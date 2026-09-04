@@ -478,14 +478,16 @@ mod platform {
             pCredentialParameters: parameters.as_mut_ptr(),
         };
 
-        let mut options = WEBAUTHN_AUTHENTICATOR_MAKE_CREDENTIAL_OPTIONS::default();
-        options.dwVersion = WEBAUTHN_AUTHENTICATOR_MAKE_CREDENTIAL_OPTIONS_VERSION_6;
-        options.dwTimeoutMilliseconds = WEBAUTHN_TIMEOUT_MS;
-        options.dwAuthenticatorAttachment = WEBAUTHN_AUTHENTICATOR_ATTACHMENT_PLATFORM;
-        options.bRequireResidentKey = BOOL(0);
-        options.dwUserVerificationRequirement = WEBAUTHN_USER_VERIFICATION_REQUIREMENT_REQUIRED;
-        options.dwAttestationConveyancePreference = WEBAUTHN_ATTESTATION_CONVEYANCE_PREFERENCE_NONE;
-        options.bEnablePrf = BOOL(1);
+        let options = WEBAUTHN_AUTHENTICATOR_MAKE_CREDENTIAL_OPTIONS {
+            dwVersion: WEBAUTHN_AUTHENTICATOR_MAKE_CREDENTIAL_OPTIONS_VERSION_6,
+            dwTimeoutMilliseconds: WEBAUTHN_TIMEOUT_MS,
+            dwAuthenticatorAttachment: WEBAUTHN_AUTHENTICATOR_ATTACHMENT_PLATFORM,
+            bRequireResidentKey: BOOL(0),
+            dwUserVerificationRequirement: WEBAUTHN_USER_VERIFICATION_REQUIREMENT_REQUIRED,
+            dwAttestationConveyancePreference: WEBAUTHN_ATTESTATION_CONVEYANCE_PREFERENCE_NONE,
+            bEnablePrf: BOOL(1),
+            ..Default::default()
+        };
 
         let attestation = AttestationGuard(
             unsafe {
@@ -603,13 +605,15 @@ mod platform {
             pCredWithHmacSecretSaltList: ptr::null_mut(),
         };
 
-        let mut options = WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS::default();
-        options.dwVersion = WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS_VERSION_6;
-        options.dwTimeoutMilliseconds = WEBAUTHN_TIMEOUT_MS;
-        options.dwAuthenticatorAttachment = WEBAUTHN_AUTHENTICATOR_ATTACHMENT_PLATFORM;
-        options.dwUserVerificationRequirement = WEBAUTHN_USER_VERIFICATION_REQUIREMENT_REQUIRED;
-        options.pAllowCredentialList = &mut allow_list;
-        options.pHmacSecretSaltValues = &mut salt_values;
+        let options = WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS {
+            dwVersion: WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS_VERSION_6,
+            dwTimeoutMilliseconds: WEBAUTHN_TIMEOUT_MS,
+            dwAuthenticatorAttachment: WEBAUTHN_AUTHENTICATOR_ATTACHMENT_PLATFORM,
+            dwUserVerificationRequirement: WEBAUTHN_USER_VERIFICATION_REQUIREMENT_REQUIRED,
+            pAllowCredentialList: &mut allow_list,
+            pHmacSecretSaltValues: &mut salt_values,
+            ..Default::default()
+        };
 
         let assertion = AssertionGuard(
             unsafe {

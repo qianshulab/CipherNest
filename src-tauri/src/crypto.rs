@@ -580,6 +580,7 @@ fn fill_random(bytes: &mut [u8]) -> VaultResult<()> {
 }
 
 fn ensure_private_directory(path: &Path) -> VaultResult<()> {
+    #[cfg(unix)]
     let existed = path.exists();
     fs::create_dir_all(path).map_err(|_| VaultError::SaveFailed)?;
     #[cfg(unix)]

@@ -1536,6 +1536,8 @@ fn set_private_directory_permissions(path: &Path) -> VaultResult<()> {
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))
             .map_err(|_| VaultError::SaveFailed)?;
     }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
