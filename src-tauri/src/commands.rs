@@ -1052,9 +1052,9 @@ pub async fn apply_selected_backup(
             *pending_guard = None;
             return Err(VaultError::PendingRestoreUnavailable);
         }
-        if !pending_guard
+        if pending_guard
             .as_ref()
-            .is_some_and(|pending| pending.token.as_str() == token.as_str())
+            .is_none_or(|pending| pending.token.as_str() != token.as_str())
         {
             return Err(VaultError::PendingRestoreUnavailable);
         }
@@ -1298,9 +1298,9 @@ fn take_pending_sync_preview(
         *pending = None;
         return Err(VaultError::PendingSyncPreviewUnavailable);
     }
-    if !pending
+    if pending
         .as_ref()
-        .is_some_and(|pending| pending.token.as_str() == token)
+        .is_none_or(|pending| pending.token.as_str() != token)
     {
         return Err(VaultError::PendingSyncPreviewUnavailable);
     }
@@ -1416,9 +1416,9 @@ fn take_pending_restore(
         *pending = None;
         return Err(VaultError::PendingRestoreUnavailable);
     }
-    if !pending
+    if pending
         .as_ref()
-        .is_some_and(|pending| pending.token.as_str() == token)
+        .is_none_or(|pending| pending.token.as_str() != token)
     {
         return Err(VaultError::PendingRestoreUnavailable);
     }
