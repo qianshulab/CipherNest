@@ -1,0 +1,453 @@
+# CipherNest 威胁模型
+
+状态：适用于 0.3.0 未审计 beta
+最后核对代码：2026-09-05
+
+本文描述当前仓库已经实现的安全边界，不是未来功能承诺。它不能证明应用没有漏洞，也不能替代独立密码学审计。
+
+## 1. 安全目标
+
+当前版本试图做到：
+
+1. 应用关闭或保险库锁定时，仅取得 `vault.cnvault` 或加密备份的攻击者不能直接读取条目内容。
+2. 错误主密码、密文篡改、头部与正文错配、截断或不受支持的参数不能产生可接受的部分明文。
+3. 新密码由操作系统安全随机源生成，字符选择不引入简单取模偏差。
+4. 正常保存尽量保证“旧版本或新版本至少一个完整存在”，恢复失败不覆盖当前保险库。
+5. 锁定后后端命令拒绝读取/修改条目，并尽力缩短秘密在内存、屏幕和剪贴板中的停留时间。
+6. 默认不联网；只有用户明确配置 WebDAV、保险库处于解锁态且用户点击创建、加入或同步时，才与指定 WebDAV collection 交换请求和客户端认证加密对象。
+7. 用户明确启用设备快速解锁后，复制保险库及其附属文件的攻击者不能仅凭这些文件取得明文设备密钥；不支持安全平台能力的系统继续只允许主密码解锁。
+8. 已配置同步的设备在本地保存 checkpoint，后续只接受从该 checkpoint 沿认证父哈希链延伸的远端历史；并发修改在客户端合并且不静默丢弃相冲突的密码。
+9. 首次加入在预览和应用之间绑定同一个 vault/session、端点身份、sync ID 以及 snapshot 精确哈希/sequence；上述任一绑定变化时拒绝使用旧预览。
+
+可用性同样是安全目标：应用保留滚动加密快照，并提供显式加密导出/恢复。但自动备份通常与主文件同盘，不构成完整灾难恢复。
+
+## 2. 明确不保证的事项
+
+当前版本不能保护：
+
+- 保险库解锁时已经在同一账号中执行的恶意软件、键盘记录器、调试器、管理员/root、内核或恶意输入法。
+- 用户主动把密码复制到钓鱼网站，或第三方进程在定时清除前读取系统剪贴板。
+- 摄像、肩窥、平台截图/录屏工具和硬件攻击。
+- 用户遗忘主密码且没有仍可用的已登记本机快速解锁；没有保险库主密码恢复密钥、服务器重置或维护者后门。设备快速解锁不是备份或迁移凭据，不能替代主密码的离线保管；CN1 同步码也不能重置主密码。
+- 攻击者把整个保险库替换为一个较旧但密码学上合法的副本；当前 generation 没有外部可信锚点。
+- 已经复制出去的旧备份、文件系统快照、SSD 历史块或云端历史版本的可靠擦除。
+- 运行时依赖、系统 WebView、构建机或分发包被入侵后的绝对安全。
+- 隐藏所有元数据。外层 envelope 和文件系统仍泄露若干信息，见下文。
+- 把可选快速解锁变成主密码之上的强制第二因素。当前策略是“主密码 OR 已登记设备”，任一路径都能独立解锁。
+- WebDAV 服务的可用性、诚实排序或永久保留。服务端可删除、延迟、隐藏密文或造成拒绝服务。
+- 全新设备仅凭 CN1 恢复码证明第一次看到的 head 是全局最新版本；首次加入是 TOFU。
+- 攻击者同时回滚保险库和本地加密同步 sidecar 时仍可靠发现回滚，或在没有外部透明日志/单调锚点时发现所有服务端分叉。
+- 隐藏 WebDAV 账号、IP、访问时间、sync ID、对象文件名、数量、大小、ETag 和流量模式。
+- 对持有共享 CN1 恢复码的单台设备进行密码学撤销。v1 没有逐设备签名或独立内容密钥。
+
+## 3. 资产
+
+最高敏感资产：
+
+- 主密码。
+- 256 位 Vault Root Key（VRK）及由其派生的正文密钥。
+- 256 位 WebDAV Sync Root Key 及包含它的 CN1 同步恢复码。
+- WebDAV 应用专用密码，以及本机同步 checkpoint、base snapshot 和设备计数器。
+- 可选快速解锁的随机 256 位设备密钥，以及运行时短暂出现的 Windows WebAuthn PRF 输出和派生包裹密钥。
+- 条目中的密码、用户名、网址、应用名称、用途、备注和标签。
+- 解锁后的搜索结果、安全报告及被删除条目的 tombstone。
+
+其他需要保护的资产：
+
+- 保险库完整性和最新性。
+- 用户设置、条目修改时间和收藏状态。
+- 加密备份与自动备份历史。
+- 设备槽完整性、macOS Keychain item、Windows WebAuthn credential，以及公开的 device ID、credential ID、PRF salt 等定位元数据。
+- 远端加密 snapshot/head 的完整性、父哈希连续性和本地同步 sidecar 的可恢复性。
+- 构建/发布链路以及未来可能加入的签名密钥。
+
+## 4. 数据流与信任边界
+
+```text
+用户键盘/屏幕
+      │
+      ▼
+Tauri WebView（TypeScript UI）
+      │  invoke 参数/返回值；选中条目会经过此边界
+      ▼
+Rust commands + VaultStore（解锁状态和完整 VaultData）
+      │
+      ├── crypto：Argon2id / HKDF / XChaCha20-Poly1305 / OS RNG
+      ├── 文件系统：vault.cnvault + *.devices + Windows *.device-auth
+      │             + vault.cnvault.sync + backups/*.cnvault
+      ├── macOS Data Protection Keychain（可选 Touch ID 快速解锁）
+      ├── Windows WebAuthn 平台认证器（可选 Hello/PRF 快速解锁）
+      ├── 系统剪贴板
+      ├── 原生文件选择器
+      └── HTTPS → 用户指定的 WebDAV collection
+                         ├── 不可变加密 snapshot
+                         └── 加密 head
+```
+
+主要边界：
+
+- **WebView ↔ Rust IPC**：WebView 不是密钥保险库。创建/解锁时主密码先存在于 JavaScript 字符串中；选中条目和生成结果也会返回前端。Rust command 在使用后将部分传入字符串放入 `Zeroizing`，前端同时清空输入，但 JavaScript 垃圾回收器不能保证及时擦除旧副本。
+- **解锁态 ↔ 锁定态**：`VaultStore.unlocked` 持有完整解密后的 `VaultData`、envelope 和 `Zeroizing<[u8;32]>` 根密钥。锁定通过 drop 解锁态来尽力清零，但解锁期间所有记录都在进程内存中。
+- **进程 ↔ 文件系统**：磁盘只写外层 envelope、设备槽/Windows 包裹记录和认证密文。备份与主文件使用相同格式和当时的密钥材料；`vault.cnvault.sync` 的正文由当前 VRK 派生密钥保护，包含 WebDAV 应用密码、同步根密钥、checkpoint 和 base。所有附属文件都被视为攻击者可复制、替换或删除。
+- **Rust ↔ 平台认证器**：设备密钥、PRF 输出和 VRK 不经过 WebView。macOS Keychain 以代码签名/访问组和 Touch ID ACL 控制读取；Windows WebAuthn 以 RP、credential、平台用户验证和 PRF 控制派生。Linux 没有该边界，只允许主密码。
+- **进程 ↔ 剪贴板**：剪贴板是系统共享资源，不受应用独占控制。
+- **正式应用 ↔ 网络**：同步默认关闭。只有用户在解锁态明确创建、加入或点击 WebDAV 同步时才发起请求；锁定态不会发起新的同步请求。若网络请求开始后保险库在途中被锁定，请求可能仍在收尾，远端 head 也可能已前进，但本地提交会因锁定或乐观状态校验失败；下次解锁后的手动同步需从旧 checkpoint 验证并协调该后继。没有 CipherNest 账号、托管服务、后台同步、遥测、远程内容或更新器请求。开发模式会连接本机 `127.0.0.1:1420` 的 Vite 服务；依赖安装/构建本身也需要外部软件源。
+- **进程 ↔ WebDAV**：服务器按不可信字节存储处理。TLS 保护传输并认证配置的服务器，但服务端仍看到 Basic 账号凭据和访问元数据；内容机密性与完整性依赖客户端的独立同步密钥和 AEAD，而不是服务器承诺。
+
+## 5. 当前保险库密码学
+
+### 5.1 创建和主密码解锁
+
+创建保险库时：
+
+1. 生成 UUID v4 形式的 `vault_id`。
+2. 使用 `getrandom` 从操作系统随机源获取 16 字节 Argon2 salt。
+3. 主密码先做 Unicode NFC 规范化，再以 Argon2id v1.3 派生 32 字节 KEK。
+4. 使用操作系统随机源生成 32 字节 VRK。
+5. 使用 XChaCha20-Poly1305 在 KEK 下包裹 VRK。
+6. 使用 HKDF-SHA-256，以 `vault_id` 为 salt、`CipherNest vault-payload-v1` 为 info，从 VRK 派生 32 字节正文密钥。
+7. 将完整 `VaultData` 序列化为 JSON，再用 XChaCha20-Poly1305 加密。
+
+实际 Argon2id 新库参数：
+
+| 参数 | 值 |
+| --- | --- |
+| version | 19 / v1.3 |
+| memory | 65,536 KiB（64 MiB） |
+| iterations | 3 |
+| parallelism | 4 |
+| salt | 16 个随机字节 |
+| output | 32 字节 |
+
+解析外来 envelope 时接受的 KDF 边界是：19 MiB–256 MiB、1–10 次迭代、1–8 lanes，且仅接受 Argon2id v1.3。边界限制主要防止恶意文件请求极端资源；这并不表示所有被接受的较低参数都等同于新建保险库默认强度。
+
+每个 XChaCha20-Poly1305 操作都生成新的 24 字节随机 nonce。代码使用库提供的 AEAD 实现，不自行组合加密与 MAC。
+
+### 5.2 AAD 和明文元数据
+
+VRK 包裹的 AAD 绑定：
+
+```text
+format + format_version + KEY_WRAP + vault_id
++ KDF algorithm/version/memory/iterations/parallelism/salt
+```
+
+正文 AAD 绑定：
+
+```text
+format + format_version + PAYLOAD + vault_id + generation
+```
+
+可选设备槽的 VRK 包裹密钥由随机设备密钥通过 HKDF-SHA-256 派生，salt 为 `vault_id`，info 绑定 `device_id`。设备槽的 XChaCha20-Poly1305 AAD 绑定：
+
+```text
+format/domain/version + vault_id + device_id + label + provider + created_at
+```
+
+外层 JSON envelope 未加密，暴露：
+
+- `CipherNest` 格式名和版本。
+- 随机 vault UUID。
+- generation。
+- KDF 算法、参数和 salt。
+- 算法名称、nonce、密文长度以及大致保险库大小。
+
+条目字段、设置、时间戳和 tombstone 位于正文密文中。文件最大为 16 MiB，解密后最多接受 10,000 个条目和 20,000 个 tombstone。
+
+### 5.3 可选设备快速解锁
+
+快速解锁默认关闭，只有主密码解锁后的会话可以主动登记。启用时后端：
+
+1. 生成随机 32 字节设备密钥和随机 device ID。
+2. 让平台安全机制保护设备密钥；密钥和 Windows PRF 输出不返回 WebView。
+3. 从设备密钥经 HKDF 派生设备槽包裹密钥，用 XChaCha20-Poly1305 包裹当前 VRK。
+4. 把最多 64 KiB、最多 8 个槽的 `vault.cnvault.devices` 原子写入磁盘。槽公开 provider、device ID、label 和创建时间，但只包含认证加密的 VRK。
+
+解锁策略是：
+
+```text
+Argon2id(主密码) 解封 password slot
+                 OR
+平台认证释放设备密钥，设备密钥解封 device slot
+                 ↓
+                VRK → 正文
+```
+
+所以快速解锁是主密码的替代通道，不是主密码之上的第二因素。Windows Hello 本身通常结合设备 credential 与 PIN/生物特征，但只要保险库仍允许单独使用主密码，CipherNest 的整体策略就是 OR 而不是 AND。
+
+平台约束：
+
+- **macOS**：随机设备密钥位于 Data Protection Keychain；ACL 使用 `BiometryCurrentSet` 和 `AccessibleWhenPasscodeSetThisDeviceOnly`，明确设置不同步。指纹集合变化会使条目失效。`LAContext` 的布尔结果只用于可用性预检，不是密钥释放边界。
+- **Windows**：只在 Win32 WebAuthn API ≥ 6、用户验证平台认证器可用、credential 支持 PRF 时启用。创建和 assertion 都要求 platform attachment 与 `UV_REQUIRED`；登记时以及每次解锁的 assertion 前后都会重新枚举并核对固定 RP、credential detail version ≥ 2 与 `bBackedUp=false`，任一条件失效即拒绝。PRF 输出经 HKDF 派生包裹密钥，再保护随机设备密钥；磁盘记录只有 credential ID、salt、nonce 和认证密文。Windows Hello 可选择 PIN、面部或指纹，且本项目未验证 TPM attestation。
+- **Linux**：不保存设备密钥，也不提供快速解锁。PAM/fprintd 的认证结果与随会话解锁的 Secret Service 不能替代密码学门控。
+
+平台存储成功但设备槽写入失败时，应用尽力删除新平台条目。平台认证失败、credential 被备份、附属文件篡改或密钥不匹配均不得交付部分明文。详细 API、官方来源及生命周期见[设备快速解锁设计](QUICK_UNLOCK.md)。
+
+#### TOTP 为什么不是离线解密因子
+
+传统 Authenticator/TOTP 是由共享 seed、时间和短数字验证码构成的在线认证协议。常见 6 位码的单次搜索空间只有约 20 bit；复制密文的攻击者可绕过应用内失败延迟离线穷举。如果桌面应用为了离线验证而同时保存 TOTP seed，复制整套文件也会复制该因子。
+
+经典 WebAuthn assertion 的签名也不是秘密。只有明确支持 PRF/`hmac-secret` 的 passkey 或认证器，才能在用户验证后向本地应用提供高熵、按 credential 隔离的秘密输出，从而安全派生设备槽包裹密钥。即便如此，当前实现仍是设备或主密码二选一；真正每次解锁的 2FA 必须把两者共同组合并删除所有单因素旁路，当前未实现。
+
+#### 公开实现、反编译和复制文件
+
+算法、源码、KDF 参数、salt、nonce、AAD 和附属文件格式都可以公开。二进制中没有全局解密密钥或隐藏 pepper；反编译加复制锁定文件不会直接还原条目。password slot 仍允许无限次离线猜测：攻击者可为每个候选运行 Argon2id，再尝试解封 VRK，因此强且独有的主密码仍然必要，快速解锁不会提高主密码路径的抗猜测强度。
+
+复制设备附属文件同样不等于复制平台秘密：macOS 密钥是不可同步的 ThisDeviceOnly Keychain item；Windows 需要未备份的平台 credential 产生正确 PRF 输出。但已解锁主机上的恶意软件、键盘记录、内存读取、进程注入、屏幕或剪贴板抓取仍可能取得秘密，不在静态文件保护边界内。
+
+### 5.4 主密码更改与设备撤销
+
+更改主密码时，应用先用当前主密码重新验证现有 envelope，然后递增 generation，并复用创建 envelope 的完整流程生成新 salt、新 KEK、全新随机 VRK、key-wrap nonce 和 payload nonce，以新 VRK 重新加密完整正文。旧设备 slots 会先失败关闭地撤销，写入成功后再尽力删除平台 Keychain/WebAuthn 记录。只有原子写入成功后才替换内存中的 VRK。
+
+关闭快速解锁同样必须提供当前主密码，并在主密码不变的情况下生成全新随机 VRK、重加密当前正文、删除所有设备 slots，再尽力清理平台记录。恢复另一个保险库备份也会撤销此前登记；快速解锁不是可迁移恢复方式。
+
+因此：
+
+- 当前保险库之后只能用新主密码解锁。
+- 已经导出的旧备份没有被修改，仍可用旧主密码解锁。
+- 旧备份中的旧 VRK 不能解密换密后的当前正文；回归测试还验证了把旧 key-wrap 与新 payload 拼接后认证失败。
+- 旧设备 slot 或残留平台设备密钥不能解密轮换后的当前正文，因为当前 payload 已改用新 VRK。
+- 如果已配置 WebDAV，应用在 VRK 轮换前准备由新 VRK 保护的同步 sidecar，再提交新保险库；同步根密钥和远端空间本身不随本地主密码更改而改变。
+- 轮换不能追溯销毁完整旧快照。若攻击者保存了相互匹配的旧 envelope、旧 slots，以及旧主密码或仍可用的旧平台 credential，它仍可能解密旧快照中的历史秘密。
+- 若攻击者已经取得解锁进程控制权、能替换应用，或已经读取了当前明文，仅更改主密码仍不能让已泄露的历史秘密失效。
+
+### 5.5 可选 WebDAV 手动同步
+
+#### 启用与连接边界
+
+同步默认关闭，未配置时没有 WebDAV 业务请求。配置要求一个已经存在、以 `/` 结尾的 HTTPS collection URL，以及独立输入的用户名和应用专用密码。URL 不允许嵌入 userinfo、query、fragment、编码斜杠或反斜杠。客户端拒绝重定向，要求至少 TLS 1.2，并以系统信任根验证证书。
+
+客户端先用 `PROPFIND Depth: 0` 确认目标是 collection；配置时和每次提交前还会在该目录创建随机探测对象，验证：
+
+- `If-None-Match: *` 能阻止重复创建。
+- 错误 `If-Match` 返回 precondition failure，正确 `If-Match` 才能更新。
+- 读取字节与写入内容完全一致，ETag 是强 ETag 且内容改变后 ETag 也改变。
+- 探测对象可按条件删除；失败路径只做尽力清理。
+
+WebDAV 的集合语义见 [RFC 4918](https://www.rfc-editor.org/info/rfc4918/)，HTTP 条件请求见 [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110.html)。账号使用 HTTP Basic authentication；Basic 自身不提供机密性，必须依赖经验证的 HTTPS，见 [RFC 7617](https://datatracker.ietf.org/doc/html/rfc7617.html)。
+
+#### 同步密钥与远端对象
+
+创建同步空间时，客户端生成随机 UUID `sync_id` 和随机 256 位 Sync Root Key，并编码为规范形式的 `CN1.<sync-id>.<base64url-key>` 恢复码。同步密钥与主密码、Argon2 salt、KEK 和本地 VRK 相互独立。
+
+HKDF-SHA-256 以 `sync_id` 为 salt、以独立用途标签派生 snapshot/head 密钥。每个对象使用 XChaCha20-Poly1305、新 24 字节 nonce 和绑定格式/版本/sync ID 的 AAD。远端只出现：
+
+```text
+ciphernest-<sync-id>-snapshot-<sha256>.cnsnap
+ciphernest-<sync-id>-head.cnhead
+```
+
+snapshot 文件名中的 SHA-256 覆盖加密对象的精确字节。解密后的 snapshot 包含协议版本、sync ID、递增 sequence、父 snapshot 哈希、写入设备 ID/计数器、创建时间、完整条目和 tombstone。head 的加密正文包含当前 sequence 和 snapshot 哈希。
+
+更新时先以 `If-None-Match: *` 写不可变 snapshot，重新读取并核对字节/哈希，再以读取 head 时取得的强 ETag 执行 `If-Match` 比较并交换。并发写入只有一个能更新 head；失败者必须重新拉取并合并。AEAD、内容哈希、父链和 ETag 分别提供认证、内容寻址/连续性和正常并发控制，不能互相替代。
+
+#### 本地 sidecar 与不上行数据
+
+本地 `vault.cnvault.sync` 是认证加密 envelope。密钥由当前 VRK 和 vault ID 经 HKDF 派生，正文包含：WebDAV URL、用户名、应用密码、sync ID、Sync Root Key、本机设备 ID/计数器、最后 checkpoint、三方合并 base snapshot、本地 generation 和最后同步时间。事务期间可能出现同样加密的 `.sync.next`、`.sync.restore-hold` 等恢复候选；外层格式、版本、vault ID、nonce 和密文长度不加密。
+
+同步远端 snapshot 只包含条目与 tombstone。主密码、KDF 参数/salt、KEK、VRK、完整本地 envelope、安全设置、备份状态、WebDAV 凭据、同步 sidecar、设备 slots、Windows 本机记录和 macOS Keychain item 均不进入远端同步对象。用户名和应用密码会作为 HTTPS Authorization 凭据发送给配置的 WebDAV 服务器。更改本地主密码或关闭快速解锁导致 VRK 轮换时，sidecar 在新 VRK 下重新加密；恢复另一保险库不会把旧配置静默绑定到新库。
+
+静态复制 sidecar 不会直接给出同步密钥或应用密码，但其安全性最终依赖本地 VRK：弱主密码被离线猜出、VRK 泄漏或解锁进程被控制时，sidecar 中的秘密也会泄漏。更改主密码或关闭快速解锁只轮换本地 VRK 并重新加密当前 sidecar；它不会轮换其中共享的 Sync Root Key、撤销 WebDAV 应用密码或清除远端历史。攻击者若保留完整旧保险库/旧 sidecar 组合，并在以后取得相应旧主密码或设备材料，仍可能恢复继续使用中的同步秘密。
+
+#### 合并、墓碑与冲突保存
+
+日常同步比较上次 base、本地条目/墓碑和认证后的远端 snapshot：
+
+- 只有一端相对 base 改变时选择变化的一端。
+- 两端修改同一条目且内容不同，保留本地原条目，并把远端版本复制为新 UUID，标题和标签标记“同步冲突”。
+- 一端删除、另一端修改时，保留原 ID tombstone，并将修改版保存为新 UUID 冲突副本。
+- 两端均删除时保留一个有效 tombstone。
+- base 中的记录若在任一侧无 tombstone 地消失则拒绝，不能猜测为删除。
+
+首次加入已有本地数据时没有共同 base，采用单独的 join merge：不相交 ID 取并集，相同内容去重，同 ID 不同内容保留冲突副本。该策略以避免丢密码为优先，可能产生需要人工处理的重复项，不采用静默 last-writer-wins。
+
+加入预览与确认之间使用 5 分钟有效、单次使用的不透明 token。后端把它与当前 vault/session、规范化端点、用户名、sync ID、snapshot 精确哈希和 sequence 绑定；确认时重新获取并逐项核对，任一变化都要求重新预览。token 状态不保存应用密码或恢复码，并在锁定或会话切换时清除。该保护防止把用户未见过的另一个合法 snapshot 应用到本地，但不会为首次加入提供外部最新性证明，因此 TOFU 限制仍然成立。
+
+#### checkpoint、回滚和 TOFU
+
+已配置设备在加密 sidecar 中保存最后接受的 snapshot 哈希。后续拉取必须验证远端 head 沿父哈希链在最多 256 个 snapshot、总计最多 90 秒的预算内回到这个 checkpoint，否则以回滚、分叉、缺失父对象、链过长或超时失败关闭。本地 generation 低于已同步 generation，或 generation 未增加但同步内容变化，也会被视为本地回滚/异常。父链实现逐个处理并立即释放完整祖先 snapshot，仅保留当前链接、计数和最多 256 个已见哈希，因此链验证内存不会按每个 snapshot 的完整大小线性叠加；单个最大对象和解析过程仍需受资源上限保护。
+
+限制如下：
+
+- 只有已保存 checkpoint 的设备才能检测与该历史不一致的远端回滚。
+- 全新设备第一次凭 CN1 码加入没有旧 checkpoint，是 TOFU，无法证明服务器提供的是全局最新 head。
+- 如果攻击者回滚整个本地应用数据，保险库与 sidecar/checkpoint 可能一起回退，检测可能被绕过。
+- 服务端可以删除、延迟或隐藏 head/snapshot、截断父链、让验证超过 256 个 snapshot/90 秒或直接拒绝服务。客户端只能拒绝接受，不能恢复服务端可用性。长期离线设备也可能自然超过预算；删除配置后重新加入会失去旧 checkpoint，并形成新的 TOFU 决策，因此应先导出本地备份并通过仍可信设备确认远端状态。
+- v1 没有透明日志、外部单调计数器或设备间 gossip，不保证发现所有 equivocation。
+
+#### 恢复码、撤销和元数据
+
+所有 CN1 v1 设备共享同一 Sync Root Key，没有逐设备签名、授权历史或密码学撤销。停止当前设备同步只删除本机 sidecar，不删除远端对象或撤销其他持码设备。更改主密码或关闭快速解锁同样不会轮换 Sync Root Key 或 WebDAV 应用密码。若恢复码、应用密码、设备或完整旧本机数据可能泄漏，需要先在服务器撤销旧 WebDAV 应用密码，再迁移到全新的同步空间与恢复码；旧历史仍应视为持码者可解密。
+
+若没有任何仍配置的设备且离线恢复码丢失，就不能再加入该空间。CN1 码不能重置本地保险库主密码。远端不可变历史不会自动垃圾回收，提供商的版本历史、备份和删除保留也不受应用控制。
+
+正文虽加密，服务器仍能看到账号、IP、TLS 连接、请求时间、sync ID、文件名、对象外层格式/版本/nonce/密文长度、对象数量/大小、更新时间、ETag 和流量模式。完整 snapshot 的大小还可能泄露保险库大致规模。WebDAV 服务端、客户端终端或已解锁进程中的恶意软件也可能直接窃取凭据或明文。完整协议和操作建议见[同步设计](SYNC_DESIGN.md)。
+
+## 6. 状态与持久化
+
+### 6.1 保存
+
+每次条目、收藏、设置或主密码发生持久化修改时：
+
+1. 在内存副本上修改数据并增加 generation。
+2. 把当前磁盘 envelope 复制为自动加密备份。
+3. 以新 nonce 重新加密完整正文。
+4. 通过 `atomicwrites` 在同目录写入、同步文件并替换目标。
+5. Unix 上再同步父目录。
+6. 只有写入成功后才用新内存状态替换旧状态。
+
+Unix 新建文件会设置为 `0600`；本应用新建的数据目录会设置为 `0700`。如果数据父目录已经存在，代码不会主动修复其权限。Windows 没有显式 ACL 设置，依赖应用数据目录的继承 ACL。
+
+该设计降低部分写入和进程崩溃造成的损坏，但不能保证所有文件系统、网络盘或突然断电场景都具有相同原子/耐久语义。
+
+设备 slots、Windows 快速解锁记录和加密同步 sidecar 也使用同目录原子替换，但跨“操作系统 credential 存储”和“文件系统”不存在统一事务。启用快速解锁时先创建平台记录，再登记 slot；后一步失败会尽力删除平台记录。最坏情况是留下无法使用的孤儿平台 credential，而不是把设备密钥明文写盘或把未完成登记报告为成功。关闭或换主密码时优先轮换 VRK、撤销 slots，再尽力清理平台记录，使清理失败只留下不能用于当前正文的旧凭据。同步应用远端内容时会核对捕获的 vault ID、generation 和 sidecar 摘要，防止网络返回覆盖请求期间的新本地编辑。
+
+### 6.2 自动和手动备份
+
+- 自动备份通常名为 `backups/auto-<vault-id>-<20位generation>.cnvault`，不同保险库不会因相同 generation 互相覆盖。若该路径已存在，先比较当前 envelope 的精确规范 JSON 字节：相同则不重复保存；同一 vault ID/generation 但字节不同，则改用 `auto-<vault-id>-<20位generation>-<sha256>[-<uuid>].cnvault` 保存。内容哈希路径发生极端占用/冲突时追加随机 UUID，而不是静默跳过新快照；所有这些文件共同按修改时间保留最近 10 份。
+- 自动备份是上一次完整 envelope，仍为认证密文。
+- 手动导出复制当前 envelope 到用户选择的位置，禁止明显覆盖当前保险库；导出成功后会在当前库中更新 `last_backup_at`。
+- 恢复采用两阶段流程：先读取不超过 16 MiB 的候选，验证 envelope、KDF 边界、备份主密码、AEAD 和字段约束，再向用户显示文件名、条目数、更新时间、generation 和 vault ID 摘要；只有用户明确确认后才备份并替换当前保险库。选择 token 最多保留 5 分钟且单次使用，取消/锁定会清除待恢复状态。
+- 恢复是整库替换，不执行条目合并。
+- 导出文件只包含 password slot 和正文，不包含 `.devices`、Windows `.device-auth`、`vault.cnvault.sync` 或 macOS Keychain item；恢复必须使用该备份所属的主密码。替换后原快速解锁登记和 WebDAV 配置不会静默迁移，需要用户重新配置。
+- 若当前活动文件已损坏但候选备份验证通过，损坏原文件会先移入应用数据目录中的私有 quarantine，再写入已验证备份；若替换失败则尝试回滚。
+
+剩余风险：自动备份通常同盘；旧备份包含历史秘密；无法可靠擦除 SSD/快照；目标路径是否位于云端由用户决定；完整旧备份可以合法回滚状态。删除当前 device slots 或轮换当前 VRK 不会改写已经复制出去的旧 envelope/旧附属文件整套快照。
+
+## 7. 锁定与敏感数据生命周期
+
+### 当前行为
+
+- 后端默认空闲 5 分钟自动锁定，接受 1–120 分钟。
+- 前端活动会重置 UI 定时器，并最多每 10 秒通知一次后端；受保护的后端操作也会检查超时。
+- 手动锁定先清除前端条目/生成器/报告状态并请求清理剪贴板，然后丢弃后端解锁态。
+- 应用收到系统睡眠/休眠后的恢复事件时丢弃解锁态，并通知前端清除敏感页面状态。
+- 窗口失焦总会隐藏已显示密码和生成结果；仅在 `lock_on_blur=true` 时锁定后端，默认值为 false。
+- 密码默认显示 10 秒后重新遮罩，后端接受 5–60 秒。
+- 第 3 次失败解锁之后开始对下一次尝试增加约 1、2、4、8、16、30 秒的内存内延迟，最大 30 秒。
+
+### 剩余风险
+
+- 当前依赖 Tauri/操作系统传递的恢复事件，尚未在三平台独立验证所有锁屏、睡眠、休眠、用户切换和异常挂起路径；操作系统全盘加密和锁屏策略仍然必要。
+- 失败延迟重启应用即可清除，对已复制保险库的离线爆破没有影响；真正的离线成本来自 Argon2id。
+- 未使用锁页内存或统一的 crash dump 抑制。macOS/Windows 可选快速解锁会使用系统秘密机制，但保险库解锁后 VRK 和完整正文仍进入普通进程内存；Linux 不使用系统秘密存储。
+- `VaultData` 在更新时会克隆，虽然类型实现了 drop 时尽力清零，仍可能产生分配器、WebView、IPC 或操作系统保留的副本。
+- `beforeunload` 中的异步剪贴板清除不保证一定在进程退出前完成。
+
+## 8. 剪贴板和显示
+
+复制密码时，后端：
+
+1. 验证保险库仍处于解锁状态。
+2. 把秘密写入系统剪贴板。
+3. 仅在内存中保存一次 SHA-256 digest 和随机 lease token。
+4. 到期后重新读取剪贴板；只有 digest 与本应用原内容匹配时才清除，避免删除用户之后复制的其他内容。
+
+后端默认 TTL 为 20 秒，允许 10、20、30 或 60 秒。清除是尽力而为：
+
+- digest 不是持久化密码数据库，也不会写入保险库；它只用于同一运行会话的剪贴板归属判断。
+- 在清除前，其他进程、剪贴板历史或跨设备剪贴板可能已复制秘密。
+- 当前没有设置 Windows 的 clipboard history/cloud exclusion 格式，也无法控制 macOS Universal Clipboard 和第三方/Linux 剪贴板管理器。
+- 遮罩字段不能防止已进入 WebView 内存的值被同进程漏洞读取。
+
+## 9. 密码生成和安全报告
+
+### 密码生成
+
+- 长度限制 8–128。
+- 字符池包括 ASCII 小写、大写、数字和固定符号集。
+- 可排除 `0O1lI|`。
+- `getrandom` 获取随机字节，使用 rejection sampling 选择索引，避免简单 `% n` 的偏差。
+- “每类至少一个”通过对完整候选重复采样实现；显示的熵值用容斥法估算满足约束的字符串数量。
+
+随机源不可用时生成失败，不回退到弱 PRNG。
+
+### 安全报告
+
+- 重复密码检查只在解锁内存中计算 SHA-256 digest 计数，digest 不持久化。
+- 弱密码检查使用短公共列表、长度和估算字符池的简单启发式。
+- 超过 365 天未更改会被标记为 stale。
+- 不调用在线泄露数据库。
+
+这些标记可能误报或漏报，不能被描述为密码已泄露、未泄露或安全性的证明。
+
+## 10. 威胁与当前缓解
+
+| 威胁 | 已实现缓解 | 剩余风险 |
+| --- | --- | --- |
+| 盗取锁定保险库/备份 | Argon2id、随机 VRK、AEAD | 弱主密码可离线猜测；文件大小和外层元数据泄露 |
+| 反编译并复制全部普通文件 | 安全性不依赖隐藏算法；无全局密钥；平台设备密钥不写入普通文件；远端使用独立高熵同步密钥 | 公开 salt/认证密文允许离线猜测 password slot；猜出主密码/VRK 后也可解本地同步 sidecar |
+| 篡改正文或参数 | AEAD、AAD、严格算法/参数和长度检查 | 可替换整个合法旧文件；可删除文件造成拒绝服务 |
+| 快速解锁策略降级 | 默认关闭；macOS 严格生物 ACL；Windows API ≥ 6、platform、UV_REQUIRED、PRF、拒绝 backed-up；Linux 拒绝启用 | 操作系统/API 缺陷；未验证 TPM attestation；同用户恶意代码可攻击已解锁进程 |
+| 盗取已登记设备 | Touch ID/Windows Hello 门控设备密钥；自动锁定 | Hello 可使用 PIN；胁迫、肩窥、弱设备 PIN、已登录会话和平台认证绕过不由保险库密码学消除 |
+| 旧 slot 或历史快照 | 换主密码/关闭快速解锁时轮换 VRK，旧 slot 不能解当前正文 | 完整且匹配的旧 envelope/slots 与旧凭据仍可解旧历史；无外部回滚锚点 |
+| 保存中断 | 保存前加密备份、同目录原子替换、文件同步 | 特殊文件系统/网络盘/硬件故障仍可能破坏耐久性 |
+| 恶意 `.cnvault` | 16 MiB 上限、KDF/数量/字段上限、验证后替换 | 尚无持续 fuzz 审计；解析库漏洞仍可能存在 |
+| 其他本地用户读取 | Unix 私有权限、OS 应用数据目录 | 既有宽松目录、Windows ACL 继承、管理员/root |
+| 同用户恶意软件 | 自动锁、短显示、尽力清零 | 解锁期间仍可读内存、键盘、IPC、屏幕、剪贴板 |
+| WebView 注入 | 本地资源、严格 CSP、无 HTML 拼接、条目 URL 后端仅允许 http/https、最小 capability | WebView/依赖或原生 IPC 漏洞；选中条目和输入秘密会进入前端 |
+| 剪贴板泄露 | 有限 TTL、仅清除仍匹配的内容 | 历史/云剪贴板和其他进程可提前读取 |
+| WebDAV 窃取或篡改正文 | 独立 256 位同步密钥、用途分离密钥、AEAD、严格结构/大小验证 | 恢复码泄漏或端点进程失陷；未完成独立审计和大规模 fuzzing |
+| WebDAV 并发覆盖 | 不可变 snapshot、SHA-256 名称、强 ETag 与 `If-Match` head CAS、三方合并 | 服务端以后改变语义；复杂故障仍需人工恢复；冲突副本需人工核对 |
+| WebDAV 加入预览竞态 | 5 分钟单次 token 绑定本地会话、端点身份、sync ID、snapshot 精确哈希/sequence；确认时重新获取核对 | 只能保证应用内容与预览一致，不能为新设备证明预览本身是全局最新版本；仍属 TOFU |
+| WebDAV 回滚/分叉 | 本机加密 checkpoint、最多 256 snapshot/90 秒的父链检查、generation/content 一致性检查 | 新设备/重新加入为 TOFU；长期离线可能超过预算；整个本地数据同步回滚；无外部透明日志或全局最新性证明 |
+| WebDAV 删除/延迟/DoS | 不把服务器当解密方；错误失败关闭；本地库和独立导出仍可用 | 服务端可永久删历史、耗尽配额或拒绝请求；应用不能恢复服务端可用性 |
+| WebDAV 元数据分析 | 条目与设备 ID 位于认证密文，不上传本地设置/快速解锁记录 | 账号、IP、时间、sync ID、文件名、数量、大小、ETag 和流量模式可见 |
+| 更改主密码后的同步秘密 | 当前 sidecar 随 VRK 轮换重新加密 | Sync Root Key、WebDAV 应用密码和远端历史不自动轮换；怀疑泄漏时必须撤销旧应用密码并创建新同步空间/恢复码 |
+| 主密码遗忘 | 加密导出/恢复 | 没有保险库主密码恢复密钥；CN1 同步码不能重置主密码 |
+| 删除后取证 | 当前正文不再含条目，Rust 类型尽力清零 | 自动/手动旧备份、文件系统快照、SSD、进程副本仍可能含秘密 |
+| 供应链/恶意包 | Cargo lockfile、最小运行依赖、生产 devtools 关闭；macOS 本地包使用 ad-hoc 完整性签名 | 前端锁文件/依赖审计与可信签名发布需持续验证；ad-hoc 签名不验证发布者身份，Windows/Linux 未签名且当前无更新器 |
+
+## 11. 不变量
+
+任何后续更改都不应破坏以下不变量：
+
+- 锁定状态下所有条目读取、修改、导出、复制和安全报告命令都失败。
+- 锁定状态不得发起新的 WebDAV 同步请求；请求途中发生锁定时，其结果不得绕过锁定/乐观校验提交到本地保险库或 sidecar。
+- 任何 AEAD 验证失败均不得交付部分明文，也不得覆盖现有保险库。
+- 系统安全随机源失败时，密码或加密 nonce 生成必须失败关闭。
+- 保险库正文和备份不能包含未加密条目字段。
+- 保存失败不能把未经确认的新内存状态标记为持久化成功。
+- 用户选择的外部 KDF 参数必须先经过资源上限验证。
+- 不向日志、窗口标题、通知或遥测写入主密码、VRK、同步恢复码、WebDAV 应用密码或条目；WebDAV 应用密码只作为经过验证的 HTTPS 请求的 Authorization 凭据发往用户配置的端点。
+- 同步默认关闭且只由用户手动触发；远端同步对象不得包含主密码、KDF/KEK、VRK、完整本地 envelope、设置、备份状态、WebDAV 凭据、同步 sidecar 或快速解锁记录。应用密码只能作为 HTTPS Authorization 凭据发往已配置端点。
+- 所有远端 head/snapshot 必须在使用前验证 AEAD、格式、长度、sync ID、内容哈希和父链；条件请求或强 ETag 能力不满足时必须拒绝配置/提交。
+- 远端 head 只能用读取到的强 ETag 经 `If-Match` 更新；并发失败必须重新获取/合并，不能静默 last-writer-wins。
+- 双改和删除/修改冲突必须保留独立冲突副本；无 tombstone 的记录消失不得被猜测为删除。
+- CN1 恢复码和 WebDAV 应用密码不得记录日志；查看恢复码和停用同步必须重新验证当前主密码。
+- 同步加入确认必须消费一个未过期的单次预览 token，并重新获取、核对同一端点/用户名、vault/session、sync ID、snapshot 精确哈希和 sequence；任一变化不得继续应用或自动合并未预览的新 head。
+- 应用另一个同步结果前必须核对请求开始时的 vault ID、解锁 session ID、generation 和同步状态摘要；任一不匹配就拒绝覆盖，锁定后快速重新解锁也不得让旧网络任务提交。
+- 快速解锁默认关闭；Linux 必须拒绝启用；设备密钥、PRF 输出和 VRK 不得经 WebView IPC 返回。
+- Windows 不得在 API < 6、不支持 PRF、未要求用户验证或 credential 已 backed-up 时静默降级；macOS 不得用一次认证布尔值替代 Keychain ACL。
+- 关闭快速解锁或更改主密码后，旧 device slot 不得解密新的当前正文；平台条目清理失败不得恢复该能力。
+- 设备认证、平台记录、AEAD 或元数据验证失败时不得交付部分明文。
+- 新网络、快速解锁机制变更、恢复、导入、自动填充或浏览器功能必须在启用前更新本文。
+
+## 12. 尚未实现、不得当作现有保护宣传
+
+- 独立安全审计、正式渗透测试和持续 fuzz 基础设施。
+- Linux 设备快速解锁、漫游硬件安全密钥，以及主密码与设备凭据共同必需的强制 2FA 解锁。
+- 保险库主密码恢复密钥或应急恢复包；CN1 码只恢复同步空间访问。
+- 对已经复制到应用控制之外的旧备份进行撤销或可靠密码学擦除的工作流。
+- 外部可信单调计数器、透明日志或在整个本地数据一同被回滚时仍可靠的全局最新性证明。
+- 锁页内存、swap/core-dump 系统级抑制。
+- Windows 剪贴板历史/云剪贴板抑制、跨平台截图保护。
+- 签名发布、签名更新器和更新降级保护。
+- CipherNest 托管同步服务、后台/自动同步、逐设备签名配对/密码学撤销、同步根密钥轮换和远端历史垃圾回收。
+- 至少一个真实 WebDAV 提供商上的三平台端到端互操作验证；能力探测不等同于此项验证。
+- 浏览器扩展、自动填充、TOTP 保存/生成、附件、共享保险库和团队权限。TOTP 未实现是功能范围；它也不会被用作低熵的离线解密密钥。
+
+## 13. 上线前验证
+
+- 用已知向量和属性测试覆盖 Argon2id、HKDF、AEAD 与随机索引选择。
+- 对 envelope 每个字段做位翻转、截断、重复字段、超长 Base64、KDF 边界和内存耗尽测试。
+- 对反序列化、字段校验和恢复入口持续 fuzz。
+- 对 WebDAV URL、`PROPFIND` XML、加密 head/snapshot、超大响应、截断和错误 Content-Type/状态码持续 fuzz 与资源上限测试。
+- 模拟每个保存阶段进程终止/断电，并验证旧库或新库可恢复。
+- 模拟忽略 `If-Match`/`If-None-Match`、弱或不变 ETag、重定向、并发 head 写入、父对象缺失、head 重放/分叉、超过 256 层、网络写成功后本地状态变化和整个本地数据回滚。
+- 覆盖双设备离线编辑、同条目双改、删除/修改、首次加入有本地数据、恢复码丢失/泄漏和冲突副本人工处理流程。
+- 在 Windows、macOS、Linux 验证文件权限、锁定、窗口失焦、剪贴板、导出和恢复。
+- 在真实硬件验证 Touch ID 指纹集合变化、Windows Hello 重置、API/PRF 缺失、backed-up credential 拒绝、用户取消、平台记录丢失、附属文件篡改、换主密码与关闭后的旧 slot 失效。
+- 使用唯一测试秘密扫描应用数据目录、临时文件、日志和崩溃产物。
+- 审查 Tauri capability/CSP、依赖锁定、SBOM、平台签名和构建机权限。
+- 在生产级宣传 WebDAV 同步前完成独立协议、密码学、桌面应用安全审计，并用至少一个真实 WebDAV 服务验证互操作与条件请求行为。

@@ -1,0 +1,201 @@
+name: Package beta release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: package-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            label: macOS-aarch64
+            target: aarch64-apple-darwin
+            bundles: app,dmg
+            executable: src-tauri/target/aarch64-apple-darwin/release/ciphernest
+            bundle_root: src-tauri/target/aarch64-apple-darwin/release/bundle
+          - os: windows-2022
+            label: Windows-x86_64
+            target: x86_64-pc-windows-msvc
+            bundles: nsis
+            executable: src-tauri/target/x86_64-pc-windows-msvc/release/ciphernest.exe
+            bundle_root: src-tauri/target/x86_64-pc-windows-msvc/release/bundle
+          - os: ubuntu-22.04
+            label: Linux-x86_64
+            target: x86_64-unknown-linux-gnu
+            bundles: deb,appimage
+            executable: src-tauri/target/x86_64-unknown-linux-gnu/release/ciphernest
+            bundle_root: src-tauri/target/x86_64-unknown-linux-gnu/release/bundle
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install Linux desktop dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential curl file libssl-dev wget \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev libxdo-dev patchelf
+
+      - name: Use Node 24 LTS
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24
+
+      - name: Install pinned pnpm and Rust
+        shell: bash
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.12.1 --activate
+          rustup toolchain install 1.89.0 --profile minimal --target "${{ matrix.target }}" --no-self-update
+          rustup component add --toolchain 1.89.0 clippy rustfmt
+          rustup default 1.89.0
+
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify release version
+        run: node scripts/release-tools.mjs verify-version
+
+      - name: Test release validation tools
+        run: node --test scripts/release-tools.node-test.mjs
+
+      - name: Verify source before packaging
+        run: pnpm check
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+
+      - name: Lint Rust with warnings denied
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features --locked -- -D warnings
+
+      - name: Build macOS ARM64 package
+        if: runner.os == 'macOS'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: >-
+          pnpm tauri build
+          --target ${{ matrix.target }}
+          --bundles ${{ matrix.bundles }}
+          --config '{"bundle":{"macOS":{"minimumSystemVersion":"11.0"}}}'
+
+      - name: Build Windows or Linux package
+        if: runner.os != 'macOS'
+        run: pnpm tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+
+      - name: Verify native executable architecture
+        run: >-
+          node scripts/release-tools.mjs verify-binary
+          --target ${{ matrix.target }}
+          --path "${{ matrix.executable }}"
+
+      - name: Verify macOS ad-hoc bundle signature
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          app="${{ matrix.bundle_root }}/macos/CipherNest.app"
+          codesign --verify --deep --strict "$app"
+          codesign --display --verbose=4 "$app" 2>&1 | grep -F "Signature=adhoc"
+
+      - name: Report Windows signing status
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $signature = Get-AuthenticodeSignature "${{ matrix.executable }}"
+          Write-Host "Authenticode status: $($signature.Status)"
+
+      - name: Stage named release assets and checksums
+        run: >-
+          node scripts/release-tools.mjs stage
+          --target ${{ matrix.target }}
+          --bundle-root "${{ matrix.bundle_root }}"
+          --output release-assets
+
+      - name: Upload verified packages
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: CipherNest-${{ matrix.label }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publish tagged beta release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Use Node 24 LTS
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24
+
+      - name: Download all platform packages
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53
+        with:
+          pattern: CipherNest-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify complete asset set and create manifest
+        run: node scripts/release-tools.mjs manifest --assets release-assets
+
+      - name: Create or finish draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          notes_file=".github/release-notes/${tag}.md"
+          if [[ ! -f "$notes_file" ]]; then
+            echo "Missing reviewed release notes: $notes_file" >&2
+            exit 1
+          fi
+
+          mapfile -t packages < <(
+            find release-assets -maxdepth 1 -type f \
+              \( -name '*.dmg' -o -name '*.exe' -o -name '*.AppImage' -o -name '*.deb' \) \
+              -print | sort
+          )
+          assets=("${packages[@]}" release-assets/SHA256SUMS.txt release-assets/release-manifest.json)
+
+          if existing_draft="$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            if [[ "$existing_draft" != "true" ]]; then
+              echo "Release $tag already exists and is not a draft; refusing to overwrite it." >&2
+              exit 1
+            fi
+            gh release edit "$tag" \
+              --title "CipherNest ${tag} (beta)" \
+              --notes-file "$notes_file" \
+              --prerelease
+          else
+            gh release create "$tag" \
+              --verify-tag \
+              --draft \
+              --prerelease \
+              --title "CipherNest ${tag} (beta)" \
+              --notes-file "$notes_file"
+          fi
+
+          gh release upload "$tag" "${assets[@]}" --clobber
+          gh release edit "$tag" --draft=false --prerelease
