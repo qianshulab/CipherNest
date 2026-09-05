@@ -59,4 +59,4 @@ jobs:
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features --locked -- -D warnings
 
       - name: Compile native desktop binary
-        run: pnpm exec tauri build --no-bundle -- --locked
+        run: node node_modules/@tauri-apps/cli/tauri.js build --no-bundle -- --locked
