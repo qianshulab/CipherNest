@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import documentSource from "../index.html?raw";
+import cargoManifestSource from "../src-tauri/Cargo.toml?raw";
+import commandsSource from "../src-tauri/src/commands.rs?raw";
+import cryptoSource from "../src-tauri/src/crypto.rs?raw";
+import backendEntrySource from "../src-tauri/src/lib.rs?raw";
 import rendererSource from "./main.ts?raw";
 import typesSource from "./types.ts?raw";
 
@@ -38,97 +42,31 @@ describe("renderer security boundary", () => {
     expect(rendererSource).toContain('"clear_owned_clipboard"');
   });
 
-  it("keeps the quick-unlock status contract non-secret and camelCase", () => {
-    expect(typesSource).toMatch(
-      /export type QuickUnlockMethod = "touchId" \| "windowsHello" \| "unsupported";/,
+  it("keeps master password as the only unlock path", () => {
+    expect(typesSource).not.toMatch(/QuickUnlock|quickUnlock/);
+    expect(rendererSource).not.toMatch(
+      /QuickUnlock|quickUnlock|quick_unlock|unlock_with_device|Windows Hello|Touch ID|快速解锁|设备认证/,
     );
-    const statusContract = typesSource.slice(
-      typesSource.indexOf("export interface QuickUnlockStatus"),
-      typesSource.indexOf("export interface RestoreSelection"),
-    );
-    expect(statusContract).toMatch(/available:\s*boolean;/);
-    expect(statusContract).toMatch(/enabled:\s*boolean;/);
-    expect(statusContract).toMatch(/method:\s*QuickUnlockMethod;/);
-    expect(statusContract).toMatch(/label:\s*string;/);
-    expect(statusContract).toMatch(/reason\?:\s*string;/);
-    expect(statusContract).not.toMatch(/password|secret|deviceKey|wrappedKey/i);
+
+    const gate = sourceBetween("function renderGate", "function createPasswordField");
+    expect(gate).toContain('invokeCommand<void>(isCreate ? "create_vault" : "unlock_vault"');
+    expect(gate).toContain('"主密码"');
+    expect(gate).toContain('"输入主密码"');
   });
 
-  it("keeps configured state independent from current device availability", () => {
-    const normalize = sourceBetween(
-      "function normalizeQuickUnlockStatus",
-      "async function loadQuickUnlockStatus",
+  it("keeps native quick-auth implementations and dependencies removed", () => {
+    const productionBackend = [backendEntrySource, commandsSource, cryptoSource].join("\n");
+    expect(productionBackend).not.toMatch(
+      /device_auth|quick_unlock|WindowsHello|MacosKeychain|WebAuthN/,
     );
-    expect(normalize).toContain("enabled: Boolean(status.enabled)");
-    expect(normalize).not.toMatch(/enabled:\s*available\s*&&/);
-
-    const gate = sourceBetween("function renderGate", "function quickUnlockDeviceName");
-    expect(gate).toContain(
-      "state.quickUnlockStatus.available && state.quickUnlockStatus.enabled",
+    expect(cargoManifestSource).not.toMatch(
+      /objc2-local-authentication|security-framework(?:-sys)?|Win32_Networking_WindowsWebServices/,
     );
-
-    const settings = sourceBetween(
-      "function renderQuickUnlockSettingsCard",
-      "async function enableQuickUnlock",
-    );
-    expect(settings).toContain("if (!status.enabled && !status.available)");
-    expect(settings).toContain("} else if (!status.enabled) {");
-    expect(settings).toContain("} else {");
-    expect(settings).toContain("if (status.reason) {");
-    expect(settings).toContain("disableQuickUnlock(current.input, disableButton, error)");
-
-    const disable = sourceBetween("async function disableQuickUnlock", "function pageHeader");
-    expect(disable).toContain("!state.quickUnlockStatus.enabled");
-    expect(disable).not.toContain("!state.quickUnlockStatus.available");
   });
 
-  it("does not receive device secrets and sends only the current password when revoking", () => {
-    expect(rendererSource).toContain('invokeCommand<void>("unlock_with_device")');
-    expect(rendererSource).toContain('invokeCommand<void>("enable_quick_unlock")');
+  it("serializes sensitive settings, password changes, restores, and sync", () => {
     expect(rendererSource).toContain(
-      'invokeCommand<MasterPasswordChangeResult>("disable_quick_unlock", { currentPassword })',
-    );
-
-    const disable = sourceBetween("async function disableQuickUnlock", "function pageHeader");
-    const clearInputIndex = disable.indexOf('passwordInput.value = ""');
-    const invokeIndex = disable.indexOf('invokeCommand<MasterPasswordChangeResult>("disable_quick_unlock"');
-    const clearLocalIndex = disable.indexOf('currentPassword = ""', invokeIndex);
-    expect(clearInputIndex).toBeGreaterThan(-1);
-    expect(invokeIndex).toBeGreaterThan(clearInputIndex);
-    expect(clearLocalIndex).toBeGreaterThan(invokeIndex);
-  });
-
-  it("guards quick-unlock mutations against duplicate and stale responses", () => {
-    const unlock = sourceBetween("async function unlockWithDevice", "function createPasswordField");
-    const enable = sourceBetween("async function enableQuickUnlock", "async function disableQuickUnlock");
-    const disable = sourceBetween("async function disableQuickUnlock", "function pageHeader");
-
-    for (const operation of [unlock, enable, disable]) {
-      expect(operation).toContain("state.quickUnlockOperation !== null");
-      expect(operation).toContain("const epoch = state.epoch");
-      expect(operation).toContain("epoch !== state.epoch");
-    }
-    expect(unlock).toContain('state.quickUnlockOperation = "unlock"');
-    expect(unlock).toContain("await bootstrap()");
-    expect(enable).toContain('state.quickUnlockOperation = "enable"');
-    expect(disable).toContain('state.quickUnlockOperation = "disable"');
-
-    for (const operation of [enable, disable]) {
-      const reloadIndex = operation.indexOf("loadQuickUnlockStatus(");
-      const staleCheckIndex = operation.indexOf("epoch !== state.epoch", reloadIndex);
-      const stateWriteIndex = operation.indexOf(
-        "state.quickUnlockStatus = quickUnlockStatus",
-        reloadIndex,
-      );
-      expect(reloadIndex).toBeGreaterThan(-1);
-      expect(staleCheckIndex).toBeGreaterThan(reloadIndex);
-      expect(stateWriteIndex).toBeGreaterThan(staleCheckIndex);
-    }
-  });
-
-  it("serializes quick-unlock changes with master-password rotation", () => {
-    expect(rendererSource).toContain(
-      'type QuickUnlockOperation = "unlock" | "enable" | "disable" | "changePassword" | "restore" | "settings" | null',
+      'type SecurityOperation = "changePassword" | "restore" | "settings" | null',
     );
     const controlHelper = sourceBetween(
       "function setSecurityMutationControlsDisabled",
@@ -136,98 +74,32 @@ describe("renderer security boundary", () => {
     );
     expect(controlHelper).toContain('querySelectorAll<HTMLButtonElement>("[data-security-mutation]")');
 
-    const settings = sourceBetween("function renderSettingsPage", "function renderQuickUnlockSettingsCard");
+    const settings = sourceBetween("function renderSettingsPage", "function renderWebDavSyncSettingsCard");
     expect(settings).toContain('changeButton.dataset.securityMutation = "true"');
-    expect(settings).toContain("changeButton.disabled || state.quickUnlockOperation !== null");
-    expect(settings).toContain('state.quickUnlockOperation = "changePassword"');
+    expect(settings).toContain("changeButton.disabled || state.securityOperation !== null");
+    expect(settings).toContain('state.securityOperation = "changePassword"');
     expect(settings).toContain("setSecurityMutationControlsDisabled(true)");
+    expect(settings).toContain("state.securityOperation = null");
 
-    const quickSettings = sourceBetween(
-      "function renderQuickUnlockSettingsCard",
-      "async function enableQuickUnlock",
-    );
-    expect(quickSettings.match(/dataset\.securityMutation = "true"/g)).toHaveLength(2);
+    const restore = sourceBetween("async function restoreBackup", "async function manualLock");
+    expect(restore).toContain('state.securityOperation = "restore"');
+    expect(restore).toContain('state.securityOperation === "restore"');
 
-    const enable = sourceBetween("async function enableQuickUnlock", "async function disableQuickUnlock");
-    const disable = sourceBetween("async function disableQuickUnlock", "function pageHeader");
-    for (const operation of [enable, disable]) {
-      expect(operation).toContain("setSecurityMutationControlsDisabled(true)");
-      expect(operation).toContain("setSecurityMutationControlsDisabled(false)");
-    }
-  });
-
-  it("refreshes device enrollment after locking while a mutation may be in flight", () => {
-    const lock = sourceBetween("async function performLock", "function clearSensitiveState");
-    const lockCommandIndex = lock.indexOf('invokeCommand<void>("lock_vault")');
-    const reloadIndex = lock.indexOf("await loadQuickUnlockStatus()", lockCommandIndex);
-    const epochCheckIndex = lock.indexOf("lockEpoch === state.epoch", reloadIndex);
-    const stateWriteIndex = lock.indexOf(
-      "state.quickUnlockStatus = quickUnlockStatus",
-      epochCheckIndex,
-    );
-
-    expect(lock).toContain("const lockEpoch = state.epoch");
-    expect(lockCommandIndex).toBeGreaterThan(-1);
-    expect(reloadIndex).toBeGreaterThan(lockCommandIndex);
-    expect(epochCheckIndex).toBeGreaterThan(reloadIndex);
-    expect(stateWriteIndex).toBeGreaterThan(epochCheckIndex);
-  });
-
-  it("reloads quick-unlock state after a successful master-password rotation", () => {
-    const settings = sourceBetween("function renderSettingsPage", "function renderQuickUnlockSettingsCard");
-    const changeIndex = settings.indexOf('invokeCommand<MasterPasswordChangeResult>("change_master_password"');
-    const reloadIndex = settings.indexOf("loadQuickUnlockStatus({", changeIndex);
-    const staleCheckIndex = settings.indexOf("operationEpoch === state.epoch", reloadIndex);
-    const stateWriteIndex = settings.indexOf(
-      "state.quickUnlockStatus = quickUnlockStatus",
-      staleCheckIndex,
-    );
-    const renderIndex = settings.indexOf("renderMainShell()", stateWriteIndex);
-    const noticeIndex = settings.indexOf("设备快速解锁已关闭", renderIndex);
-
-    expect(changeIndex).toBeGreaterThan(-1);
-    expect(reloadIndex).toBeGreaterThan(changeIndex);
-    expect(staleCheckIndex).toBeGreaterThan(reloadIndex);
-    expect(stateWriteIndex).toBeGreaterThan(staleCheckIndex);
-    expect(renderIndex).toBeGreaterThan(stateWriteIndex);
-    expect(noticeIndex).toBeGreaterThan(renderIndex);
-  });
-
-  it("preserves the last trusted enrollment state when a status refresh fails", () => {
-    const loader = sourceBetween("async function loadQuickUnlockStatus", "function makeElement");
-    expect(loader).toContain("fallback: QuickUnlockStatus = state.quickUnlockStatus");
-    expect(loader).toContain("...fallback");
-    expect(loader).toContain("已保留上一次可信状态");
-
-    const enable = sourceBetween("async function enableQuickUnlock", "async function disableQuickUnlock");
-    expect(enable).toMatch(
-      /loadQuickUnlockStatus\(\{[\s\S]*\.\.\.state\.quickUnlockStatus,[\s\S]*enabled:\s*true/,
-    );
-
-    const disable = sourceBetween("async function disableQuickUnlock", "function pageHeader");
-    expect(disable).toMatch(
-      /loadQuickUnlockStatus\(\{[\s\S]*\.\.\.state\.quickUnlockStatus,[\s\S]*enabled:\s*false/,
-    );
-
-    const settings = sourceBetween("function renderSettingsPage", "function renderQuickUnlockSettingsCard");
-    const changeIndex = settings.indexOf('invokeCommand<MasterPasswordChangeResult>("change_master_password"');
-    const rotationReload = settings.slice(changeIndex, settings.indexOf("} catch", changeIndex));
-    expect(rotationReload).toMatch(
-      /loadQuickUnlockStatus\(\{[\s\S]*\.\.\.state\.quickUnlockStatus,[\s\S]*enabled:\s*false/,
-    );
+    const sync = sourceBetween("function beginSyncOperation", "function pageHeader");
+    expect(sync).toContain("state.securityOperation !== null");
   });
 
   it("uses a two-stage, preview-before-apply restore and cleans up every non-apply exit", () => {
-    const gate = sourceBetween("function renderGate", "function quickUnlockDeviceName");
+    const gate = sourceBetween("function renderGate", "function createPasswordField");
     expect(gate).toContain('restore.dataset.securityMutation = "true"');
-    const settings = sourceBetween("function renderSettingsPage", "function renderQuickUnlockSettingsCard");
+    const settings = sourceBetween("function renderSettingsPage", "function renderWebDavSyncSettingsCard");
     expect(settings).toContain('restoreButton.dataset.securityMutation = "true"');
 
     const restore = sourceBetween("async function restoreBackup", "async function manualLock");
-    expect(restore).toContain("state.quickUnlockOperation !== null || state.syncOperation !== null");
+    expect(restore).toContain("state.securityOperation !== null || state.syncOperation !== null");
     expect(restore).toContain("hasUnsavedDraft()");
     expect(restore).toContain("当前条目有未保存修改");
-    expect(restore).toContain('state.quickUnlockOperation = "restore"');
+    expect(restore).toContain('state.securityOperation = "restore"');
     expect(restore).toContain("setSecurityMutationControlsDisabled(true)");
     expect(restore).toContain('invokeCommand<RestoreSelection | null>("select_backup_for_restore")');
     expect(restore).toContain('invokeCommand<RestorePreview>("inspect_selected_backup"');
@@ -243,15 +115,13 @@ describe("renderer security boundary", () => {
     const clearPasswordIndex = restore.indexOf('masterPassword = ""', invokeIndex);
     const previewIndex = restore.indexOf("showRestorePreview(selection, preview)", clearPasswordIndex);
     const applyIndex = restore.indexOf('"apply_selected_backup"', previewIndex);
-    const revokeIndex = restore.indexOf("enabled: false", applyIndex);
-    const bootstrapIndex = restore.indexOf("await bootstrap()", revokeIndex);
+    const bootstrapIndex = restore.indexOf("await bootstrap()", applyIndex);
     expect(askIndex).toBeGreaterThan(selectionIndex);
     expect(invokeIndex).toBeGreaterThan(askIndex);
     expect(clearPasswordIndex).toBeGreaterThan(invokeIndex);
     expect(previewIndex).toBeGreaterThan(clearPasswordIndex);
     expect(applyIndex).toBeGreaterThan(previewIndex);
-    expect(revokeIndex).toBeGreaterThan(applyIndex);
-    expect(bootstrapIndex).toBeGreaterThan(revokeIndex);
+    expect(bootstrapIndex).toBeGreaterThan(applyIndex);
 
     const preview = sourceBetween("function showRestorePreview", "function handleGlobalShortcut");
     for (const field of ["preview.fileName", "selection.fileSize", "preview.itemCount", "preview.updatedAt", "preview.generation", "preview.vaultIdShort"]) {
@@ -268,11 +138,9 @@ describe("renderer security boundary", () => {
     expect(trusted).toContain("trustedSystemInteractionDepth += 1");
     expect(trusted).toContain("trustedSystemInteractionDepth - 1");
 
-    const unlock = sourceBetween("async function unlockWithDevice", "function createPasswordField");
-    const enable = sourceBetween("async function enableQuickUnlock", "async function disableQuickUnlock");
     const backup = sourceBetween("async function exportBackup", "async function restoreBackup");
     const restore = sourceBetween("async function restoreBackup", "async function manualLock");
-    for (const section of [unlock, enable, backup, restore]) {
+    for (const section of [backup, restore]) {
       expect(section).toContain("withTrustedSystemInteraction");
     }
 
@@ -441,7 +309,7 @@ describe("renderer security boundary", () => {
     expect(rendererSource).toContain('window.matchMedia("(max-width: 1100px)")');
     const settings = sourceBetween("function renderSettingsPage", "function renderWebDavSyncSettingsCard");
     expect(settings).toContain("if (compactSettingsMedia.matches)");
-    expect(settings).toContain("layout.append(security, quickUnlock, backup, master, sync)");
+    expect(settings).toContain("layout.append(security, backup, master, sync)");
   });
 
   it("keeps modal interactions single-layered and blocks background shortcuts", () => {
@@ -471,14 +339,14 @@ describe("renderer security boundary", () => {
     expect(sidebar).toContain("state.overview.totalEntries");
     expect(sidebar).toContain("state.overview.favoriteCount");
     expect(sidebar).not.toContain("state.overview.tags");
-    const settings = sourceBetween("function renderSettingsPage", "function renderQuickUnlockSettingsCard");
+    const settings = sourceBetween("function renderSettingsPage", "function renderWebDavSyncSettingsCard");
     expect(settings).toContain("state.overview.lastBackupAt");
     const bootstrap = sourceBetween("async function bootstrap", "function renderGate");
     expect(bootstrap).toContain('invokeCommand<VaultOverview>("vault_overview")');
   });
 
   it("soft-fails an invalid local sync sidecar without taking down the vault", () => {
-    const loader = sourceBetween("async function loadWebDavSyncStatusSafely", "async function loadQuickUnlockStatus");
+    const loader = sourceBetween("async function loadWebDavSyncStatusSafely", "function makeElement");
     expect(loader).toContain('invokeCommand<WebDavSyncStatus>("webdav_sync_status")');
     expect(loader).toContain("error: true");
     const bootstrap = sourceBetween("async function bootstrap", "function renderGate");

@@ -2,7 +2,7 @@
 //!
 //! WebDAV is treated as an untrusted byte store.  The module deliberately
 //! keeps the synchronization key, WebDAV credential, local vault key-wrap,
-//! settings, and platform quick-unlock records out of remote objects.
+//! settings, and retired device-authentication records out of remote objects.
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},

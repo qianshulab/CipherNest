@@ -8,7 +8,6 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use serde::Serialize;
 use sha2::{Digest, Sha256};
 use url::Url;
 use uuid::Uuid;
@@ -16,10 +15,8 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     crypto::{
-        create_device_key_slot, create_envelope, decrypt_envelope, decrypt_envelope_with_root_key,
-        read_device_slots, read_envelope, unwrap_device_root_key, update_payload,
-        write_device_slots_atomic, write_envelope_atomic, DeviceKeyProvider, DeviceSlotsEnvelope,
-        VaultEnvelope, DEVICE_KEY_BYTES, MAX_DEVICE_SLOTS, MAX_VAULT_BYTES,
+        create_envelope, decrypt_envelope, read_envelope, update_payload, write_envelope_atomic,
+        VaultEnvelope, MAX_VAULT_BYTES,
     },
     error::{VaultError, VaultResult},
     models::{
@@ -37,23 +34,7 @@ struct UnlockedVault {
     root_key: Zeroizing<[u8; 32]>,
     data: VaultData,
     envelope: VaultEnvelope,
-    unlock_method: UnlockMethod,
     session_id: String,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum UnlockMethod {
-    MasterPassword,
-    DeviceKey,
-}
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DeviceUnlockRegistration {
-    pub device_id: String,
-    pub label: String,
-    pub provider: DeviceKeyProvider,
-    pub created_at: u64,
 }
 
 pub(crate) struct NewSyncContext {
@@ -74,7 +55,8 @@ pub(crate) struct ExistingSyncContext {
 
 pub struct VaultStore {
     vault_path: PathBuf,
-    device_slots_path: PathBuf,
+    legacy_device_slots_path: PathBuf,
+    legacy_device_auth_path: PathBuf,
     sync_state_path: PathBuf,
     sync_transition_path: PathBuf,
     sync_restore_hold_path: PathBuf,
@@ -87,14 +69,16 @@ pub struct VaultStore {
 
 impl VaultStore {
     pub fn new(vault_path: PathBuf) -> Self {
-        let device_slots_path = device_slots_path_for(&vault_path);
+        let legacy_device_slots_path = sidecar_path_for(&vault_path, ".devices");
+        let legacy_device_auth_path = sidecar_path_for(&vault_path, ".device-auth");
         let sync_state_path = sidecar_path_for(&vault_path, ".sync");
         let sync_transition_path = sidecar_path_for(&vault_path, ".sync.next");
         let sync_restore_hold_path = sidecar_path_for(&vault_path, ".sync.restore-hold");
         let sync_restore_next_hold_path = sidecar_path_for(&vault_path, ".sync.next.restore-hold");
         Self {
             vault_path,
-            device_slots_path,
+            legacy_device_slots_path,
+            legacy_device_auth_path,
             sync_state_path,
             sync_transition_path,
             sync_restore_hold_path,
@@ -141,12 +125,14 @@ impl VaultStore {
             created_at: now,
             updated_at: now,
             last_backup_at: None,
+            password_only_unlock: true,
             settings: VaultSettings::default(),
             entries: vec![],
             tombstones: vec![],
         };
         let (envelope, root_key) = create_envelope(master_password, &data)?;
-        self.invalidate_device_slots()?;
+        self.invalidate_legacy_device_slots()?;
+        self.cleanup_legacy_device_auth_record();
         // A stale optional sync artifact must not prevent creating the local
         // vault. Make it inactive when possible; the fresh random root key also
         // makes any undeletable old sidecar cryptographically unusable.
@@ -156,7 +142,6 @@ impl VaultStore {
             root_key,
             data,
             envelope,
-            unlock_method: UnlockMethod::MasterPassword,
             session_id: Uuid::new_v4().to_string(),
         });
         self.failed_unlocks = 0;
@@ -180,173 +165,25 @@ impl VaultStore {
                     root_key,
                     data,
                     envelope,
-                    unlock_method: UnlockMethod::MasterPassword,
                     session_id: Uuid::new_v4().to_string(),
                 })
             });
-        self.finish_unlock_attempt(attempt)
-    }
+        self.finish_unlock_attempt(attempt)?;
 
-    pub fn device_unlock_registrations(&self) -> VaultResult<Vec<DeviceUnlockRegistration>> {
-        if !self.vault_path.is_file() {
-            return Err(VaultError::NotFound);
+        let needs_password_only_migration = self
+            .unlocked
+            .as_ref()
+            .is_some_and(|vault| !vault.data.password_only_unlock);
+        if needs_password_only_migration
+            && self
+                .rotate_root_key(master_password, master_password)
+                .is_err()
+        {
+            self.lock();
+            return Err(VaultError::PasswordOnlyMigrationFailed);
         }
-        let envelope = read_envelope(&self.vault_path)?;
-        let slots = self.load_device_slots(&envelope.vault_id)?;
-        Ok(slots
-            .slots
-            .into_iter()
-            .map(|slot| DeviceUnlockRegistration {
-                device_id: slot.device_id,
-                label: slot.label,
-                provider: slot.provider,
-                created_at: slot.created_at,
-            })
-            .collect())
-    }
-
-    /// Returns the public identifier from the authenticated vault envelope header.
-    /// This intentionally does not require an unlocked session: platform key stores
-    /// use the identifier to locate this vault's device-bound secret before unlock.
-    pub fn vault_id(&self) -> VaultResult<String> {
-        if !self.vault_path.is_file() {
-            return Err(VaultError::NotFound);
-        }
-        Ok(read_envelope(&self.vault_path)?.vault_id)
-    }
-
-    pub fn unlocked_vault_context(&mut self) -> VaultResult<(String, String)> {
-        self.require_unlocked()?;
-        let vault = self.unlocked.as_ref().ok_or(VaultError::Locked)?;
-        if vault.unlock_method != UnlockMethod::MasterPassword {
-            return Err(VaultError::InvalidInput(
-                "需要先使用主密码解锁，再启用设备快速解锁".into(),
-            ));
-        }
-        let context = (vault.data.vault_id.clone(), vault.session_id.clone());
-        self.touch();
-        Ok(context)
-    }
-
-    #[cfg(test)]
-    pub fn unlocked_vault_id(&mut self) -> VaultResult<String> {
-        self.unlocked_vault_context().map(|(vault_id, _)| vault_id)
-    }
-
-    #[cfg(test)]
-    pub fn enroll_device_with_key(
-        &mut self,
-        device_id: &str,
-        provider: DeviceKeyProvider,
-        label: &str,
-        device_key: &[u8; DEVICE_KEY_BYTES],
-    ) -> VaultResult<DeviceUnlockRegistration> {
-        self.enroll_device_with_key_inner(device_id, provider, label, device_key, None)
-    }
-
-    pub(crate) fn enroll_device_with_key_for_session(
-        &mut self,
-        expected_session_id: &str,
-        device_id: &str,
-        provider: DeviceKeyProvider,
-        label: &str,
-        device_key: &[u8; DEVICE_KEY_BYTES],
-    ) -> VaultResult<DeviceUnlockRegistration> {
-        self.enroll_device_with_key_inner(
-            device_id,
-            provider,
-            label,
-            device_key,
-            Some(expected_session_id),
-        )
-    }
-
-    fn enroll_device_with_key_inner(
-        &mut self,
-        device_id: &str,
-        provider: DeviceKeyProvider,
-        label: &str,
-        device_key: &[u8; DEVICE_KEY_BYTES],
-        expected_session_id: Option<&str>,
-    ) -> VaultResult<DeviceUnlockRegistration> {
-        self.require_unlocked()?;
-        let label = label.trim();
-        let (vault_id, root_key) = {
-            let vault = self.unlocked.as_ref().ok_or(VaultError::Locked)?;
-            if expected_session_id.is_some_and(|expected| expected != vault.session_id) {
-                return Err(VaultError::SyncLocalChanged);
-            }
-            if vault.unlock_method != UnlockMethod::MasterPassword {
-                return Err(VaultError::InvalidInput(
-                    "需要先使用主密码解锁，再启用设备快速解锁".into(),
-                ));
-            }
-            (vault.data.vault_id.clone(), Zeroizing::new(*vault.root_key))
-        };
-        let mut slots = self.load_device_slots(&vault_id)?;
-        if slots.slots.len() >= MAX_DEVICE_SLOTS {
-            return Err(VaultError::InvalidInput("设备解锁数量已达上限".into()));
-        }
-        if slots.slots.iter().any(|slot| slot.device_id == device_id) {
-            return Err(VaultError::InvalidInput("设备解锁标识已存在".into()));
-        }
-
-        let created_at = now_ms();
-        let slot = create_device_key_slot(
-            &root_key, device_key, &vault_id, device_id, label, provider, created_at,
-        )?;
-        slots.slots.push(slot);
-        write_device_slots_atomic(&self.device_slots_path, &slots)?;
-        self.touch();
-        Ok(DeviceUnlockRegistration {
-            device_id: device_id.into(),
-            label: label.into(),
-            provider,
-            created_at,
-        })
-    }
-
-    pub fn unlock_with_device_key(
-        &mut self,
-        device_id: &str,
-        device_key: &[u8; DEVICE_KEY_BYTES],
-    ) -> VaultResult<VaultStatus> {
-        validate_id(device_id)?;
-        if !self.vault_path.is_file() {
-            return Err(VaultError::NotFound);
-        }
-        self.wait_for_unlock_retry();
-
-        let attempt = read_envelope(&self.vault_path).and_then(|envelope| {
-            let slots = read_device_slots(&self.device_slots_path, &envelope.vault_id)?;
-            let slot = slots
-                .slots
-                .iter()
-                .find(|slot| slot.device_id == device_id)
-                .ok_or(VaultError::UnlockFailed)?;
-            let root_key = unwrap_device_root_key(slot, device_key, &envelope.vault_id)?;
-            let data = decrypt_envelope_with_root_key(&envelope, &root_key)?;
-            validate_loaded_data(&data).map_err(|_| VaultError::UnlockFailed)?;
-            Ok(UnlockedVault {
-                root_key,
-                data,
-                envelope,
-                unlock_method: UnlockMethod::DeviceKey,
-                session_id: Uuid::new_v4().to_string(),
-            })
-        });
-        self.finish_unlock_attempt(attempt)
-    }
-
-    /// Revokes every registered device key and rotates the VRK so a rolled-back
-    /// sidecar cannot restore access to the current payload.
-    pub fn revoke_device_unlock(
-        &mut self,
-        current_password: &str,
-    ) -> VaultResult<(Vec<DeviceUnlockRegistration>, MasterPasswordChangeResult)> {
-        let registrations = self.device_unlock_registrations().unwrap_or_default();
-        let rotation = self.rotate_root_key(current_password, current_password)?;
-        Ok((registrations, rotation))
+        self.cleanup_legacy_device_artifacts();
+        Ok(self.status().0)
     }
 
     pub fn lock(&mut self) -> bool {
@@ -937,6 +774,9 @@ impl VaultStore {
         data: VaultData,
     ) -> VaultResult<()> {
         validate_loaded_data(&data)?;
+        if !data.password_only_unlock {
+            return Err(VaultError::InvalidVault);
+        }
         // Move synchronization state out of its active names first. A failed
         // vault replacement restores it; a successful replacement leaves it
         // disabled, even if the process stops before cleanup.
@@ -948,7 +788,7 @@ impl VaultStore {
                 return Err(error);
             }
         };
-        if let Err(error) = self.invalidate_device_slots() {
+        if let Err(error) = self.invalidate_legacy_device_slots() {
             self.rollback_quarantine(quarantined.as_deref());
             self.rollback_held_sync_sidecars();
             return Err(error);
@@ -962,9 +802,9 @@ impl VaultStore {
             root_key,
             data,
             envelope,
-            unlock_method: UnlockMethod::MasterPassword,
             session_id: Uuid::new_v4().to_string(),
         });
+        self.cleanup_legacy_device_auth_record();
         self.last_activity = Instant::now();
         self.failed_unlocks = 0;
         self.retry_after = None;
@@ -1019,17 +859,25 @@ impl VaultStore {
         new_password: &str,
     ) -> VaultResult<MasterPasswordChangeResult> {
         self.require_unlocked()?;
-        let (sync_state, invalid_sync_state) = match self.load_sync_state() {
-            Ok(state) => (state, false),
-            Err(VaultError::Sync(_)) if self.sync_artifacts_present() => (None, true),
-            Err(error) => return Err(error),
-        };
         let mut next_data = {
             let vault = self.unlocked.as_ref().ok_or(VaultError::Locked)?;
             decrypt_envelope(current_password, &vault.envelope)
                 .map_err(|_| VaultError::UnlockFailed)?;
             vault.data.clone()
         };
+
+        // Once the master password has been proven, retire the only legacy file that can
+        // connect a platform-held device key to this vault before attempting any fallible
+        // migration I/O. A failed sync rewrap or backup must never leave that shortcut active.
+        self.invalidate_legacy_device_slots()?;
+        self.cleanup_legacy_device_auth_record();
+
+        let (sync_state, invalid_sync_state) = match self.load_sync_state() {
+            Ok(state) => (state, false),
+            Err(VaultError::Sync(_)) if self.sync_artifacts_present() => (None, true),
+            Err(error) => return Err(error),
+        };
+        next_data.password_only_unlock = true;
         bump_generation(&mut next_data, now_ms());
         let (next_envelope, next_root_key) = create_envelope(new_password, &next_data)?;
         let current_root_key = {
@@ -1059,15 +907,14 @@ impl VaultStore {
         }
         self.backup_current()?;
 
-        // Revoke first and fail closed. If the following vault write fails, password unlock
-        // still works with the previous file, but device unlock must be enrolled again.
-        self.invalidate_device_slots()?;
+        // Any reported write failure makes the unlock caller discard its in-memory session.
+        // The next master-password unlock validates the actual disk state and retries when the
+        // password-only marker is still absent. The legacy device slot was removed above.
         write_envelope_atomic(&self.vault_path, &next_envelope)?;
         let vault = self.unlocked.as_mut().ok_or(VaultError::Locked)?;
         vault.root_key = next_root_key;
         vault.data = next_data;
         vault.envelope = next_envelope;
-        vault.unlock_method = UnlockMethod::MasterPassword;
         vault.session_id = Uuid::new_v4().to_string();
 
         let (sync_config_preserved, warning) = if invalid_sync_state {
@@ -1100,6 +947,7 @@ impl VaultStore {
         } else {
             (true, None)
         };
+        self.cleanup_legacy_device_auth_record();
         self.touch();
         Ok(MasterPasswordChangeResult {
             sync_config_preserved,
@@ -1143,20 +991,37 @@ impl VaultStore {
         }
     }
 
-    fn load_device_slots(&self, vault_id: &str) -> VaultResult<DeviceSlotsEnvelope> {
-        if self.device_slots_path.exists() {
-            read_device_slots(&self.device_slots_path, vault_id)
-        } else {
-            Ok(DeviceSlotsEnvelope::empty(vault_id))
-        }
-    }
-
-    fn invalidate_device_slots(&self) -> VaultResult<()> {
-        match fs::remove_file(&self.device_slots_path) {
-            Ok(()) => Ok(()),
+    fn invalidate_legacy_device_slots(&self) -> VaultResult<()> {
+        match fs::remove_file(&self.legacy_device_slots_path) {
+            Ok(()) => {
+                #[cfg(unix)]
+                {
+                    let parent = self
+                        .legacy_device_slots_path
+                        .parent()
+                        .ok_or(VaultError::SaveFailed)?;
+                    File::open(parent)
+                        .and_then(|directory| directory.sync_all())
+                        .map_err(|_| VaultError::SaveFailed)?;
+                }
+                Ok(())
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(_) => Err(VaultError::SaveFailed),
         }
+    }
+
+    fn cleanup_legacy_device_auth_record(&self) {
+        match fs::remove_file(&self.legacy_device_auth_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {}
+        }
+    }
+
+    fn cleanup_legacy_device_artifacts(&self) {
+        let _ = self.invalidate_legacy_device_slots();
+        self.cleanup_legacy_device_auth_record();
     }
 
     fn load_sync_state(&self) -> VaultResult<Option<LocalSyncState>> {
@@ -1905,12 +1770,6 @@ fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
     }
 }
 
-fn device_slots_path_for(vault_path: &Path) -> PathBuf {
-    let mut path = OsString::from(vault_path.as_os_str());
-    path.push(".devices");
-    PathBuf::from(path)
-}
-
 fn sidecar_path_for(vault_path: &Path, suffix: &str) -> PathBuf {
     let mut path = OsString::from(vault_path.as_os_str());
     path.push(suffix);
@@ -2318,122 +2177,123 @@ mod tests {
     }
 
     #[test]
-    fn device_key_unlock_is_cryptographic_and_revocable() {
+    fn first_password_unlock_retires_legacy_device_access_once() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("vault.cnvault");
-        let mut store = VaultStore::new(path);
+        let mut store = VaultStore::new(path.clone());
         let master_password = "test master passphrase with enough length";
         store.create(master_password).unwrap();
         let summary = store
             .save_entry(EntryInput {
                 id: None,
                 expected_revision: None,
-                title: "Device unlock".into(),
+                title: "Password-only migration".into(),
                 username: "local-user".into(),
-                password: "K7!device-bound#secret".into(),
+                password: "K7!migration-secret".into(),
                 url: "https://example.com".into(),
-                purpose: "device-key regression".into(),
+                purpose: "legacy retirement regression".into(),
                 notes: String::new(),
                 tags: vec![],
                 favorite: false,
             })
             .unwrap();
-        let device_key = crate::crypto::generate_device_key().unwrap();
-        let device_id = Uuid::new_v4().to_string();
-        let registration = store
-            .enroll_device_with_key(
-                &device_id,
-                DeviceKeyProvider::MacosKeychain,
-                "This Mac",
-                &device_key,
-            )
-            .unwrap();
-        assert_eq!(
-            store.unlocked_vault_id().unwrap(),
-            read_envelope(&store.vault_path).unwrap().vault_id
-        );
-        assert_eq!(store.device_unlock_registrations().unwrap().len(), 1);
-        let enrolled_sidecar = fs::read(&store.device_slots_path).unwrap();
 
+        let mut legacy_data = store.unlocked.as_ref().unwrap().data.clone();
+        legacy_data.password_only_unlock = false;
+        bump_generation(&mut legacy_data, now_ms());
+        store.persist(legacy_data).unwrap();
+        let before = read_envelope(&path).unwrap();
+        let (before_root_key, before_data) = decrypt_envelope(master_password, &before).unwrap();
+        assert!(!before_data.password_only_unlock);
+
+        fs::write(&store.legacy_device_slots_path, b"legacy-slot-record").unwrap();
+        fs::write(&store.legacy_device_auth_path, b"legacy-device-record").unwrap();
         assert!(store.lock());
-        assert_eq!(
-            store.vault_id().unwrap(),
-            read_envelope(&store.vault_path).unwrap().vault_id
-        );
-        let wrong_device_key = [0x5A; DEVICE_KEY_BYTES];
-        assert!(store
-            .unlock_with_device_key(&registration.device_id, &wrong_device_key)
-            .is_err());
-        store
-            .unlock_with_device_key(&registration.device_id, &device_key)
-            .unwrap();
+        store.unlock(master_password).unwrap();
+
+        let migrated = read_envelope(&path).unwrap();
+        let (migrated_root_key, migrated_data) =
+            decrypt_envelope(master_password, &migrated).unwrap();
+        assert!(migrated_data.password_only_unlock);
+        assert_eq!(migrated.generation, before.generation + 1);
+        assert_ne!(before_root_key.as_ref(), migrated_root_key.as_ref());
+        assert!(!store.legacy_device_slots_path.exists());
+        assert!(!store.legacy_device_auth_path.exists());
         assert_eq!(
             store.get_entry(&summary.id).unwrap().password,
-            "K7!device-bound#secret"
+            "K7!migration-secret"
         );
-        let second_device_key = crate::crypto::generate_device_key().unwrap();
-        assert!(store
-            .enroll_device_with_key(
-                &Uuid::new_v4().to_string(),
-                DeviceKeyProvider::MacosKeychain,
-                "Second Mac",
-                &second_device_key,
-            )
-            .is_err());
 
-        let revoked = store.revoke_device_unlock(master_password).unwrap();
-        assert_eq!(revoked.0.len(), 1);
-        assert_eq!(revoked.0[0].device_id, registration.device_id);
-        assert!(store.device_unlock_registrations().unwrap().is_empty());
         assert!(store.lock());
-
-        // Restoring the old sidecar must not restore access after revocation rotated the VRK.
-        fs::write(&store.device_slots_path, enrolled_sidecar).unwrap();
-        assert!(store
-            .unlock_with_device_key(&registration.device_id, &device_key,)
-            .is_err());
         store.unlock(master_password).unwrap();
-        assert_eq!(store.get_entry(&summary.id).unwrap().title, "Device unlock");
+        assert_eq!(
+            read_envelope(&path).unwrap().generation,
+            migrated.generation
+        );
     }
 
     #[test]
-    fn exported_backup_never_contains_device_key_or_sidecar() {
+    fn failed_password_only_migration_still_retires_legacy_device_slot() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vault.cnvault");
+        let mut store = VaultStore::new(path.clone());
+        let master_password = "migration failure passphrase long enough";
+        store.create(master_password).unwrap();
+
+        let legacy_envelope = {
+            let vault = store.unlocked.as_ref().unwrap();
+            let mut legacy_data = vault.data.clone();
+            legacy_data.password_only_unlock = false;
+            bump_generation(&mut legacy_data, now_ms());
+            update_payload(&vault.envelope, &vault.root_key, &legacy_data).unwrap()
+        };
+        write_envelope_atomic(&path, &legacy_envelope).unwrap();
+        fs::write(&store.legacy_device_slots_path, b"legacy-slot-record").unwrap();
+        fs::write(&store.legacy_device_auth_path, b"legacy-device-record").unwrap();
+        assert!(store.lock());
+
+        // A regular file at the backup directory path forces backup_current() to fail after
+        // password verification. The legacy slot must already be absent at that point.
+        fs::write(directory.path().join("backups"), b"not-a-directory").unwrap();
+        assert!(matches!(
+            store.unlock(master_password),
+            Err(VaultError::PasswordOnlyMigrationFailed)
+        ));
+        assert!(!store.status().0.unlocked);
+        assert!(!store.legacy_device_slots_path.exists());
+        assert!(!store.legacy_device_auth_path.exists());
+
+        let unchanged = read_envelope(&path).unwrap();
+        let (_, unchanged_data) = decrypt_envelope(master_password, &unchanged).unwrap();
+        assert!(!unchanged_data.password_only_unlock);
+        assert_eq!(unchanged.generation, legacy_envelope.generation);
+    }
+
+    #[test]
+    fn exported_backup_never_copies_retired_auth_sidecars() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("vault.cnvault");
         let backup_path = directory.path().join("portable-backup.cnvault");
         let mut store = VaultStore::new(path.clone());
         let master_password = "test master passphrase with enough length";
         store.create(master_password).unwrap();
-        let device_key = crate::crypto::generate_device_key().unwrap();
-        let device_id = Uuid::new_v4().to_string();
-        let registration = store
-            .enroll_device_with_key(
-                &device_id,
-                DeviceKeyProvider::WindowsHello,
-                "Windows PC",
-                &device_key,
-            )
-            .unwrap();
+        fs::write(&store.legacy_device_slots_path, b"retired-slot-record").unwrap();
+        fs::write(&store.legacy_device_auth_path, b"retired-device-record").unwrap();
 
         store.export_to(&backup_path).unwrap();
 
         let backup = read_envelope(&backup_path).unwrap();
         let (backup_root_key, backup_data) = decrypt_envelope(master_password, &backup).unwrap();
-        assert!(!device_slots_path_for(&backup_path).exists());
-        let backup_bytes = fs::read(&backup_path).unwrap();
-        assert!(!backup_bytes
-            .windows(device_key.len())
-            .any(|window| window == device_key.as_ref()));
+        assert!(!sidecar_path_for(&backup_path, ".devices").exists());
+        assert!(!sidecar_path_for(&backup_path, ".device-auth").exists());
         assert!(path.is_file());
 
         store
             .replace_with_verified_backup(backup, backup_root_key, backup_data)
             .unwrap();
-        assert!(store.device_unlock_registrations().unwrap().is_empty());
+        assert!(!store.legacy_device_slots_path.exists());
+        assert!(!store.legacy_device_auth_path.exists());
         assert!(store.lock());
-        assert!(store
-            .unlock_with_device_key(&registration.device_id, &device_key,)
-            .is_err());
         store.unlock(master_password).unwrap();
     }
 
@@ -2460,16 +2320,8 @@ mod tests {
                 favorite: false,
             })
             .unwrap();
-        let device_key = crate::crypto::generate_device_key().unwrap();
-        let device_id = Uuid::new_v4().to_string();
-        let registration = store
-            .enroll_device_with_key(
-                &device_id,
-                DeviceKeyProvider::MacosKeychain,
-                "Rekey Mac",
-                &device_key,
-            )
-            .unwrap();
+        fs::write(&store.legacy_device_slots_path, b"retired-slot-record").unwrap();
+        fs::write(&store.legacy_device_auth_path, b"retired-device-record").unwrap();
         let before_change = read_envelope(&path).unwrap();
 
         store
@@ -2492,9 +2344,11 @@ mod tests {
         assert!(old_root_key.as_ref() != new_root_key.as_ref());
         assert_eq!(decrypted.entries.len(), 1);
         assert_eq!(decrypted.entries[0].id, summary.id);
+        assert!(decrypted.password_only_unlock);
         assert!(decrypt_envelope(old_password, &current).is_err());
         assert!(decrypt_envelope(new_password, &old_backup).is_err());
-        assert!(store.device_unlock_registrations().unwrap().is_empty());
+        assert!(!store.legacy_device_slots_path.exists());
+        assert!(!store.legacy_device_auth_path.exists());
 
         // Combine the old backup's valid key wrap with the current payload. If the old root key
         // had been reused, this hybrid envelope would decrypt with the old master password.
@@ -2508,9 +2362,6 @@ mod tests {
         settings.auto_lock_minutes = 10;
         store.update_settings(settings).unwrap();
         assert!(store.lock());
-        assert!(store
-            .unlock_with_device_key(&registration.device_id, &device_key,)
-            .is_err());
         assert!(store.unlock(old_password).is_err());
         store.unlock(new_password).unwrap();
         assert_eq!(
@@ -2670,31 +2521,6 @@ mod tests {
             Err(VaultError::SyncLocalChanged)
         ));
         assert!(!store.sync_state_path.exists());
-    }
-
-    #[test]
-    fn quick_unlock_enrollment_from_a_previous_session_is_rejected() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("vault.cnvault");
-        let mut store = VaultStore::new(path);
-        let password = "quick unlock session passphrase long enough";
-        store.create(password).unwrap();
-        let (_, old_session_id) = store.unlocked_vault_context().unwrap();
-        store.lock();
-        store.unlock(password).unwrap();
-        let device_key = [7_u8; DEVICE_KEY_BYTES];
-
-        assert!(matches!(
-            store.enroll_device_with_key_for_session(
-                &old_session_id,
-                &Uuid::new_v4().to_string(),
-                DeviceKeyProvider::MacosKeychain,
-                "stale session",
-                &device_key,
-            ),
-            Err(VaultError::SyncLocalChanged)
-        ));
-        assert!(!store.device_slots_path.exists());
     }
 
     #[test]

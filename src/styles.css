@@ -755,48 +755,6 @@ p {
   gap: 16px;
 }
 
-.gate-divider {
-  display: grid;
-  align-items: center;
-  gap: 10px;
-  margin: -1px 0;
-  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
-  color: var(--text-muted);
-}
-
-.gate-divider span {
-  height: 1px;
-  background: var(--border-soft);
-}
-
-.gate-divider em {
-  font-size: 10px;
-  font-style: normal;
-}
-
-.quick-unlock-button {
-  border-color: var(--orange-border);
-  background: var(--orange-soft);
-}
-
-.quick-unlock-button:not(:disabled):hover {
-  border-color: var(--orange);
-  background: rgba(255, 122, 24, 0.18);
-}
-
-.gate-quick-unlock-help {
-  margin: -7px 4px 0;
-  color: var(--text-muted);
-  font-size: 11px;
-  line-height: 1.55;
-  text-align: center;
-}
-
-.quick-unlock-error {
-  margin-top: -8px;
-  text-align: center;
-}
-
 .strength-block {
   display: grid;
   gap: 7px;
@@ -2133,76 +2091,6 @@ p {
   flex-wrap: wrap;
   gap: 9px;
   padding: 15px 18px 18px;
-}
-
-.quick-unlock-content {
-  padding: 16px 18px 18px;
-}
-
-.quick-unlock-status-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.quick-unlock-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  border: 1px solid var(--border);
-  border-radius: 99px;
-  padding: 6px 10px;
-  background: rgba(255, 255, 255, 0.025);
-  color: var(--text-secondary);
-  font-size: 11px;
-}
-
-.quick-unlock-badge.is-enabled {
-  border-color: rgba(70, 201, 137, 0.28);
-  background: var(--green-soft);
-  color: #9ce1be;
-}
-
-.quick-unlock-explanation,
-.quick-unlock-disable-help {
-  color: var(--text-secondary);
-  font-size: 11px;
-  line-height: 1.65;
-}
-
-.quick-unlock-explanation {
-  margin: 13px 0 0;
-}
-
-.quick-unlock-reason {
-  margin-top: 14px;
-}
-
-.quick-unlock-actions {
-  display: flex;
-  justify-content: flex-end;
-  margin-top: 15px;
-}
-
-.quick-unlock-disable-form {
-  display: grid;
-  gap: 12px;
-  margin-top: 14px;
-  border-top: 1px solid var(--border-soft);
-  padding-top: 14px;
-}
-
-.quick-unlock-disable-help {
-  margin: 0;
-}
-
-.quick-unlock-disable-form > .button {
-  justify-self: end;
-}
-
-.quick-unlock-settings-error {
-  margin-top: 10px;
 }
 
 .compact-form {

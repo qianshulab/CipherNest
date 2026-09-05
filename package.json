@@ -1,7 +1,7 @@
 {
   "name": "ciphernest-vault",
   "private": true,
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Local-first, encrypted password vault for Windows, macOS and Linux",
   "type": "module",
   "scripts": {
@@ -11,8 +11,8 @@
     "test": "vitest run",
     "tauri": "tauri",
     "desktop:dev": "tauri dev",
-    "desktop:build": "npm run test && tauri build",
-    "check": "npm run test && npm run build && cargo test --manifest-path src-tauri/Cargo.toml"
+    "desktop:build": "pnpm test && tauri build -- --locked",
+    "check": "pnpm test && pnpm build && cargo test --manifest-path src-tauri/Cargo.toml --locked"
   },
   "dependencies": {
     "@tauri-apps/api": "2.11.1"

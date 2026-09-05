@@ -86,6 +86,11 @@ pub struct VaultData {
     pub created_at: u64,
     pub updated_at: u64,
     pub last_backup_at: Option<u64>,
+    /// Missing on vaults created before password-only unlock became mandatory.
+    /// The first successful master-password unlock rotates the vault root key
+    /// before this flag is persisted, revoking any copied legacy device slot.
+    #[serde(default)]
+    pub password_only_unlock: bool,
     pub settings: VaultSettings,
     pub entries: Vec<VaultEntry>,
     pub tombstones: Vec<Tombstone>,
@@ -107,17 +112,6 @@ pub struct VaultOverview {
     pub favorite_count: usize,
     pub security_issue_count: usize,
     pub last_backup_at: Option<u64>,
-}
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct QuickUnlockStatus {
-    pub available: bool,
-    pub enabled: bool,
-    pub method: String,
-    pub label: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
 }
 
 #[derive(Clone, Serialize)]

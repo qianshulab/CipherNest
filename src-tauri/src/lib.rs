@@ -1,6 +1,5 @@
 mod commands;
 mod crypto;
-mod device_auth;
 mod error;
 mod generator;
 mod models;
@@ -33,10 +32,6 @@ pub fn run() {
             commands::vault_status,
             commands::create_vault,
             commands::unlock_vault,
-            commands::quick_unlock_status,
-            commands::enable_quick_unlock,
-            commands::unlock_with_device,
-            commands::disable_quick_unlock,
             commands::lock_vault,
             commands::list_entries,
             commands::vault_overview,

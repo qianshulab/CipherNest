@@ -595,7 +595,7 @@ dependencies = [
 
 [[package]]
 name = "ciphernest"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "argon2",
  "atomicwrites",
@@ -603,11 +603,8 @@ dependencies = [
  "chacha20poly1305",
  "getrandom 0.3.4",
  "hkdf",
- "objc2-local-authentication",
  "quick-xml",
  "reqwest 0.12.28",
- "security-framework",
- "security-framework-sys",
  "serde",
  "serde_json",
  "sha2",
@@ -622,7 +619,6 @@ dependencies = [
  "unicode-normalization",
  "url",
  "uuid",
- "windows",
  "zeroize",
 ]
 
@@ -2618,16 +2614,6 @@ dependencies = [
  "bitflags 2.13.1",
  "objc2",
  "objc2-core-foundation",
-]
-
-[[package]]
-name = "objc2-local-authentication"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e48e0b8b339e0d9d2ed4416b7f93f9d4daadff7d4dd797f89867cde11aeac607"
-dependencies = [
- "objc2",
- "objc2-foundation",
 ]
 
 [[package]]

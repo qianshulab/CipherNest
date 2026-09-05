@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import brandLogoUrl from "./assets/ciphernest-logo-ui-v1.png";
-import { describeEntrySaveFailure, type EntryField } from "./entry-errors";
+import { describeEntrySaveFailure, describeUnlockFailure, type EntryField } from "./entry-errors";
 import "./styles.css";
 
 import type {
@@ -11,7 +11,6 @@ import type {
   GeneratedPassword,
   GeneratorOptions,
   MasterPasswordChangeResult,
-  QuickUnlockStatus,
   RestorePreview,
   RestoreSelection,
   SecurityIssue,
@@ -77,7 +76,7 @@ interface WebDavJoinDetails {
   recoveryCode: string;
 }
 
-type QuickUnlockOperation = "unlock" | "enable" | "disable" | "changePassword" | "restore" | "settings" | null;
+type SecurityOperation = "changePassword" | "restore" | "settings" | null;
 type EntryMutation = "saving" | "deleting" | "favoriting" | null;
 type SyncOperation = "create" | "inspect" | "join" | "sync" | "reveal" | "disable" | null;
 
@@ -91,8 +90,7 @@ interface ManagedSensitiveInput {
 interface AppState {
   status: VaultStatus;
   overview: VaultOverview;
-  quickUnlockStatus: QuickUnlockStatus;
-  quickUnlockOperation: QuickUnlockOperation;
+  securityOperation: SecurityOperation;
   syncStatus: WebDavSyncStatus;
   syncStatusError: boolean;
   syncOperation: SyncOperation;
@@ -155,14 +153,6 @@ const EMPTY_OVERVIEW: VaultOverview = {
   securityIssueCount: 0,
 };
 
-const EMPTY_QUICK_UNLOCK_STATUS: QuickUnlockStatus = {
-  available: false,
-  enabled: false,
-  method: "unsupported",
-  label: "设备快速解锁",
-  reason: "当前设备不支持快速解锁，或暂时无法读取设备认证状态。",
-};
-
 const EMPTY_SYNC_STATUS: WebDavSyncStatus = {
   configured: false,
   pendingLocalChanges: false,
@@ -171,8 +161,7 @@ const EMPTY_SYNC_STATUS: WebDavSyncStatus = {
 const state: AppState = {
   status: { ...EMPTY_STATUS },
   overview: { ...EMPTY_OVERVIEW },
-  quickUnlockStatus: { ...EMPTY_QUICK_UNLOCK_STATUS },
-  quickUnlockOperation: null,
+  securityOperation: null,
   syncStatus: { ...EMPTY_SYNC_STATUS },
   syncStatusError: false,
   syncOperation: null,
@@ -269,25 +258,6 @@ function normalizeSettings(settings: VaultSettings): VaultSettings {
   };
 }
 
-function normalizeQuickUnlockStatus(status: QuickUnlockStatus): QuickUnlockStatus {
-  const method = ["touchId", "windowsHello", "unsupported"].includes(status.method)
-    ? status.method
-    : "unsupported";
-  const available = Boolean(status.available) && method !== "unsupported";
-  const defaultLabel = method === "touchId"
-    ? "Touch ID"
-    : method === "windowsHello"
-      ? "Windows Hello"
-      : "设备快速解锁";
-  return {
-    available,
-    enabled: Boolean(status.enabled),
-    method,
-    label: typeof status.label === "string" && status.label.trim() ? status.label.trim() : defaultLabel,
-    ...(typeof status.reason === "string" && status.reason.trim() ? { reason: status.reason.trim() } : {}),
-  };
-}
-
 function normalizeWebDavSyncStatus(status: WebDavSyncStatus): WebDavSyncStatus {
   return {
     configured: Boolean(status.configured),
@@ -308,20 +278,6 @@ async function loadWebDavSyncStatusSafely(
     return { status: normalizeWebDavSyncStatus(status), error: false };
   } catch {
     return { status: normalizeWebDavSyncStatus(fallback), error: true };
-  }
-}
-
-async function loadQuickUnlockStatus(
-  fallback: QuickUnlockStatus = state.quickUnlockStatus,
-): Promise<QuickUnlockStatus> {
-  try {
-    const status = await invokeCommand<QuickUnlockStatus>("quick_unlock_status");
-    return normalizeQuickUnlockStatus(status);
-  } catch {
-    return {
-      ...fallback,
-      reason: "暂时无法刷新设备认证状态；已保留上一次可信状态。主密码仍可正常使用。",
-    };
   }
 }
 
@@ -534,6 +490,10 @@ function setEntryEditorFrozen(frozen: boolean): void {
 }
 
 function blockEntryActionWhileMutating(): boolean {
+  if (state.securityOperation !== null) {
+    showToast("正在完成安全设置，请稍候。", "info", 2200);
+    return true;
+  }
   if (state.syncOperation !== null) {
     showToast("正在完成手动同步，请稍候。", "info", 2200);
     return true;
@@ -630,16 +590,12 @@ function renderFatal(): void {
 async function bootstrap(): Promise<void> {
   state.epoch += 1;
   const epoch = state.epoch;
-  state.quickUnlockOperation = null;
+  state.securityOperation = null;
   renderLoading();
   try {
-    const [status, quickUnlockStatus] = await Promise.all([
-      invokeCommand<VaultStatus>("vault_status"),
-      loadQuickUnlockStatus(),
-    ]);
+    const status = await invokeCommand<VaultStatus>("vault_status");
     if (epoch !== state.epoch) return;
     state.status = status;
-    state.quickUnlockStatus = quickUnlockStatus;
     if (!status.exists || !status.unlocked) {
       clearSensitiveState(true);
       renderGate();
@@ -771,35 +727,14 @@ function renderGate(): void {
   submit.type = "submit";
   form.append(submit);
 
-  if (!isCreate && state.quickUnlockStatus.available && state.quickUnlockStatus.enabled) {
-    const quickUnlockDivider = makeElement("div", "gate-divider");
-    quickUnlockDivider.append(makeElement("span"), makeElement("em", "", "或"), makeElement("span"));
-    const quickUnlockError = makeElement("p", "form-error quick-unlock-error");
-    quickUnlockError.setAttribute("role", "alert");
-    const deviceName = quickUnlockDeviceName(state.quickUnlockStatus);
-    const quickUnlockButton = makeButton(
-      `使用 ${deviceName} 快速解锁`,
-      "button button-secondary button-full quick-unlock-button",
-      async () => unlockWithDevice(quickUnlockButton, submit, passwordGroup.input, quickUnlockError),
-      "key",
-    );
-    quickUnlockButton.disabled = state.quickUnlockOperation !== null;
-    const quickUnlockHelp = makeElement(
-      "p",
-      "gate-quick-unlock-help",
-      "这是替代输入主密码的设备便捷通道，不是第二因素；你始终可以改用主密码解锁。",
-    );
-    form.append(quickUnlockDivider, quickUnlockButton, quickUnlockHelp, quickUnlockError);
-  }
-
   const restore = makeButton("从加密备份恢复", "button button-ghost button-full", restoreBackup, "upload");
   restore.dataset.securityMutation = "true";
-  restore.disabled = state.quickUnlockOperation !== null;
+  restore.disabled = state.securityOperation !== null;
   form.append(restore);
 
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
-    if (submit.disabled || state.quickUnlockOperation !== null) return;
+    if (submit.disabled || state.securityOperation !== null) return;
     error.textContent = "";
     let masterPassword = passwordGroup.input.value;
     if (isCreate) {
@@ -827,13 +762,13 @@ function renderGate(): void {
       if (confirmInput) confirmInput.value = "";
       masterPassword = "";
       await bootstrap();
-    } catch {
+    } catch (caught) {
       passwordGroup.input.value = "";
       if (confirmInput) confirmInput.value = "";
       masterPassword = "";
       error.textContent = isCreate
         ? "无法创建保险库。数据未被保存，请检查磁盘权限后重试。"
-        : "无法解锁保险库，请检查主密码或保险库文件是否正确。";
+        : describeUnlockFailure(caught);
       setBusy(submit, false);
       passwordGroup.input.focus();
     }
@@ -862,50 +797,6 @@ function renderGate(): void {
   screen.append(layout);
   app.append(screen);
   window.setTimeout(() => passwordGroup.input.focus(), 0);
-}
-
-function quickUnlockDeviceName(status: QuickUnlockStatus): string {
-  if (status.method === "touchId") return "Touch ID";
-  if (status.method === "windowsHello") return "Windows Hello";
-  return status.label || "设备认证";
-}
-
-async function unlockWithDevice(
-  button: HTMLButtonElement,
-  passwordSubmit: HTMLButtonElement,
-  passwordInput: HTMLInputElement,
-  error: HTMLElement,
-): Promise<void> {
-  if (
-    state.quickUnlockOperation !== null
-    || passwordSubmit.disabled
-    || !state.status.exists
-    || state.status.unlocked
-    || !state.quickUnlockStatus.available
-    || !state.quickUnlockStatus.enabled
-  ) return;
-
-  const epoch = state.epoch;
-  const deviceName = quickUnlockDeviceName(state.quickUnlockStatus);
-  state.quickUnlockOperation = "unlock";
-  error.textContent = "";
-  passwordInput.value = "";
-  hideAllManagedSensitiveInputs();
-  passwordSubmit.disabled = true;
-  setBusy(button, true, `正在验证 ${deviceName}…`);
-  try {
-    await withTrustedSystemInteraction(() => invokeCommand<void>("unlock_with_device"));
-    if (epoch !== state.epoch) return;
-    state.quickUnlockOperation = null;
-    await bootstrap();
-  } catch {
-    if (epoch !== state.epoch) return;
-    state.quickUnlockOperation = null;
-    setBusy(button, false);
-    passwordSubmit.disabled = false;
-    error.textContent = `${deviceName} 认证未完成或已取消。请重试，或使用主密码解锁。`;
-    button.focus();
-  }
 }
 
 function createPasswordField(
@@ -990,7 +881,9 @@ function renderMainShell(): void {
   }
   app.append(shell);
   setModalBackgroundHidden(hasOpenModal());
-  setEntryEditorFrozen(state.entryMutation !== null || state.syncOperation !== null);
+  setEntryEditorFrozen(
+    state.entryMutation !== null || state.syncOperation !== null || state.securityOperation !== null,
+  );
   updateClipboardStatus();
 }
 
@@ -1021,8 +914,10 @@ function renderTopbar(): HTMLElement {
   const actions = makeElement("div", "topbar-actions");
   const generate = makeButton("生成密码", "button button-ghost topbar-button", () => openGenerator("standalone"), "key");
   generate.title = shortcutTitle("G");
+  generate.dataset.securityMutation = "true";
   const add = makeButton("新建条目", "button button-primary topbar-button", createNewEntry, "plus");
   add.title = shortcutTitle("N");
+  add.dataset.securityMutation = "true";
   const lock = iconButton("立即锁定", "lock", manualLock, "icon-button lock-button");
   lock.title = `立即锁定 (${shortcutLabel("L")})`;
   actions.append(generate, add, lock);
@@ -1353,7 +1248,10 @@ function shortcutPill(keys: string, label: string): HTMLElement {
 function renderEntryEditor(): HTMLElement {
   const draft = state.draft as EntryInput;
   const editor = makeElement("div", "entry-editor");
-  editor.setAttribute("aria-busy", String(state.entryMutation !== null));
+  editor.setAttribute(
+    "aria-busy",
+    String(state.entryMutation !== null || state.syncOperation !== null || state.securityOperation !== null),
+  );
   const top = makeElement("header", "editor-header");
   const identity = makeElement("div", "editor-identity");
   identity.append(iconButton("返回条目列表", "back", returnToList, "icon-button mobile-back"));
@@ -1789,7 +1687,7 @@ function renderSettingsPage(): HTMLElement {
     if (
       saveSettings.disabled
       || !state.status.unlocked
-      || state.quickUnlockOperation !== null
+      || state.securityOperation !== null
       || state.syncOperation !== null
     ) return;
     const settings: VaultSettings = {
@@ -1799,7 +1697,7 @@ function renderSettingsPage(): HTMLElement {
       lockOnBlur: document.querySelector<HTMLInputElement>("#setting-lock-blur")?.checked ?? false,
     };
     const epoch = state.epoch;
-    state.quickUnlockOperation = "settings";
+    state.securityOperation = "settings";
     settingError.textContent = "";
     setSecurityMutationControlsDisabled(true);
     setBusy(saveSettings, true, "正在保存…");
@@ -1808,7 +1706,7 @@ function renderSettingsPage(): HTMLElement {
       if (
         epoch !== state.epoch
         || !state.status.unlocked
-        || state.quickUnlockOperation !== "settings"
+        || state.securityOperation !== "settings"
       ) return;
       state.settings = settings;
       state.status.autoLockMinutes = settings.autoLockMinutes;
@@ -1818,20 +1716,17 @@ function renderSettingsPage(): HTMLElement {
       if (epoch !== state.epoch || !state.status.unlocked) return;
       settingError.textContent = "无法保存设置，请重试。";
     } finally {
-      if (epoch === state.epoch && state.quickUnlockOperation === "settings") {
-        state.quickUnlockOperation = null;
+      if (epoch === state.epoch && state.securityOperation === "settings") {
+        state.securityOperation = null;
         setBusy(saveSettings, false);
         setSecurityMutationControlsDisabled(false);
       }
     }
   }, "check");
   saveSettings.dataset.securityMutation = "true";
-  saveSettings.disabled = state.quickUnlockOperation !== null || state.syncOperation !== null;
+  saveSettings.disabled = state.securityOperation !== null || state.syncOperation !== null;
   form.append(settingError, saveSettings);
   security.append(form);
-
-  const quickUnlock = renderQuickUnlockSettingsCard();
-  quickUnlock.classList.add("settings-quick-unlock-card");
 
   const backup = makeElement("section", "content-card settings-card settings-backup-card");
   backup.append(settingsCardHeader("archive", "加密备份", "手动迁移保险库，不产生明文导出文件。"));
@@ -1847,10 +1742,10 @@ function renderSettingsPage(): HTMLElement {
   const backupActions = makeElement("div", "settings-actions");
   const exportButton = makeButton("导出加密备份", "button button-secondary", async () => exportBackup(exportButton), "download");
   exportButton.dataset.securityMutation = "true";
-  exportButton.disabled = state.syncOperation !== null || state.quickUnlockOperation !== null;
+  exportButton.disabled = state.syncOperation !== null || state.securityOperation !== null;
   const restoreButton = makeButton("恢复加密备份", "button button-ghost", restoreBackup, "upload");
   restoreButton.dataset.securityMutation = "true";
-  restoreButton.disabled = state.quickUnlockOperation !== null || state.syncOperation !== null;
+  restoreButton.disabled = state.securityOperation !== null || state.syncOperation !== null;
   backupActions.append(exportButton, restoreButton);
   backup.append(backupStatus, backupNotice, backupActions);
 
@@ -1866,11 +1761,11 @@ function renderSettingsPage(): HTMLElement {
   const changeButton = makeButton("更改主密码", "button button-secondary", () => undefined, "key");
   changeButton.type = "submit";
   changeButton.dataset.securityMutation = "true";
-  changeButton.disabled = state.quickUnlockOperation !== null || state.syncOperation !== null;
+  changeButton.disabled = state.securityOperation !== null || state.syncOperation !== null;
   masterForm.append(current.wrapper, next.wrapper, confirm.wrapper, masterError, changeButton);
   masterForm.addEventListener("submit", async (event) => {
     event.preventDefault();
-    if (changeButton.disabled || state.quickUnlockOperation !== null || state.syncOperation !== null) return;
+    if (changeButton.disabled || state.securityOperation !== null || state.syncOperation !== null) return;
     let currentPassword = current.input.value;
     let newPassword = next.input.value;
     masterError.textContent = "";
@@ -1892,7 +1787,7 @@ function renderSettingsPage(): HTMLElement {
     hideAllManagedSensitiveInputs();
     const operationEpoch = state.epoch;
     const syncWasConfigured = state.syncStatus.configured;
-    state.quickUnlockOperation = "changePassword";
+    state.securityOperation = "changePassword";
     setSecurityMutationControlsDisabled(true);
     setBusy(changeButton, true, "正在更改…");
     try {
@@ -1906,22 +1801,15 @@ function renderSettingsPage(): HTMLElement {
       currentPassword = "";
       newPassword = "";
       const result = await changeRequest;
-      const [quickUnlockStatus, syncState] = await Promise.all([
-        loadQuickUnlockStatus({
-          ...state.quickUnlockStatus,
-          enabled: false,
-        }),
-        result.syncConfigPreserved
-          ? loadWebDavSyncStatusSafely(state.syncStatus)
-          : Promise.resolve({ status: { ...EMPTY_SYNC_STATUS }, error: false }),
-      ]);
+      const syncState = result.syncConfigPreserved
+        ? await loadWebDavSyncStatusSafely(state.syncStatus)
+        : { status: { ...EMPTY_SYNC_STATUS }, error: false };
       if (operationEpoch === state.epoch && state.status.unlocked) {
-        state.quickUnlockStatus = quickUnlockStatus;
         state.syncStatus = syncState.status;
         state.syncStatusError = syncState.error;
-        state.quickUnlockOperation = null;
+        state.securityOperation = null;
         renderMainShell();
-        const baseMessage = "主密码已更改并轮换保险库密钥；设备快速解锁已关闭。旧备份仍使用原密码。";
+        const baseMessage = "主密码已更改并轮换保险库密钥。旧备份仍使用原密码。";
         if (result.warning) {
           showToast(`${baseMessage} ${result.warning}`, "warning", 7600);
         } else if (!result.syncConfigPreserved && syncWasConfigured) {
@@ -1941,7 +1829,7 @@ function renderSettingsPage(): HTMLElement {
       currentPassword = "";
       newPassword = "";
       if (operationEpoch !== state.epoch) return;
-      state.quickUnlockOperation = null;
+      state.securityOperation = null;
       setSecurityMutationControlsDisabled(false);
       masterError.textContent = "无法更改主密码，请检查当前主密码后重试。";
       current.input.focus();
@@ -1955,12 +1843,12 @@ function renderSettingsPage(): HTMLElement {
   sync.classList.add("settings-sync-card");
 
   if (compactSettingsMedia.matches) {
-    layout.append(security, quickUnlock, backup, master, sync);
+    layout.append(security, backup, master, sync);
   } else {
     const primaryColumn = makeElement("div", "settings-column");
     const secondaryColumn = makeElement("div", "settings-column");
     primaryColumn.append(security, sync);
-    secondaryColumn.append(quickUnlock, backup, master);
+    secondaryColumn.append(backup, master);
     layout.append(primaryColumn, secondaryColumn);
   }
   page.append(layout);
@@ -2000,7 +1888,7 @@ function renderWebDavSyncSettingsCard(): HTMLElement {
     const actions = makeElement("div", "sync-actions");
     const clear = makeButton("清除本机同步配置", "button button-danger-ghost", disableWebDavSync, "trash");
     clear.dataset.securityMutation = "true";
-    clear.disabled = state.syncOperation !== null || state.quickUnlockOperation !== null;
+    clear.disabled = state.syncOperation !== null || state.securityOperation !== null;
     actions.append(clear);
     content.append(notice, actions);
   } else if (!status.configured) {
@@ -2019,7 +1907,7 @@ function renderWebDavSyncSettingsCard(): HTMLElement {
     const join = makeButton("加入已有空间", "button button-ghost", joinWebDavSyncSpace, "download");
     for (const button of [create, join]) {
       button.dataset.securityMutation = "true";
-      button.disabled = state.syncOperation !== null || state.quickUnlockOperation !== null;
+      button.disabled = state.syncOperation !== null || state.securityOperation !== null;
     }
     actions.append(create, join);
     content.append(notice, actions);
@@ -2057,7 +1945,7 @@ function renderWebDavSyncSettingsCard(): HTMLElement {
     const disable = makeButton("停止此设备同步", "button button-danger-ghost", disableWebDavSync, "x");
     for (const button of [syncNow, reveal, disable]) {
       button.dataset.securityMutation = "true";
-      button.disabled = state.syncOperation !== null || state.quickUnlockOperation !== null;
+      button.disabled = state.syncOperation !== null || state.securityOperation !== null;
     }
     actions.append(syncNow, reveal, disable);
     content.append(notice, actions);
@@ -2086,229 +1974,11 @@ function appendSensitiveSyncMetadata(list: HTMLDListElement, label: string, valu
   list.append(item);
 }
 
-function renderQuickUnlockSettingsCard(): HTMLElement {
-  const card = makeElement("section", "content-card settings-card quick-unlock-card");
-  card.append(settingsCardHeader("key", "设备快速解锁", "使用本机的设备认证替代本次主密码输入。"));
-
-  const content = makeElement("div", "quick-unlock-content");
-  const status = state.quickUnlockStatus;
-  const deviceName = quickUnlockDeviceName(status);
-  const statusRow = makeElement("div", "quick-unlock-status-row");
-  const badge = makeElement(
-    "div",
-    `quick-unlock-badge${status.available && status.enabled ? " is-enabled" : ""}`,
-  );
-  badge.append(
-    makeElement("span", `status-dot${status.available && status.enabled ? "" : " status-dot-muted"}`),
-    makeElement(
-      "strong",
-      "",
-      status.enabled
-        ? status.available
-          ? `${deviceName} 已启用`
-          : `${deviceName} 已配置 · 当前不可用`
-        : !status.available
-          ? "此设备不可用"
-          : `${deviceName} 未启用`,
-    ),
-  );
-  statusRow.append(badge);
-  content.append(statusRow);
-
-  const explanation = makeElement(
-    "p",
-    "quick-unlock-explanation",
-    "这是替代输入主密码的设备便捷通道，不是第二因素。主密码始终可以解锁保险库，并仍用于恢复与敏感设置。",
-  );
-  content.append(explanation);
-
-  const error = makeElement("p", "form-error quick-unlock-settings-error");
-  error.setAttribute("role", "alert");
-
-  if (!status.enabled && !status.available) {
-    content.append(makeElement(
-      "div",
-      "inline-notice inline-notice-compact quick-unlock-reason",
-    ));
-    const notice = content.lastElementChild as HTMLElement;
-    notice.append(
-      icon("alert", 17),
-      makeElement("p", "", status.reason || "当前系统或设备未提供可用的设备认证。你仍可使用主密码解锁。"),
-    );
-  } else if (!status.enabled) {
-    const actions = makeElement("div", "quick-unlock-actions");
-    const enableButton = makeButton(
-      `启用 ${deviceName}`,
-      "button button-secondary",
-      async () => enableQuickUnlock(enableButton, error),
-      "key",
-    );
-    enableButton.dataset.securityMutation = "true";
-    enableButton.disabled = state.quickUnlockOperation !== null || state.syncOperation !== null;
-    actions.append(enableButton);
-    content.append(error, actions);
-  } else {
-    if (status.reason) {
-      const notice = makeElement(
-        "div",
-        "inline-notice inline-notice-compact quick-unlock-reason",
-      );
-      notice.append(
-        icon("alert", 17),
-        makeElement("p", "", status.reason),
-      );
-      content.append(notice);
-    }
-    const disableForm = makeElement("form", "quick-unlock-disable-form") as HTMLFormElement;
-    disableForm.noValidate = true;
-    disableForm.append(makeElement(
-      "p",
-      "quick-unlock-disable-help",
-      `关闭 ${deviceName} 前请输入当前主密码，以确认你仍掌握保险库的主要解锁凭据。`,
-    ));
-    const current = createPasswordField(
-      "quick-unlock-current-password",
-      "当前主密码",
-      "输入当前主密码",
-      "current-password",
-    );
-    const disableButton = makeButton(
-      "关闭快速解锁",
-      "button button-danger-ghost",
-      () => undefined,
-      "lock",
-    );
-    disableButton.type = "submit";
-    disableButton.dataset.securityMutation = "true";
-    disableButton.disabled = state.quickUnlockOperation !== null || state.syncOperation !== null;
-    disableForm.append(current.wrapper, error, disableButton);
-    disableForm.addEventListener("submit", async (event) => {
-      event.preventDefault();
-      if (disableButton.disabled || state.quickUnlockOperation !== null) return;
-      if (!current.input.value) {
-        error.textContent = "请输入当前主密码后再关闭设备快速解锁。";
-        current.input.focus();
-        return;
-      }
-      await disableQuickUnlock(current.input, disableButton, error);
-    });
-    content.append(disableForm);
-  }
-
-  card.append(content);
-  return card;
-}
-
-async function enableQuickUnlock(button: HTMLButtonElement, error: HTMLElement): Promise<void> {
-  if (
-    state.quickUnlockOperation !== null
-    || state.syncOperation !== null
-    || !state.status.unlocked
-    || !state.quickUnlockStatus.available
-    || state.quickUnlockStatus.enabled
-  ) return;
-
-  const epoch = state.epoch;
-  const deviceName = quickUnlockDeviceName(state.quickUnlockStatus);
-  state.quickUnlockOperation = "enable";
-  error.textContent = "";
-  setSecurityMutationControlsDisabled(true);
-  setBusy(button, true, `正在启用 ${deviceName}…`);
-  try {
-    await withTrustedSystemInteraction(() => invokeCommand<void>("enable_quick_unlock"));
-    if (epoch !== state.epoch || !state.status.unlocked) return;
-    const quickUnlockStatus = await loadQuickUnlockStatus({
-      ...state.quickUnlockStatus,
-      enabled: true,
-      reason: undefined,
-    });
-    if (epoch !== state.epoch || !state.status.unlocked) return;
-    state.quickUnlockStatus = quickUnlockStatus;
-    state.quickUnlockOperation = null;
-    renderMainShell();
-    if (state.quickUnlockStatus.enabled) {
-      showToast(`${deviceName} 快速解锁已启用。主密码仍可随时使用。`, "success", 4800);
-    } else {
-      showToast("操作已完成，但无法确认快速解锁状态。请重试或继续使用主密码。", "warning", 4800);
-    }
-  } catch {
-    if (epoch !== state.epoch) return;
-    state.quickUnlockOperation = null;
-    setBusy(button, false);
-    setSecurityMutationControlsDisabled(false);
-    error.textContent = `无法启用 ${deviceName}。设备认证可能已取消或暂时不可用；主密码未受影响。`;
-    button.focus();
-  }
-}
-
-async function disableQuickUnlock(
-  passwordInput: HTMLInputElement,
-  button: HTMLButtonElement,
-  error: HTMLElement,
-): Promise<void> {
-  if (
-    state.quickUnlockOperation !== null
-    || state.syncOperation !== null
-    || !state.status.unlocked
-    || !state.quickUnlockStatus.enabled
-  ) return;
-
-  const epoch = state.epoch;
-  const deviceName = quickUnlockDeviceName(state.quickUnlockStatus);
-  const syncWasConfigured = state.syncStatus.configured;
-  let currentPassword = passwordInput.value;
-  passwordInput.value = "";
-  hideAllManagedSensitiveInputs();
-  state.quickUnlockOperation = "disable";
-  error.textContent = "";
-  setSecurityMutationControlsDisabled(true);
-  setBusy(button, true, "正在关闭…");
-  try {
-    const disableRequest = invokeCommand<MasterPasswordChangeResult>("disable_quick_unlock", { currentPassword });
-    currentPassword = "";
-    const result = await disableRequest;
-    if (epoch !== state.epoch || !state.status.unlocked) return;
-    const [quickUnlockStatus, syncState] = await Promise.all([
-      loadQuickUnlockStatus({
-        ...state.quickUnlockStatus,
-        enabled: false,
-        reason: undefined,
-      }),
-      result.syncConfigPreserved
-        ? loadWebDavSyncStatusSafely(state.syncStatus)
-        : Promise.resolve({ status: { ...EMPTY_SYNC_STATUS }, error: false }),
-    ]);
-    if (epoch !== state.epoch || !state.status.unlocked) return;
-    state.quickUnlockStatus = quickUnlockStatus;
-    state.syncStatus = syncState.status;
-    state.syncStatusError = syncState.error;
-    state.quickUnlockOperation = null;
-    renderMainShell();
-    if (state.quickUnlockStatus.enabled) {
-      showToast("操作已完成，但无法确认快速解锁状态。请重试。", "warning", 4800);
-    } else if (result.warning) {
-      showToast(`${deviceName} 快速解锁已关闭。${result.warning}`, "warning", 7200);
-    } else if (syncWasConfigured && !result.syncConfigPreserved) {
-      showToast(`${deviceName} 快速解锁已关闭，但 WebDAV 同步配置未能保留，请重新配置。`, "warning", 7200);
-    } else {
-      showToast(`${deviceName} 快速解锁已关闭。请继续使用主密码解锁。`, "success", 4800);
-    }
-  } catch {
-    currentPassword = "";
-    if (epoch !== state.epoch) return;
-    state.quickUnlockOperation = null;
-    setBusy(button, false);
-    setSecurityMutationControlsDisabled(false);
-    error.textContent = "无法关闭快速解锁。请检查当前主密码后重试；现有解锁方式未改变。";
-    passwordInput.focus();
-  }
-}
-
 function beginSyncOperation(operation: Exclude<SyncOperation, null>): number | null {
   if (
     !state.status.unlocked
     || state.syncOperation !== null
-    || state.quickUnlockOperation !== null
+    || state.securityOperation !== null
     || state.entryMutation !== null
   ) return null;
   state.syncOperation = operation;
@@ -2831,7 +2501,13 @@ function hasUnsavedDraft(): boolean {
 }
 
 async function saveCurrentEntry(button?: HTMLButtonElement): Promise<boolean> {
-  if (!state.draft || !state.status.unlocked || state.entryMutation !== null || state.syncOperation !== null) return false;
+  if (
+    !state.draft
+    || !state.status.unlocked
+    || state.entryMutation !== null
+    || state.syncOperation !== null
+    || state.securityOperation !== null
+  ) return false;
   if (!validateEntry(state.draft)) return false;
   const submittedDraft = cloneEntryInput(state.draft);
   const submittedSnapshot = serializeInput(submittedDraft);
@@ -3694,7 +3370,7 @@ function closeGenerator(force = false): void {
 }
 
 async function exportBackup(button: HTMLButtonElement): Promise<void> {
-  if (state.syncOperation !== null || state.quickUnlockOperation !== null) return;
+  if (state.syncOperation !== null || state.securityOperation !== null) return;
   setBusy(button, true, "正在导出…");
   try {
     const result = await withTrustedSystemInteraction(
@@ -3715,7 +3391,7 @@ async function exportBackup(button: HTMLButtonElement): Promise<void> {
 }
 
 async function restoreBackup(): Promise<void> {
-  if (state.quickUnlockOperation !== null || state.syncOperation !== null) return;
+  if (state.securityOperation !== null || state.syncOperation !== null) return;
   if (blockEntryActionWhileMutating()) return;
   if (state.status.unlocked && hasUnsavedDraft()) {
     const continueRestore = await showConfirm(
@@ -3724,11 +3400,11 @@ async function restoreBackup(): Promise<void> {
       "继续选择备份",
       true,
     );
-    if (!continueRestore || state.quickUnlockOperation !== null) return;
+    if (!continueRestore || state.securityOperation !== null) return;
   }
 
   const operationEpoch = state.epoch;
-  state.quickUnlockOperation = "restore";
+  state.securityOperation = "restore";
   setSecurityMutationControlsDisabled(true);
   let masterPassword: string | null = null;
   let restoreApplied = false;
@@ -3771,15 +3447,10 @@ async function restoreBackup(): Promise<void> {
     }
     restoreApplied = true;
     if (operationEpoch !== state.epoch) return;
-    state.quickUnlockStatus = {
-      ...state.quickUnlockStatus,
-      enabled: false,
-      reason: undefined,
-    };
     state.epoch += 1;
     await bootstrap();
     showToast(
-      "加密备份已恢复；原设备快速解锁和本机 WebDAV 同步配置均已停用。如需同步，请凭恢复码重新加入。",
+      "加密备份已恢复；本机 WebDAV 同步配置已停用。如需同步，请凭恢复码重新加入。",
       "success",
       7200,
     );
@@ -3797,8 +3468,8 @@ async function restoreBackup(): Promise<void> {
         // Pending restore data also expires in Rust; cancellation is best-effort here.
       }
     }
-    if (operationEpoch === state.epoch && state.quickUnlockOperation === "restore") {
-      state.quickUnlockOperation = null;
+    if (operationEpoch === state.epoch && state.securityOperation === "restore") {
+      state.securityOperation = null;
       setSecurityMutationControlsDisabled(false);
     }
   }
@@ -3808,7 +3479,7 @@ async function manualLock(): Promise<void> {
   if (!state.status.unlocked) return;
   if (
     state.syncOperation !== null
-    || state.quickUnlockOperation !== null
+    || state.securityOperation !== null
     || state.entryMutation !== null
   ) {
     await performLock("保险库界面已锁定；当前操作不会再回写此会话。", true);
@@ -3828,7 +3499,6 @@ async function manualLock(): Promise<void> {
 async function performLock(message: string, notify: boolean): Promise<void> {
   if (!state.status.unlocked) return;
   state.epoch += 1;
-  const lockEpoch = state.epoch;
   state.status.unlocked = false;
   clearSensitiveState(true);
   renderGate();
@@ -3842,16 +3512,11 @@ async function performLock(message: string, notify: boolean): Promise<void> {
   } catch {
     // The UI remains fail-closed. A later unlock attempt rechecks backend state.
   }
-  const quickUnlockStatus = await loadQuickUnlockStatus();
-  if (lockEpoch === state.epoch && !state.status.unlocked) {
-    state.quickUnlockStatus = quickUnlockStatus;
-    renderGate();
-  }
   if (notify) showToast(message, "info");
 }
 
 function clearSensitiveState(clearMetadata: boolean): void {
-  state.quickUnlockOperation = null;
+  state.securityOperation = null;
   state.syncOperation = null;
   hideAllManagedSensitiveInputs();
   hidePassword();
@@ -3882,15 +3547,9 @@ function clearSensitiveState(clearMetadata: boolean): void {
 async function handleLifecycleLock(): Promise<void> {
   if (!state.status.unlocked) return;
   state.epoch += 1;
-  const lockEpoch = state.epoch;
   state.status.unlocked = false;
   clearSensitiveState(true);
   renderGate();
-  const quickUnlockStatus = await loadQuickUnlockStatus();
-  if (lockEpoch === state.epoch && !state.status.unlocked) {
-    state.quickUnlockStatus = quickUnlockStatus;
-    renderGate();
-  }
   showToast("系统已恢复运行，保险库已自动锁定。", "info", 4200);
 }
 
@@ -4652,7 +4311,7 @@ function showRestorePreview(selection: RestoreSelection, preview: RestorePreview
       makeElement(
         "p",
         "",
-        "未保存修改不会被保留；恢复完成后，本机已有的 Touch ID / Windows Hello 快速解锁与 WebDAV 同步配置都会停用。如需同步，必须凭恢复码重新加入。",
+        "未保存修改不会被保留；恢复完成后，本机 WebDAV 同步配置会停用。如需同步，必须凭恢复码重新加入。",
       ),
     );
 

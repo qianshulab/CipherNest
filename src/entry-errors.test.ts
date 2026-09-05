@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { describeEntrySaveFailure } from "./entry-errors";
+import { describeEntrySaveFailure, describeUnlockFailure } from "./entry-errors";
 
 describe("entry save error presentation", () => {
   it("shows backend validation reasons and links them to the relevant field", () => {
@@ -27,5 +27,12 @@ describe("entry save error presentation", () => {
     expect(describeEntrySaveFailure({ message: "secret internal detail" })).toEqual({
       message: "无法保存条目。现有保险库内容未被覆盖，请重试。",
     });
+  });
+
+  it("distinguishes a failed password-only migration without exposing unknown errors", () => {
+    expect(describeUnlockFailure("保险库安全升级未完成。")).toContain("保险库升级未完成");
+    expect(describeUnlockFailure(new Error("failed to write /private/vault.cnvault"))).toBe(
+      "无法解锁保险库，请检查主密码或保险库文件是否正确。",
+    );
   });
 });

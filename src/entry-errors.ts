@@ -17,6 +17,9 @@ const KNOWN_ENTRY_ERRORS = new Map<string, string>([
 
 const INVALID_INPUT_PREFIX = "请求中的字段无效：";
 const GENERIC_SAVE_FAILURE = "无法保存条目。现有保险库内容未被覆盖，请重试。";
+const GENERIC_UNLOCK_FAILURE = "无法解锁保险库，请检查主密码或保险库文件是否正确。";
+const MIGRATION_WRITE_FAILURE =
+  "保险库升级未完成，未交付解锁会话；保险库仍保持加密。请检查可用空间和应用数据目录权限，然后重新输入主密码。";
 
 export function describeEntrySaveFailure(error: unknown): EntrySaveFailure {
   const raw = readableErrorText(error);
@@ -35,6 +38,12 @@ export function describeEntrySaveFailure(error: unknown): EntrySaveFailure {
   }
 
   return { message: GENERIC_SAVE_FAILURE };
+}
+
+export function describeUnlockFailure(error: unknown): string {
+  return readableErrorText(error) === "保险库安全升级未完成。"
+    ? MIGRATION_WRITE_FAILURE
+    : GENERIC_UNLOCK_FAILURE;
 }
 
 function readableErrorText(error: unknown): string | null {

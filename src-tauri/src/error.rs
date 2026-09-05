@@ -32,20 +32,10 @@ pub enum VaultError {
     PendingRestoreNotVerified,
     #[error("无法安全保存保险库。")]
     SaveFailed,
+    #[error("保险库安全升级未完成。")]
+    PasswordOnlyMigrationFailed,
     #[error("系统剪贴板不可用。")]
     Clipboard,
-    #[error("此设备不支持安全的系统快速解锁。")]
-    QuickUnlockUnavailable,
-    #[error("快速解锁尚未启用或已失效，请使用主密码。")]
-    QuickUnlockNotConfigured,
-    // Linux intentionally has no quick-unlock backend, so these platform-specific
-    // errors are not constructed there.
-    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
-    #[error("系统身份验证未完成，保险库仍保持锁定。")]
-    DeviceAuthenticationFailed,
-    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
-    #[error("无法安全保存此设备的快速解锁材料。")]
-    DeviceKeyStore,
     #[error("WebDAV 同步正在进行，请等待当前操作完成。")]
     SyncBusy,
     #[error("尚未在此设备配置 WebDAV 同步。")]

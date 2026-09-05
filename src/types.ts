@@ -12,16 +12,6 @@ export interface VaultOverview {
   lastBackupAt?: number;
 }
 
-export type QuickUnlockMethod = "touchId" | "windowsHello" | "unsupported";
-
-export interface QuickUnlockStatus {
-  available: boolean;
-  enabled: boolean;
-  method: QuickUnlockMethod;
-  label: string;
-  reason?: string;
-}
-
 export interface RestoreSelection {
   token: string;
   fileName: string;

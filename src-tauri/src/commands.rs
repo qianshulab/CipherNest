@@ -15,7 +15,7 @@ use std::{
 use std::fs;
 
 use sha2::{Digest, Sha256};
-use tauri::{AppHandle, Manager, State, WebviewWindow};
+use tauri::{AppHandle, Manager, State};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_dialog::DialogExt;
 use tokio::sync::watch;
@@ -24,17 +24,16 @@ use zeroize::Zeroizing;
 
 use crate::{
     crypto::{
-        decrypt_envelope, generate_device_key, parse_envelope_bytes, VaultEnvelope, MAX_VAULT_BYTES,
+        create_envelope, decrypt_envelope, parse_envelope_bytes, VaultEnvelope, MAX_VAULT_BYTES,
     },
-    device_auth,
     error::{VaultError, VaultResult},
     generator,
     models::{
         EntryInput, EntrySummary, GeneratedPassword, GeneratorOptions, MasterPasswordChangeResult,
-        QuickUnlockStatus, RestorePreview, RestoreSelection, SecurityReport, VaultData, VaultEntry,
-        VaultOverview, VaultSettings, VaultStatus, WebDavCreateResult, WebDavCredentialsInput,
-        WebDavInspectInput, WebDavJoinInput, WebDavJoinMode, WebDavRecoveryCode,
-        WebDavRemotePreview, WebDavSyncOutcome, WebDavSyncOutcomeKind, WebDavSyncStatus,
+        RestorePreview, RestoreSelection, SecurityReport, VaultData, VaultEntry, VaultOverview,
+        VaultSettings, VaultStatus, WebDavCreateResult, WebDavCredentialsInput, WebDavInspectInput,
+        WebDavJoinInput, WebDavJoinMode, WebDavRecoveryCode, WebDavRemotePreview,
+        WebDavSyncOutcome, WebDavSyncOutcomeKind, WebDavSyncStatus,
     },
     sync::{self, SyncError, WebDavClient},
     vault::{now_ms, sync_contents_equal, ExistingSyncContext, VaultStore},
@@ -55,12 +54,53 @@ struct VerifiedRestore {
     data: VaultData,
 }
 
+struct PreparedRestore {
+    envelope: VaultEnvelope,
+    verified: VerifiedRestore,
+    source_updated_at: u64,
+    source_generation: u64,
+}
+
 struct PendingRestore {
     token: Zeroizing<String>,
     selected_at: Instant,
     file_name: String,
     envelope: VaultEnvelope,
     verified: Option<VerifiedRestore>,
+}
+
+fn prepare_verified_restore(
+    master_password: &str,
+    envelope: VaultEnvelope,
+) -> VaultResult<PreparedRestore> {
+    let (root_key, mut data) = decrypt_envelope(master_password, &envelope)?;
+    let source_updated_at = data.updated_at;
+    let source_generation = data.generation;
+    if data.password_only_unlock {
+        return Ok(PreparedRestore {
+            envelope,
+            verified: VerifiedRestore { root_key, data },
+            source_updated_at,
+            source_generation,
+        });
+    }
+
+    // Never retain decrypted legacy-format material in pending restore state. Rotating the
+    // root key here means a copied v0.3.1 device slot cannot decrypt the candidate that may
+    // later become current, even before the user confirms the restore.
+    data.password_only_unlock = true;
+    data.generation = data.generation.saturating_add(1);
+    data.updated_at = now_ms();
+    let (migrated_envelope, migrated_root_key) = create_envelope(master_password, &data)?;
+    Ok(PreparedRestore {
+        envelope: migrated_envelope,
+        verified: VerifiedRestore {
+            root_key: migrated_root_key,
+            data,
+        },
+        source_updated_at,
+        source_generation,
+    })
 }
 
 struct PendingSyncPreview {
@@ -117,12 +157,10 @@ pub struct AppState {
     pending_sync_preview: Arc<Mutex<Option<PendingSyncPreview>>>,
     sync_operation_active: Arc<AtomicBool>,
     sync_cancel_epoch: watch::Sender<u64>,
-    device_auth_path: PathBuf,
 }
 
 impl AppState {
     pub fn new(vault_path: PathBuf) -> Self {
-        let device_auth_path = device_auth_path_for(&vault_path);
         let (sync_cancel_epoch, _) = watch::channel(0);
         Self {
             store: Arc::new(Mutex::new(VaultStore::new(vault_path))),
@@ -131,7 +169,6 @@ impl AppState {
             pending_sync_preview: Arc::new(Mutex::new(None)),
             sync_operation_active: Arc::new(AtomicBool::new(false)),
             sync_cancel_epoch,
-            device_auth_path,
         }
     }
 
@@ -193,169 +230,6 @@ pub async fn unlock_vault(
         store.unlock(password.as_str())
     })
     .await
-}
-
-#[tauri::command]
-pub async fn quick_unlock_status(state: State<'_, AppState>) -> VaultResult<QuickUnlockStatus> {
-    let platform = device_auth::availability();
-    let registrations = run_store(Arc::clone(&state.store), |store| {
-        match store.device_unlock_registrations() {
-            Ok(registrations) => Ok(Some(registrations)),
-            Err(VaultError::NotFound) => Ok(None),
-            Err(error) => Err(error),
-        }
-    })
-    .await;
-
-    let (enabled, reason) = match registrations {
-        Ok(Some(registrations)) => (!registrations.is_empty(), platform.reason),
-        Ok(None) => (false, platform.reason),
-        Err(_) => (
-            false,
-            Some("快速解锁登记无法验证。保险库未受影响，请使用主密码解锁后重新设置。".into()),
-        ),
-    };
-
-    Ok(QuickUnlockStatus {
-        available: platform.available,
-        enabled,
-        method: platform.method.into(),
-        label: platform.label.into(),
-        reason,
-    })
-}
-
-#[tauri::command]
-pub async fn enable_quick_unlock(
-    window: WebviewWindow,
-    state: State<'_, AppState>,
-) -> VaultResult<()> {
-    let platform = device_auth::availability();
-    if !platform.available {
-        return Err(VaultError::QuickUnlockUnavailable);
-    }
-    let provider = device_auth::provider().ok_or(VaultError::QuickUnlockUnavailable)?;
-    let store = Arc::clone(&state.store);
-    let (vault_id, session_id) = run_store(Arc::clone(&store), |store| {
-        if !store.device_unlock_registrations()?.is_empty() {
-            return Err(VaultError::InvalidInput(
-                "快速解锁已经登记；请先关闭后再重新启用".into(),
-            ));
-        }
-        store.unlocked_vault_context()
-    })
-    .await?;
-
-    let device_id = Uuid::new_v4().to_string();
-    let device_key = generate_device_key()?;
-    let metadata_path = state.device_auth_path.clone();
-    let window_for_enrollment = window.clone();
-    let vault_id_for_enrollment = vault_id.clone();
-    let device_id_for_enrollment = device_id.clone();
-    let key_for_enrollment = Zeroizing::new(*device_key);
-    let metadata_path_for_enrollment = metadata_path.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        device_auth::store_device_key(
-            &window_for_enrollment,
-            &metadata_path_for_enrollment,
-            &vault_id_for_enrollment,
-            &device_id_for_enrollment,
-            &key_for_enrollment,
-        )
-    })
-    .await
-    .map_err(|_| VaultError::StateUnavailable)??;
-
-    let label = format!("{} · 本机", platform.label);
-    let enrollment = run_store(store, {
-        let device_id = device_id.clone();
-        let session_id = session_id.clone();
-        move |store| {
-            store
-                .enroll_device_with_key_for_session(
-                    &session_id,
-                    &device_id,
-                    provider,
-                    &label,
-                    &device_key,
-                )
-                .map(|_| ())
-        }
-    })
-    .await;
-    if let Err(error) = enrollment {
-        let _ = device_auth::remove_device_key(&metadata_path, &vault_id, &device_id);
-        return Err(error);
-    }
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn unlock_with_device(
-    window: WebviewWindow,
-    state: State<'_, AppState>,
-) -> VaultResult<VaultStatus> {
-    clear_pending_sync_preview_state(&state.pending_sync_preview)?;
-    if !device_auth::availability().available {
-        return Err(VaultError::QuickUnlockUnavailable);
-    }
-    let provider = device_auth::provider().ok_or(VaultError::QuickUnlockUnavailable)?;
-    let store = Arc::clone(&state.store);
-    let (vault_id, device_id) = run_store(Arc::clone(&store), move |store| {
-        let vault_id = store.vault_id()?;
-        let registration = store
-            .device_unlock_registrations()?
-            .into_iter()
-            .find(|registration| registration.provider == provider)
-            .ok_or(VaultError::QuickUnlockNotConfigured)?;
-        Ok((vault_id, registration.device_id))
-    })
-    .await?;
-
-    let metadata_path = state.device_auth_path.clone();
-    let window_for_unlock = window.clone();
-    let vault_id_for_unlock = vault_id.clone();
-    let device_id_for_unlock = device_id.clone();
-    let device_key = tauri::async_runtime::spawn_blocking(move || {
-        device_auth::load_device_key(
-            &window_for_unlock,
-            &metadata_path,
-            &vault_id_for_unlock,
-            &device_id_for_unlock,
-        )
-    })
-    .await
-    .map_err(|_| VaultError::StateUnavailable)??;
-
-    run_store(store, move |store| {
-        store.unlock_with_device_key(&device_id, &device_key)
-    })
-    .await
-}
-
-#[tauri::command]
-pub async fn disable_quick_unlock(
-    state: State<'_, AppState>,
-    current_password: String,
-) -> VaultResult<MasterPasswordChangeResult> {
-    let password = Zeroizing::new(current_password);
-    let (vault_id, registrations, rotation) = run_store(Arc::clone(&state.store), move |store| {
-        let vault_id = store.vault_id()?;
-        let (registrations, rotation) = store.revoke_device_unlock(password.as_str())?;
-        Ok((vault_id, registrations, rotation))
-    })
-    .await?;
-    state.cancel_sync_operations();
-    clear_pending_sync_preview_state(&state.pending_sync_preview)?;
-
-    for registration in registrations {
-        let _ = device_auth::remove_device_key(
-            &state.device_auth_path,
-            &vault_id,
-            &registration.device_id,
-        );
-    }
-    Ok(rotation)
 }
 
 #[tauri::command]
@@ -850,24 +724,14 @@ pub async fn change_master_password(
     new_password: String,
 ) -> VaultResult<MasterPasswordChangeResult> {
     let store = Arc::clone(&state.store);
-    let (vault_id, registrations, result) = run_store(store, move |store| {
+    let result = run_store(store, move |store| {
         let current = Zeroizing::new(current_password);
         let new = Zeroizing::new(new_password);
-        let vault_id = store.vault_id()?;
-        let registrations = store.device_unlock_registrations().unwrap_or_default();
-        let result = store.change_master_password(current.as_str(), new.as_str())?;
-        Ok((vault_id, registrations, result))
+        store.change_master_password(current.as_str(), new.as_str())
     })
     .await?;
     state.cancel_sync_operations();
     clear_pending_sync_preview_state(&state.pending_sync_preview)?;
-    for registration in registrations {
-        let _ = device_auth::remove_device_key(
-            &state.device_auth_path,
-            &vault_id,
-            &registration.device_id,
-        );
-    }
     Ok(result)
 }
 
@@ -999,13 +863,12 @@ pub async fn inspect_selected_backup(
     let envelope = pending_envelope_for_inspection(&state.pending_restore, &token)?;
     let token_for_failure = token.clone();
     let decrypted = tauri::async_runtime::spawn_blocking(move || {
-        decrypt_envelope(password.as_str(), &envelope)
-            .map(|(root_key, data)| (envelope, VerifiedRestore { root_key, data }))
+        prepare_verified_restore(password.as_str(), envelope)
     })
     .await;
 
-    let (envelope, verified) = match decrypted {
-        Ok(Ok(verified)) => verified,
+    let prepared = match decrypted {
+        Ok(Ok(prepared)) => prepared,
         Ok(Err(_)) => {
             clear_pending_restore_if_token(&state.pending_restore, &token_for_failure)?;
             return Err(VaultError::UnlockFailed);
@@ -1016,19 +879,24 @@ pub async fn inspect_selected_backup(
         }
     };
 
-    let vault_id = Uuid::parse_str(&verified.data.vault_id).map_err(|_| {
+    let vault_id = Uuid::parse_str(&prepared.verified.data.vault_id).map_err(|_| {
         let _ = clear_pending_restore_if_token(&state.pending_restore, &token);
         VaultError::InvalidVault
     })?;
     let canonical_vault_id = vault_id.to_string();
     let preview = RestorePreview {
         file_name: pending_file_name(&state.pending_restore, &token)?,
-        item_count: verified.data.entries.len(),
-        updated_at: verified.data.updated_at,
-        generation: verified.data.generation,
+        item_count: prepared.verified.data.entries.len(),
+        updated_at: prepared.source_updated_at,
+        generation: prepared.source_generation,
         vault_id_short: canonical_vault_id[..8].to_string(),
     };
-    commit_verified_restore(&state.pending_restore, &token, envelope, verified)?;
+    commit_verified_restore(
+        &state.pending_restore,
+        &token,
+        prepared.envelope,
+        prepared.verified,
+    )?;
     Ok(preview)
 }
 
@@ -1067,32 +935,14 @@ pub async fn apply_selected_backup(
         let mut store = store.lock().map_err(|_| VaultError::StateUnavailable)?;
         drop(pending_guard);
 
-        let previous_device_unlock = match store.vault_id() {
-            Ok(vault_id) => Some((
-                vault_id,
-                store.device_unlock_registrations().unwrap_or_default(),
-            )),
-            Err(VaultError::NotFound | VaultError::InvalidVault) => None,
-            Err(error) => return Err(error),
-        };
         store.replace_with_verified_backup(pending.envelope, verified.root_key, verified.data)?;
-        Ok((store.status().0, previous_device_unlock))
+        Ok(store.status().0)
     })
     .await
     .map_err(|_| VaultError::StateUnavailable)?;
-    let (status, previous_device_unlock) = applied?;
+    let status = applied?;
     state.cancel_sync_operations();
     clear_pending_sync_preview_state(&state.pending_sync_preview)?;
-
-    if let Some((vault_id, registrations)) = previous_device_unlock {
-        for registration in registrations {
-            let _ = device_auth::remove_device_key(
-                &state.device_auth_path,
-                &vault_id,
-                &registration.device_id,
-            );
-        }
-    }
     Ok(status)
 }
 
@@ -1464,16 +1314,13 @@ fn clear_clipboard_if_owned_blocking(
     *lease_guard = None;
 }
 
-fn device_auth_path_for(vault_path: &std::path::Path) -> PathBuf {
-    let mut path = vault_path.as_os_str().to_os_string();
-    path.push(".device-auth");
-    PathBuf::from(path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::{CipherBlock, KdfHeader, FORMAT_NAME, FORMAT_VERSION};
+    use crate::crypto::{
+        decrypt_envelope_with_root_key, read_envelope, CipherBlock, KdfHeader, FORMAT_NAME,
+        FORMAT_VERSION,
+    };
 
     fn test_envelope(vault_id: &str) -> VaultEnvelope {
         VaultEnvelope {
@@ -1511,6 +1358,7 @@ mod tests {
             created_at: 1,
             updated_at: 1,
             last_backup_at: None,
+            password_only_unlock: true,
             settings: VaultSettings::default(),
             entries: Vec::new(),
             tombstones: Vec::new(),
@@ -1572,6 +1420,107 @@ mod tests {
             Err(VaultError::PendingRestoreUnavailable)
         ));
         assert!(pending.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn legacy_restore_is_rotated_before_pending_state_or_apply() {
+        let directory = tempfile::tempdir().unwrap();
+        let target_path = directory.path().join("vault.cnvault");
+        let backup_password = "legacy backup passphrase long enough";
+        let current_password = "current vault passphrase long enough";
+
+        let mut legacy_data = test_data(&Uuid::new_v4().to_string());
+        legacy_data.password_only_unlock = false;
+        legacy_data.generation = 7;
+        legacy_data.updated_at = 1;
+        let (legacy_envelope, legacy_root_key) =
+            create_envelope(backup_password, &legacy_data).unwrap();
+        let legacy_envelope_for_hybrid = legacy_envelope.clone();
+
+        let prepared = prepare_verified_restore(backup_password, legacy_envelope.clone()).unwrap();
+        let migrated_envelope = prepared.envelope;
+        let verified = prepared.verified;
+        assert_eq!(prepared.source_updated_at, legacy_data.updated_at);
+        assert_eq!(prepared.source_generation, legacy_data.generation);
+        assert!(verified.data.password_only_unlock);
+        assert_eq!(verified.data.generation, legacy_data.generation + 1);
+        assert_eq!(migrated_envelope.generation, verified.data.generation);
+        assert_eq!(migrated_envelope.vault_id, legacy_envelope.vault_id);
+        assert!(verified.data.updated_at > legacy_data.updated_at);
+        assert_ne!(verified.root_key.as_ref(), legacy_root_key.as_ref());
+        assert!(decrypt_envelope_with_root_key(&migrated_envelope, &legacy_root_key).is_err());
+
+        let pending = Arc::new(Mutex::new(Some(PendingRestore {
+            token: Zeroizing::new("restore-token".into()),
+            selected_at: Instant::now(),
+            file_name: "legacy.cnvault".into(),
+            envelope: legacy_envelope,
+            verified: None,
+        })));
+        commit_verified_restore(
+            &pending,
+            "restore-token",
+            migrated_envelope.clone(),
+            verified,
+        )
+        .unwrap();
+        let pending = take_pending_restore(&pending, "restore-token").unwrap();
+        let verified = pending.verified.unwrap();
+        assert!(verified.data.password_only_unlock);
+        assert_eq!(pending.envelope.generation, legacy_data.generation + 1);
+
+        let migrated_root_key = Zeroizing::new(*verified.root_key);
+        let mut store = VaultStore::new(target_path.clone());
+        store.create(current_password).unwrap();
+        let current_before_restore = read_envelope(&target_path).unwrap();
+        let (current_root_key, _) =
+            decrypt_envelope(current_password, &current_before_restore).unwrap();
+        assert!(matches!(
+            store.replace_with_verified_backup(
+                legacy_envelope_for_hybrid.clone(),
+                Zeroizing::new(*legacy_root_key),
+                legacy_data.clone(),
+            ),
+            Err(VaultError::InvalidVault)
+        ));
+        assert_eq!(
+            serde_json::to_vec(&read_envelope(&target_path).unwrap()).unwrap(),
+            serde_json::to_vec(&current_before_restore).unwrap()
+        );
+        assert!(store.status().0.unlocked);
+
+        let mut legacy_slots_path = target_path.as_os_str().to_os_string();
+        legacy_slots_path.push(".devices");
+        let legacy_slots_path = PathBuf::from(legacy_slots_path);
+        let mut legacy_auth_path = target_path.as_os_str().to_os_string();
+        legacy_auth_path.push(".device-auth");
+        let legacy_auth_path = PathBuf::from(legacy_auth_path);
+        fs::write(&legacy_slots_path, b"retired-device-slot").unwrap();
+        fs::write(&legacy_auth_path, b"retired-device-auth").unwrap();
+
+        store
+            .replace_with_verified_backup(pending.envelope, verified.root_key, verified.data)
+            .unwrap();
+        let current = read_envelope(&target_path).unwrap();
+        let (current_key, current_data) = decrypt_envelope(backup_password, &current).unwrap();
+        assert!(current_data.password_only_unlock);
+        assert_eq!(current_data.generation, legacy_data.generation + 1);
+        assert_eq!(current_key.as_ref(), migrated_root_key.as_ref());
+        assert!(decrypt_envelope_with_root_key(&current, &legacy_root_key).is_err());
+        assert!(decrypt_envelope_with_root_key(&current, &current_root_key).is_err());
+        assert!(!legacy_slots_path.exists());
+        assert!(!legacy_auth_path.exists());
+
+        // Even combining the legacy password wrapper with the new current payload cannot
+        // recreate access: the restore candidate was encrypted under a fresh random root key.
+        let mut legacy_key_with_current_payload = legacy_envelope_for_hybrid;
+        legacy_key_with_current_payload.generation = current.generation;
+        legacy_key_with_current_payload.payload = current.payload.clone();
+        assert!(decrypt_envelope(backup_password, &legacy_key_with_current_payload).is_err());
+
+        assert!(store.lock());
+        assert!(store.unlock(current_password).is_err());
+        assert!(store.unlock(backup_password).unwrap().unlocked);
     }
 
     #[test]
