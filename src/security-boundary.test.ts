@@ -277,7 +277,8 @@ describe("renderer security boundary", () => {
     }
 
     const focus = sourceBetween("async function handleFocusChange", "function focusSearchAtEnd");
-    expect(focus).toContain("hideAllManagedPasswordFields()");
+    expect(focus).toContain("hideAllManagedSensitiveInputs()");
+    expect(focus).toContain("hideNotes()");
     expect(focus).toContain("trustedSystemInteractionDepth > 0");
     expect(focus).toContain('invokeCommand<boolean>("handle_focus_change"');
     expect(focus).toContain("if (locked)");
@@ -328,7 +329,7 @@ describe("renderer security boundary", () => {
     expect(connection).toContain('endpoint.pathname.endsWith("/")');
     expect(connection).toContain('appPassword.input.value = ""');
     expect(connection).toContain('recovery.input.value = ""');
-    expect(connection).toContain("hideAllManagedPasswordFields()");
+    expect(connection).toContain("hideAllManagedSensitiveInputs()");
 
     const recovery = sourceBetween("function showRecoveryCodeDialog", "function showWebDavJoinPreview");
     expect(recovery).toContain("这是本次创建流程唯一一次自动展示");
@@ -363,17 +364,47 @@ describe("renderer security boundary", () => {
     expect(applyIndex).toBeGreaterThan(dangerIndex);
   });
 
-  it("handles master-password sync warnings and copies usernames and URLs through the owned clipboard", () => {
+  it("masks entry metadata by default and copies it through the owned clipboard", () => {
+    const summaryType = typesSource.slice(
+      typesSource.indexOf("export interface EntrySummary"),
+      typesSource.indexOf("export interface VaultEntry"),
+    );
+    expect(summaryType).not.toMatch(/\b(?:username|url|purpose|notes|tags|password)\b/);
     const settings = sourceBetween("function renderSettingsPage", "function renderWebDavSyncSettingsCard");
     expect(settings).toContain('invokeCommand<MasterPasswordChangeResult>("change_master_password"');
     expect(settings).toContain("result.syncConfigPreserved");
     expect(settings).toContain("result.warning");
 
     const editor = sourceBetween("function renderEntryEditor", "function sectionHeading");
-    expect(editor).toContain('addCopyAction(usernameField, "用户名")');
-    expect(editor).toContain('addCopyAction(urlField, "网址")');
-    const copy = sourceBetween("function addCopyAction", "function bindDraftInput");
-    expect(copy).toContain("copy.hidden = !field.input.value");
+    expect(editor).toContain('addSensitiveTextActions(usernameField, "用户名")');
+    expect(editor).toContain('addSensitiveTextActions(purposeField, "用途")');
+    expect(editor).toContain('addSensitiveTextActions(urlField, "地址")');
+    expect(editor).toContain('addSensitiveTextActions(tagsField, "标签")');
+    expect(editor).toContain("notes.readOnly = true");
+    expect(editor).toContain("CONCEALED_TEXT");
+    expect(editor).not.toContain("draft.purpose) copy.append");
+    expect(editor).toContain('"网站或主机地址"');
+    expect(editor).not.toContain('urlField.input.type = "url"');
+    const sensitiveInput = sourceBetween("function addSensitiveTextActions", "function revealNotes");
+    expect(sensitiveInput).toContain('field.input.type = "password"');
+    expect(sensitiveInput).toContain("setOptionalActionAvailable(copy, Boolean(field.input.value))");
+    expect(sensitiveInput).toContain("revealManagedSensitiveInput(managedField)");
+    const row = sourceBetween("function renderEntryRow", "function renderEntryDetail");
+    expect(row).toContain('select.setAttribute("aria-label", entry.title)');
+    expect(row).not.toMatch(/entry\.(?:username|purpose|tags)/);
+    const list = sourceBetween("function renderEntryList", "function renderListSkeleton");
+    expect(list).toContain('search.type = "password"');
+    expect(list).toContain("revealManagedSensitiveInput(managedSearch)");
+    const generator = sourceBetween("function renderGeneratorDialog", "function generatorToggle");
+    for (const field of ["generatorUser", "generatorPurpose", "generatorUrl", "generatorTags"]) {
+      expect(generator).toContain(`addSensitiveTextActions(${field},`);
+    }
+    const syncSettings = sourceBetween("function renderWebDavSyncSettingsCard", "function appendSyncMetadata");
+    expect(syncSettings).toContain('appendSensitiveSyncMetadata(metadata, "服务器"');
+    expect(syncSettings).toContain('appendSensitiveSyncMetadata(metadata, "用户名"');
+    const syncConnection = sourceBetween("function askWebDavConnection", "function showRecoveryCodeDialog");
+    expect(syncConnection).toContain('addSensitiveTextActions(endpoint, "WebDAV 地址")');
+    expect(syncConnection).toContain('addSensitiveTextActions(username, "WebDAV 用户名")');
     const clipboard = sourceBetween("async function copySecret", "function startClipboardTimer");
     expect(clipboard).toContain('invokeCommand<void>("copy_secret"');
   });
@@ -388,6 +419,15 @@ describe("renderer security boundary", () => {
     expect(save).toContain("draftChangedWhileSaving");
     expect(save).toContain("serializeInput(state.draft) !== submittedSnapshot");
     expect(save).toContain("state.entryMutation = null");
+    expect(save).toContain('presentEntrySaveFailure(error, "editor")');
+
+    const favorite = sourceBetween("async function toggleCurrentFavorite", "function updateSnapshotFavorite");
+    expect(favorite).toContain('invokeCommand<number>("set_favorite"');
+    expect(favorite).toContain("setCurrentEntryRevision(id, revision)");
+
+    const generator = sourceBetween("function renderGenerator", "function generatorToggle");
+    expect(generator).toContain('"网站或主机地址"');
+    expect(generator).not.toContain('generatorUrl.input.type = "url"');
 
     const shortcuts = sourceBetween("function handleGlobalShortcut", "ensureLayers()");
     expect(shortcuts).toContain("state.entryMutation");
@@ -430,7 +470,7 @@ describe("renderer security boundary", () => {
     const sidebar = sourceBetween("function renderSidebar", "function navItem");
     expect(sidebar).toContain("state.overview.totalEntries");
     expect(sidebar).toContain("state.overview.favoriteCount");
-    expect(sidebar).toContain("state.overview.tags.slice(0, 8)");
+    expect(sidebar).not.toContain("state.overview.tags");
     const settings = sourceBetween("function renderSettingsPage", "function renderQuickUnlockSettingsCard");
     expect(settings).toContain("state.overview.lastBackupAt");
     const bootstrap = sourceBetween("async function bootstrap", "function renderGate");
@@ -450,15 +490,25 @@ describe("renderer security boundary", () => {
     expect(disable).toContain("state.syncStatusError = false");
   });
 
-  it("auto-hides every managed password field and masks them on window blur", () => {
+  it("auto-hides every managed sensitive field and masks notes on window blur", () => {
     const passwordField = sourceBetween("function createPasswordField", "function estimateMasterPassword");
-    const revealHelper = sourceBetween("function hideManagedPasswordField", "function setEntryEditorFrozen");
+    const revealHelper = sourceBetween("function hideManagedSensitiveInput", "function setEntryEditorFrozen");
+    const notesHelper = sourceBetween("function revealNotes", "function bindDraftInput");
     const focusHandler = sourceBetween("async function handleFocusChange", "function focusSearchAtEnd");
-    expect(passwordField).toContain("revealManagedPasswordField(managedField)");
+    expect(passwordField).toContain("revealManagedSensitiveInput(managedField)");
     expect(passwordField).toContain('aria-pressed');
     expect(revealHelper).toContain("state.settings.passwordRevealSeconds");
-    expect(revealHelper).toContain("window.setTimeout(() => hideManagedPasswordField(field)");
-    expect(focusHandler).toContain("hideAllManagedPasswordFields()");
+    expect(revealHelper).toContain("window.setTimeout(() => hideManagedSensitiveInput(field)");
+    expect(notesHelper).toContain("window.setTimeout(hideNotes");
+    expect(notesHelper).toContain('input.value = state.draft?.notes ? CONCEALED_TEXT : ""');
+    const editor = sourceBetween("function renderEntryEditor", "function sectionHeading");
+    expect(editor).toContain("revealedNotesInput === notes && !notes.readOnly");
+    expect(editor).toContain("hideNotes()");
+    expect(focusHandler).toContain("hideAllManagedSensitiveInputs()");
+    expect(focusHandler).toContain("hideNotes()");
+    const modal = sourceBetween("function activateModal", "function deactivateModal");
+    expect(modal).toContain("hideAllManagedSensitiveInputs()");
+    expect(modal).toContain("hideNotes()");
   });
 
   it("disables generator result actions and closing while generation or save is busy", () => {

@@ -418,7 +418,7 @@ pub async fn set_favorite(
     state: State<'_, AppState>,
     id: String,
     favorite: bool,
-) -> VaultResult<()> {
+) -> VaultResult<u64> {
     let store = Arc::clone(&state.store);
     run_store(store, move |store| store.set_favorite(&id, favorite)).await
 }

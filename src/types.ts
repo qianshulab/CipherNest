@@ -8,7 +8,6 @@ export interface VaultStatus {
 export interface VaultOverview {
   totalEntries: number;
   favoriteCount: number;
-  tags: string[];
   securityIssueCount: number;
   lastBackupAt?: number;
 }
@@ -89,9 +88,6 @@ export interface MasterPasswordChangeResult {
 export interface EntrySummary {
   id: string;
   title: string;
-  username: string;
-  purpose: string;
-  tags: string[];
   favorite: boolean;
   createdAt: number;
   updatedAt: number;
@@ -100,9 +96,12 @@ export interface EntrySummary {
 }
 
 export interface VaultEntry extends EntrySummary {
+  username: string;
   password: string;
   url: string;
+  purpose: string;
   notes: string;
+  tags: string[];
   revision: number;
 }
 

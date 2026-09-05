@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import brandLogoUrl from "./assets/ciphernest-logo-ui-v1.png";
+import { describeEntrySaveFailure, type EntryField } from "./entry-errors";
 import "./styles.css";
 
 import type {
@@ -80,9 +81,10 @@ type QuickUnlockOperation = "unlock" | "enable" | "disable" | "changePassword" |
 type EntryMutation = "saving" | "deleting" | "favoriting" | null;
 type SyncOperation = "create" | "inspect" | "join" | "sync" | "reveal" | "disable" | null;
 
-interface RevealedPasswordField {
+interface ManagedSensitiveInput {
   input: HTMLInputElement;
   button: HTMLButtonElement;
+  label: string;
   timeout: ReturnType<typeof setTimeout> | null;
 }
 
@@ -138,6 +140,8 @@ const DEFAULT_GENERATOR_OPTIONS: GeneratorOptions = {
   requireEach: true,
 };
 
+const CONCEALED_TEXT = "••••••••••••";
+
 const EMPTY_STATUS: VaultStatus = {
   exists: false,
   unlocked: false,
@@ -148,7 +152,6 @@ const EMPTY_STATUS: VaultStatus = {
 const EMPTY_OVERVIEW: VaultOverview = {
   totalEntries: 0,
   favoriteCount: 0,
-  tags: [],
   securityIssueCount: 0,
 };
 
@@ -246,7 +249,10 @@ let generatorFocusRelease: (() => void) | null = null;
 let activeModalClose: (() => void) | null = null;
 let modalSequence = 0;
 let trustedSystemInteractionDepth = 0;
-const revealedPasswordFields = new Set<RevealedPasswordField>();
+const revealedSensitiveInputs = new Set<ManagedSensitiveInput>();
+let revealedNotesInput: HTMLTextAreaElement | null = null;
+let notesRevealButton: HTMLButtonElement | null = null;
+let notesRevealTimeout: ReturnType<typeof setTimeout> | null = null;
 
 function emptyGeneratorDraft(): GeneratorDraft {
   return { title: "", username: "", purpose: "", url: "", tags: [] };
@@ -446,6 +452,10 @@ function setModalBackgroundHidden(hidden: boolean): void {
 
 function activateModal(close: () => void): boolean {
   if (hasOpenModal()) return false;
+  hideAllManagedSensitiveInputs();
+  hidePassword();
+  hideGeneratorPassword();
+  hideNotes();
   activeModalClose = close;
   setModalBackgroundHidden(true);
   return true;
@@ -475,36 +485,39 @@ function nextModalIds(prefix: string): { title: string; description: string } {
   };
 }
 
-function hideManagedPasswordField(field: RevealedPasswordField): void {
+function hideManagedSensitiveInput(field: ManagedSensitiveInput): void {
   if (field.timeout) window.clearTimeout(field.timeout);
   field.timeout = null;
   field.input.type = "password";
   clearNode(field.button);
   field.button.append(icon("eye"));
-  field.button.setAttribute("aria-label", "显示密码");
+  field.button.setAttribute("aria-label", `显示${field.label}`);
   field.button.setAttribute("aria-pressed", "false");
-  field.button.title = "显示密码";
-  revealedPasswordFields.delete(field);
+  field.button.title = `显示${field.label}`;
+  revealedSensitiveInputs.delete(field);
 }
 
-function revealManagedPasswordField(field: RevealedPasswordField): void {
-  for (const revealed of Array.from(revealedPasswordFields)) {
-    if (revealed !== field) hideManagedPasswordField(revealed);
+function revealManagedSensitiveInput(field: ManagedSensitiveInput): void {
+  for (const revealed of Array.from(revealedSensitiveInputs)) {
+    if (revealed !== field) hideManagedSensitiveInput(revealed);
   }
+  hidePassword();
+  hideGeneratorPassword();
+  hideNotes();
   if (field.timeout) window.clearTimeout(field.timeout);
   field.input.type = "text";
   clearNode(field.button);
   field.button.append(icon("eyeOff"));
-  field.button.setAttribute("aria-label", "隐藏密码");
+  field.button.setAttribute("aria-label", `隐藏${field.label}`);
   field.button.setAttribute("aria-pressed", "true");
-  field.button.title = "隐藏密码";
+  field.button.title = `隐藏${field.label}`;
   const seconds = Math.max(1, state.settings.passwordRevealSeconds || DEFAULT_SETTINGS.passwordRevealSeconds);
-  field.timeout = window.setTimeout(() => hideManagedPasswordField(field), seconds * 1000);
-  revealedPasswordFields.add(field);
+  field.timeout = window.setTimeout(() => hideManagedSensitiveInput(field), seconds * 1000);
+  revealedSensitiveInputs.add(field);
 }
 
-function hideAllManagedPasswordFields(): void {
-  for (const field of Array.from(revealedPasswordFields)) hideManagedPasswordField(field);
+function hideAllManagedSensitiveInputs(): void {
+  for (const field of Array.from(revealedSensitiveInputs)) hideManagedSensitiveInput(field);
 }
 
 function setEntryEditorFrozen(frozen: boolean): void {
@@ -584,7 +597,7 @@ function showToast(message: string, kind: ToastKind = "info", duration = 3600): 
 }
 
 function renderLoading(label = "正在打开本地保险库…"): void {
-  hideAllManagedPasswordFields();
+  hideAllManagedSensitiveInputs();
   clearNode(app);
   const screen = makeElement("main", "loading-screen");
   const mark = makeElement("div", "brand-mark brand-mark-large brand-logo");
@@ -600,7 +613,7 @@ function renderLoading(label = "正在打开本地保险库…"): void {
 }
 
 function renderFatal(): void {
-  hideAllManagedPasswordFields();
+  hideAllManagedSensitiveInputs();
   clearNode(app);
   const screen = makeElement("main", "loading-screen");
   const card = makeElement("section", "fatal-card");
@@ -656,7 +669,7 @@ async function bootstrap(): Promise<void> {
 }
 
 function renderGate(): void {
-  hideAllManagedPasswordFields();
+  hideAllManagedSensitiveInputs();
   clearNode(app);
   const isCreate = !state.status.exists;
   const screen = makeElement("main", "gate-screen");
@@ -806,7 +819,7 @@ function renderGate(): void {
       return;
     }
 
-    hideAllManagedPasswordFields();
+    hideAllManagedSensitiveInputs();
     setBusy(submit, true, isCreate ? "正在创建…" : "正在解锁…");
     try {
       await invokeCommand<void>(isCreate ? "create_vault" : "unlock_vault", { masterPassword });
@@ -877,7 +890,7 @@ async function unlockWithDevice(
   state.quickUnlockOperation = "unlock";
   error.textContent = "";
   passwordInput.value = "";
-  hideAllManagedPasswordFields();
+  hideAllManagedSensitiveInputs();
   passwordSubmit.disabled = true;
   setBusy(button, true, `正在验证 ${deviceName}…`);
   try {
@@ -914,13 +927,13 @@ function createPasswordField(
   input.maxLength = 1024;
   input.required = true;
   input.setAttribute("aria-required", "true");
-  let managedField: RevealedPasswordField;
+  let managedField: ManagedSensitiveInput;
   const reveal = iconButton("显示密码", "eye", () => {
-    if (input.type === "password") revealManagedPasswordField(managedField);
-    else hideManagedPasswordField(managedField);
+    if (input.type === "password") revealManagedSensitiveInput(managedField);
+    else hideManagedSensitiveInput(managedField);
   });
   reveal.setAttribute("aria-pressed", "false");
-  managedField = { input, button: reveal, timeout: null };
+  managedField = { input, button: reveal, label: "密码", timeout: null };
   inputWrap.append(input, reveal);
   wrapper.append(label, inputWrap);
   return { wrapper, input };
@@ -949,7 +962,8 @@ function renderMainShell(): void {
     renderGate();
     return;
   }
-  hideAllManagedPasswordFields();
+  hideAllManagedSensitiveInputs();
+  hideNotes();
   clearNode(app);
   const shell = makeElement("div", "app-shell");
   const topbar = renderTopbar();
@@ -1051,25 +1065,11 @@ function renderSidebar(): HTMLElement {
   );
   sidebar.append(nav);
 
-  const tags = state.overview.tags.slice(0, 8);
   const tagSection = makeElement("section", "sidebar-tags");
-  tagSection.append(makeElement("h2", "sidebar-section-title", "标签"));
-  if (!tags.length) {
-    tagSection.append(makeElement("p", "sidebar-empty", "编辑条目时可添加标签"));
-  } else {
-    for (const tag of tags) {
-      const tagButton = makeElement("button", "sidebar-tag");
-      tagButton.type = "button";
-      tagButton.append(icon("tag", 14), makeElement("span", "truncate", tag));
-      tagButton.addEventListener("click", () => {
-        state.query = tag;
-        state.view = "all";
-        state.mobileNavOpen = false;
-        void loadEntries(true);
-      });
-      tagSection.append(tagButton);
-    }
-  }
+  tagSection.append(
+    makeElement("h2", "sidebar-section-title", "敏感字段"),
+    makeElement("p", "sidebar-empty", "账号、地址、用途、备注和标签默认隐藏"),
+  );
   sidebar.append(tagSection);
 
   const bottom = makeElement("div", "sidebar-bottom");
@@ -1176,24 +1176,34 @@ function renderEntryList(): HTMLElement {
   searchWrap.append(icon("search", 17));
   const search = makeElement("input", "search-input") as HTMLInputElement;
   search.id = "vault-search";
-  search.type = "search";
+  search.type = "password";
   search.placeholder = "搜索名称、账号、用途或标签";
   search.value = state.query;
   search.autocomplete = "off";
   search.spellcheck = false;
-  search.setAttribute("aria-label", "搜索保险库条目");
+  search.setAttribute("aria-label", "搜索保险库条目（内容已隐藏）");
+  let managedSearch: ManagedSensitiveInput;
+  const searchReveal = iconButton("显示搜索内容", "eye", () => {
+    if (search.type === "password") revealManagedSensitiveInput(managedSearch);
+    else hideManagedSensitiveInput(managedSearch);
+  }, "search-reveal");
+  searchReveal.setAttribute("aria-pressed", "false");
+  const searchActions = makeElement("div", "search-actions");
+  const clearSearch = iconButton("清除搜索", "x", () => {
+    state.query = "";
+    hideManagedSensitiveInput(managedSearch);
+    void loadEntries(true, undefined, true);
+  }, "search-clear");
+  setOptionalActionAvailable(clearSearch, Boolean(state.query));
+  managedSearch = { input: search, button: searchReveal, label: "搜索内容", timeout: null };
   search.addEventListener("input", () => {
     state.query = search.value;
+    setOptionalActionAvailable(clearSearch, Boolean(search.value));
     if (listDebounce) window.clearTimeout(listDebounce);
     listDebounce = window.setTimeout(() => void loadEntries(true, undefined, true), 220);
   });
-  searchWrap.append(search);
-  if (state.query) {
-    searchWrap.append(iconButton("清除搜索", "x", () => {
-      state.query = "";
-      void loadEntries(true, undefined, true);
-    }, "search-clear"));
-  }
+  searchActions.append(searchReveal, clearSearch);
+  searchWrap.append(search, searchActions);
   header.append(searchWrap);
 
   const toolbar = makeElement("div", "list-toolbar");
@@ -1255,7 +1265,7 @@ function renderListEmpty(): HTMLElement {
   graphic.append(icon(state.query ? "search" : state.view === "favorites" ? "favorite" : "key", 25));
   empty.append(graphic);
   if (state.query) {
-    empty.append(makeElement("h2", "", "没有匹配的条目"), makeElement("p", "", `未找到与“${state.query}”匹配的内容。`));
+    empty.append(makeElement("h2", "", "没有匹配的条目"), makeElement("p", "", "未找到匹配的内容。"));
     empty.append(makeButton("清除搜索", "button button-ghost button-small", () => {
       state.query = "";
       void loadEntries(true);
@@ -1274,7 +1284,7 @@ function renderEntryRow(entry: EntrySummary): HTMLElement {
   row.setAttribute("role", "listitem");
   const select = makeElement("button", "entry-row-main");
   select.type = "button";
-  select.setAttribute("aria-label", `${entry.title}${entry.username ? `，${entry.username}` : ""}`);
+  select.setAttribute("aria-label", entry.title);
   if (state.selectedId === entry.id) select.setAttribute("aria-current", "true");
   const avatar = makeElement("div", "entry-avatar", firstCharacter(entry.title));
   avatar.setAttribute("aria-hidden", "true");
@@ -1289,9 +1299,11 @@ function renderEntryRow(entry: EntrySummary): HTMLElement {
     warning.setAttribute("role", "img");
     first.append(warning);
   }
-  const subtitle = makeElement("span", "entry-subtitle truncate", entry.username || entry.purpose || "未填写账号");
+  const subtitle = makeElement("span", "entry-subtitle truncate", "敏感信息已隐藏");
   const meta = makeElement("div", "entry-row-meta");
-  if (entry.tags[0]) meta.append(makeElement("span", "mini-tag truncate", entry.tags[0]));
+  const privacy = makeElement("span", "entry-private-label", "PRIVATE");
+  privacy.setAttribute("aria-hidden", "true");
+  meta.append(privacy);
   const updated = makeElement("time", "entry-time", formatCompactDate(entry.updatedAt));
   const updatedDate = new Date(entry.updatedAt);
   if (!Number.isNaN(updatedDate.getTime())) updated.dateTime = updatedDate.toISOString();
@@ -1321,7 +1333,7 @@ function renderEntryDetail(): HTMLElement {
     const graphic = makeElement("div", "detail-empty-graphic");
     graphic.append(icon("shield", 42));
     empty.append(graphic, makeElement("h2", "", "选择一个条目"));
-    empty.append(makeElement("p", "", "只有在你明确打开时，密码内容才会进入当前会话。"));
+    empty.append(makeElement("p", "", "只有在你明确打开条目时，敏感内容才会进入当前会话，并默认保持遮罩。"));
     const shortcuts = makeElement("div", "shortcut-pills");
     shortcuts.append(shortcutPill(shortcutLabel("N"), "新建"), shortcutPill(shortcutLabel("G"), "生成"));
     empty.append(shortcuts);
@@ -1350,7 +1362,6 @@ function renderEntryEditor(): HTMLElement {
   const copy = makeElement("div", "editor-heading");
   copy.append(makeElement("span", "eyebrow", state.entryMeta.id ? "CREDENTIAL" : "NEW CREDENTIAL"));
   copy.append(makeElement("h1", "truncate", draft.title || "新建密码条目"));
-  if (draft.purpose) copy.append(makeElement("p", "truncate", draft.purpose));
   identity.append(avatar, copy);
   const controls = makeElement("div", "editor-header-actions");
   const favorite = iconButton(draft.favorite ? "取消收藏" : "收藏", "favorite", toggleCurrentFavorite, `icon-button${draft.favorite ? " is-favorite" : ""}`);
@@ -1371,12 +1382,11 @@ function renderEntryEditor(): HTMLElement {
 
   const two = makeElement("div", "form-grid-two");
   const usernameField = createTextField("entry-username", "用户名或邮箱", draft.username, "name@example.com", false, 500);
-  usernameField.input.autocomplete = "off";
-  usernameField.input.spellcheck = false;
   bindDraftInput(usernameField.input, "username");
-  addCopyAction(usernameField, "用户名");
+  addSensitiveTextActions(usernameField, "用户名");
   const purposeField = createTextField("entry-purpose", "用途", draft.purpose, "例如：公司后台管理员", false, 500);
   bindDraftInput(purposeField.input, "purpose");
+  addSensitiveTextActions(purposeField, "用途");
   two.append(usernameField.wrapper, purposeField.wrapper);
   section.append(two);
 
@@ -1412,13 +1422,10 @@ function renderEntryEditor(): HTMLElement {
   passwordGroup.append(passwordLabel, passwordWrap, passwordError, revealHint);
   section.append(passwordGroup);
 
-  const urlField = createTextField("entry-url", "网站地址", draft.url, "https://example.com", false, 2048);
-  urlField.input.type = "url";
-  urlField.input.autocomplete = "off";
-  urlField.input.spellcheck = false;
+  const urlField = createTextField("entry-url", "网站或主机地址", draft.url, "例如 example.com、10.0.0.5:3389 或 3389", false, 2048);
   bindDraftInput(urlField.input, "url");
-  addCopyAction(urlField, "网址");
-  urlField.wrapper.append(makeElement("p", "field-help", "仅作为纯文本保存；应用不会自动访问此地址。"));
+  addSensitiveTextActions(urlField, "地址");
+  urlField.wrapper.append(makeElement("p", "field-help", "可填写网站、IP、主机名、端口或其他地址标记；仅作为纯文本保存，应用不会自动访问。"));
   section.append(urlField.wrapper);
   form.append(section);
 
@@ -1428,6 +1435,7 @@ function renderEntryEditor(): HTMLElement {
   tagsField.input.addEventListener("input", () => {
     if (state.draft) state.draft.tags = parseTags(tagsField.input.value);
   });
+  addSensitiveTextActions(tagsField, "标签");
   tagsField.wrapper.append(makeElement("p", "field-help", "使用逗号分隔，最多保留 20 个标签。"));
   detailSection.append(tagsField.wrapper);
 
@@ -1436,13 +1444,38 @@ function renderEntryEditor(): HTMLElement {
   notesLabel.htmlFor = "entry-notes";
   const notes = makeElement("textarea", "textarea") as HTMLTextAreaElement;
   notes.id = "entry-notes";
-  notes.value = draft.notes;
-  notes.placeholder = "仅记录必要的恢复说明或账号背景，不要粘贴不受信任的脚本。";
+  notes.value = draft.notes ? CONCEALED_TEXT : "";
+  notes.placeholder = "点击显示按钮后输入或编辑备注。";
+  notes.readOnly = true;
+  notes.autocomplete = "off";
+  notes.spellcheck = false;
+  notes.classList.add("concealed-notes");
   notes.maxLength = 20000;
+  const notesWrap = makeElement("div", "notes-with-actions");
+  const notesActions = makeElement("div", "notes-actions");
+  const revealNotesButton = iconButton("显示并编辑备注", "eye", () => {
+    if (revealedNotesInput === notes && !notes.readOnly) hideNotes();
+    else revealNotes(notes, revealNotesButton);
+  });
+  revealNotesButton.setAttribute("aria-pressed", "false");
+  const copyNotes = iconButton("复制备注", "copy", () => copySecret(state.draft?.notes ?? "", "备注"));
+  setOptionalActionAvailable(copyNotes, Boolean(draft.notes));
   notes.addEventListener("input", () => {
     if (state.draft) state.draft.notes = notes.value;
+    setOptionalActionAvailable(copyNotes, Boolean(notes.value));
+    clearFieldError("entry-notes");
   });
-  notesGroup.append(notesLabel, notes);
+  const notesError = makeElement("p", "field-error");
+  notesError.id = "entry-notes-error";
+  notesError.setAttribute("aria-live", "polite");
+  notesActions.append(revealNotesButton, copyNotes);
+  notesWrap.append(notes, notesActions);
+  notesGroup.append(
+    notesLabel,
+    notesWrap,
+    notesError,
+    makeElement("p", "field-help", "默认隐藏；显示后可编辑，并会按敏感字段显示时长自动重新遮罩。"),
+  );
   detailSection.append(notesGroup);
   form.append(detailSection);
 
@@ -1527,18 +1560,85 @@ function createTextField(
   return { wrapper, input };
 }
 
-function addCopyAction(
+function addSensitiveTextActions(
   field: { wrapper: HTMLElement; input: HTMLInputElement },
   label: string,
 ): void {
-  const inputWrap = makeElement("div", "input-with-action");
-  const copy = iconButton(`复制${label}`, "copy", () => copySecret(field.input.value, label));
-  copy.hidden = !field.input.value;
-  field.input.addEventListener("input", () => {
-    copy.hidden = !field.input.value;
+  field.input.type = "password";
+  field.input.autocomplete = "off";
+  field.input.spellcheck = false;
+  field.input.classList.add("sensitive-text-input");
+  const inputWrap = makeElement("div", "input-with-action sensitive-input-with-actions");
+  const actions = makeElement("div", "sensitive-input-actions");
+  let managedField: ManagedSensitiveInput;
+  const reveal = iconButton(`显示${label}`, "eye", () => {
+    if (field.input.type === "password") revealManagedSensitiveInput(managedField);
+    else hideManagedSensitiveInput(managedField);
   });
+  reveal.setAttribute("aria-pressed", "false");
+  const copy = iconButton(`复制${label}`, "copy", () => copySecret(field.input.value, label));
+  if (field.input.id.startsWith("generator-")) {
+    reveal.classList.add("generator-config-control");
+    copy.classList.add("generator-config-control");
+  }
+  setOptionalActionAvailable(copy, Boolean(field.input.value));
+  field.input.addEventListener("input", () => {
+    setOptionalActionAvailable(copy, Boolean(field.input.value));
+  });
+  managedField = { input: field.input, button: reveal, label, timeout: null };
   field.wrapper.insertBefore(inputWrap, field.input);
-  inputWrap.append(field.input, copy);
+  actions.append(reveal, copy);
+  inputWrap.append(field.input, actions);
+}
+
+function setOptionalActionAvailable(button: HTMLButtonElement, available: boolean): void {
+  button.hidden = !available;
+  button.disabled = !available;
+  button.tabIndex = available ? 0 : -1;
+  if (available) button.removeAttribute("aria-hidden");
+  else button.setAttribute("aria-hidden", "true");
+}
+
+function revealNotes(input: HTMLTextAreaElement, button: HTMLButtonElement): void {
+  hideNotes();
+  hideAllManagedSensitiveInputs();
+  hidePassword();
+  hideGeneratorPassword();
+  revealedNotesInput = input;
+  notesRevealButton = button;
+  input.readOnly = false;
+  input.classList.remove("concealed-notes");
+  input.value = state.draft?.notes ?? "";
+  clearNode(button);
+  button.append(icon("eyeOff"));
+  button.setAttribute("aria-label", "隐藏备注");
+  button.setAttribute("aria-pressed", "true");
+  button.title = "隐藏备注";
+  const seconds = Math.max(1, state.settings.passwordRevealSeconds || DEFAULT_SETTINGS.passwordRevealSeconds);
+  notesRevealTimeout = window.setTimeout(hideNotes, seconds * 1000);
+  input.focus();
+  input.setSelectionRange(input.value.length, input.value.length);
+}
+
+function hideNotes(): void {
+  if (notesRevealTimeout) window.clearTimeout(notesRevealTimeout);
+  notesRevealTimeout = null;
+  const input = revealedNotesInput;
+  if (input?.isConnected && !input.readOnly) {
+    if (state.draft) state.draft.notes = input.value;
+    input.value = state.draft?.notes ? CONCEALED_TEXT : "";
+    input.readOnly = true;
+    input.classList.add("concealed-notes");
+  }
+  if (notesRevealButton?.isConnected) {
+    clearNode(notesRevealButton);
+    notesRevealButton.append(icon("eye"));
+    notesRevealButton.setAttribute("aria-label", "显示并编辑备注");
+    notesRevealButton.setAttribute("aria-pressed", "false");
+    notesRevealButton.title = "显示并编辑备注";
+  }
+  revealedNotesInput = null;
+  notesRevealButton = null;
 }
 
 function bindDraftInput(input: HTMLInputElement, key: "title" | "username" | "purpose" | "url"): void {
@@ -1656,7 +1756,7 @@ function renderSettingsPage(): HTMLElement {
 
   const layout = makeElement("div", "settings-layout");
   const security = makeElement("section", "content-card settings-card settings-security-card");
-  security.append(settingsCardHeader("shield", "锁定与隐私", "减少密码停留在屏幕和剪贴板中的时间。"));
+  security.append(settingsCardHeader("shield", "锁定与隐私", "减少敏感字段停留在屏幕和剪贴板中的时间。"));
   const form = makeElement("form", "settings-form");
   form.noValidate = true;
   form.append(
@@ -1673,7 +1773,7 @@ function renderSettingsPage(): HTMLElement {
       [30, "30 秒"],
       [60, "60 秒"],
     ], state.settings.clipboardClearSeconds),
-    createSelectSetting("setting-reveal", "密码显示时长", "到期后自动重新遮罩。", [
+    createSelectSetting("setting-reveal", "敏感字段显示时长", "密码、账号、地址、用途、备注和标签到期后自动重新遮罩。", [
       [5, "5 秒"],
       [10, "10 秒（推荐）"],
       [20, "20 秒"],
@@ -1789,7 +1889,7 @@ function renderSettingsPage(): HTMLElement {
       confirm.input.focus();
       return;
     }
-    hideAllManagedPasswordFields();
+    hideAllManagedSensitiveInputs();
     const operationEpoch = state.epoch;
     const syncWasConfigured = state.syncStatus.configured;
     state.quickUnlockOperation = "changePassword";
@@ -1925,8 +2025,8 @@ function renderWebDavSyncSettingsCard(): HTMLElement {
     content.append(notice, actions);
   } else {
     const metadata = makeElement("dl", "sync-metadata");
-    appendSyncMetadata(metadata, "服务器", status.endpointHost || "已配置");
-    appendSyncMetadata(metadata, "用户名", status.username || "—");
+    appendSensitiveSyncMetadata(metadata, "服务器", status.endpointHost || "已配置");
+    appendSensitiveSyncMetadata(metadata, "用户名", status.username || "—");
     appendSyncMetadata(metadata, "同步 ID", status.syncIdShort || "—");
     appendSyncMetadata(metadata, "远端序列", status.remoteSequence === undefined ? "尚未记录" : `#${status.remoteSequence.toLocaleString("zh-CN")}`);
     appendSyncMetadata(metadata, "上次完成", status.lastSyncAt ? formatFullDate(status.lastSyncAt) : "尚未完成手动同步");
@@ -1970,6 +2070,19 @@ function renderWebDavSyncSettingsCard(): HTMLElement {
 function appendSyncMetadata(list: HTMLDListElement, label: string, value: string): void {
   const item = makeElement("div", "sync-metadata-item");
   item.append(makeElement("dt", "", label), makeElement("dd", "", value));
+  list.append(item);
+}
+
+function appendSensitiveSyncMetadata(list: HTMLDListElement, label: string, value: string): void {
+  const item = makeElement("div", "sync-metadata-item sync-metadata-sensitive");
+  const valueCell = makeElement("dd");
+  const input = makeElement("input", "input sync-metadata-input") as HTMLInputElement;
+  input.value = value;
+  input.readOnly = true;
+  input.setAttribute("aria-label", `${label}（已隐藏）`);
+  valueCell.append(input);
+  addSensitiveTextActions({ wrapper: valueCell, input }, label);
+  item.append(makeElement("dt", "", label), valueCell);
   list.append(item);
 }
 
@@ -2145,7 +2258,7 @@ async function disableQuickUnlock(
   const syncWasConfigured = state.syncStatus.configured;
   let currentPassword = passwordInput.value;
   passwordInput.value = "";
-  hideAllManagedPasswordFields();
+  hideAllManagedSensitiveInputs();
   state.quickUnlockOperation = "disable";
   error.textContent = "";
   setSecurityMutationControlsDisabled(true);
@@ -2580,7 +2693,9 @@ async function loadEntries(render = true, requestedEpoch = state.epoch, restoreS
   if (query) args.query = query;
   try {
     const entries = await invokeCommand<EntrySummary[]>("list_entries", args);
-    if (epoch !== state.epoch || requestId !== listRequestId || !state.status.unlocked) return;
+    if (epoch !== state.epoch || requestId !== listRequestId || !state.status.unlocked) {
+      return;
+    }
     state.entries = entries;
     state.status.itemCount = Math.max(state.status.itemCount, entries.length);
     state.listLoading = false;
@@ -2635,8 +2750,7 @@ async function selectEntry(id: string): Promise<void> {
   try {
     const entry = await invokeCommand<VaultEntry>("get_entry", { id });
     if (epoch !== state.epoch || state.selectedId !== id || !state.status.unlocked) {
-      entry.password = "";
-      entry.notes = "";
+      clearVaultEntrySensitiveFields(entry);
       return;
     }
     state.entryMeta = {
@@ -2648,8 +2762,7 @@ async function selectEntry(id: string): Promise<void> {
     };
     state.draft = entryInputFromVault(entry);
     state.draftSnapshot = serializeInput(state.draft);
-    entry.password = "";
-    entry.notes = "";
+    clearVaultEntrySensitiveFields(entry);
     state.detailLoading = false;
     renderMainShell();
   } catch {
@@ -2667,7 +2780,7 @@ async function createNewEntry(): Promise<void> {
     const discard = await showConfirm("放弃未保存的修改？", "新建条目将丢弃当前修改。", "放弃并新建", true);
     if (!discard) return;
   }
-  hidePassword();
+  clearEntryDraft();
   state.view = "all";
   state.selectedId = null;
   state.entryMeta = {};
@@ -2694,6 +2807,15 @@ function entryInputFromVault(entry: VaultEntry): EntryInput {
     tags: [...entry.tags],
     favorite: entry.favorite,
   };
+}
+
+function clearVaultEntrySensitiveFields(entry: VaultEntry): void {
+  entry.username = "";
+  entry.password = "";
+  entry.url = "";
+  entry.purpose = "";
+  entry.notes = "";
+  entry.tags.length = 0;
 }
 
 function cloneEntryInput(input: EntryInput): EntryInput {
@@ -2732,8 +2854,7 @@ async function saveCurrentEntry(button?: HTMLButtonElement): Promise<boolean> {
     await loadVaultOverview(epoch).catch(() => undefined);
     const entry = await invokeCommand<VaultEntry>("get_entry", { id: summary.id });
     if (epoch !== state.epoch || !state.status.unlocked || state.entryMutation !== "saving") {
-      entry.password = "";
-      entry.notes = "";
+      clearVaultEntrySensitiveFields(entry);
       return false;
     }
     state.entryMeta = {
@@ -2755,8 +2876,7 @@ async function saveCurrentEntry(button?: HTMLButtonElement): Promise<boolean> {
       state.draft = entryInputFromVault(entry);
       state.draftSnapshot = serializeInput(state.draft);
     }
-    entry.password = "";
-    entry.notes = "";
+    clearVaultEntrySensitiveFields(entry);
     state.report = null;
     state.entryMutation = null;
     renderMainShell();
@@ -2767,7 +2887,7 @@ async function saveCurrentEntry(button?: HTMLButtonElement): Promise<boolean> {
       draftChangedWhileSaving ? "warning" : "success",
     );
     return true;
-  } catch {
+  } catch (error) {
     if (epoch !== state.epoch || !state.status.unlocked) return false;
     state.entryMutation = null;
     if (button) setBusy(button, false);
@@ -2779,9 +2899,25 @@ async function saveCurrentEntry(button?: HTMLButtonElement): Promise<boolean> {
       showToast("条目已保存，但详情刷新失败。请重新打开条目确认内容。", "warning", 4800);
       return true;
     }
-    showToast("无法保存条目。保险库未被修改，请重试。", "error");
+    presentEntrySaveFailure(error, "editor");
     return false;
   }
+}
+
+function presentEntrySaveFailure(error: unknown, context: "editor" | "generator"): void {
+  const failure = describeEntrySaveFailure(error);
+  const fieldId = failure.field ? entryFieldId(failure.field, context) : null;
+  if (fieldId) setFieldError(fieldId, failure.message.replace(/^无法保存：/u, ""), true);
+  showToast(failure.message, "error", 4800);
+}
+
+function entryFieldId(field: EntryField, context: "editor" | "generator"): string | null {
+  const prefix = context === "editor" ? "entry" : "generator";
+  const suffixes: Partial<Record<EntryField, string>> = context === "editor"
+    ? { title: "title", username: "username", password: "password", address: "url", purpose: "purpose", notes: "notes", tags: "tags" }
+    : { title: "app", username: "user", address: "url", purpose: "purpose", tags: "tags" };
+  const suffix = suffixes[field];
+  return suffix ? `${prefix}-${suffix}` : null;
 }
 
 function validateEntry(input: EntryInput): boolean {
@@ -2841,11 +2977,16 @@ async function returnToList(): Promise<void> {
 }
 
 function clearEntryDraft(): void {
+  hideAllManagedSensitiveInputs();
   hidePassword();
+  hideNotes();
   if (state.draft) {
-    state.draft.password = "";
-    state.draft.notes = "";
     state.draft.username = "";
+    state.draft.password = "";
+    state.draft.url = "";
+    state.draft.purpose = "";
+    state.draft.notes = "";
+    state.draft.tags.length = 0;
   }
   state.draft = null;
   state.draftSnapshot = "";
@@ -2905,13 +3046,14 @@ async function toggleFavorite(entry: EntrySummary): Promise<void> {
   state.entryMutation = "favoriting";
   setEntryEditorFrozen(true);
   try {
-    await invokeCommand<void>("set_favorite", { id, favorite });
+    const revision = await invokeCommand<number>("set_favorite", { id, favorite });
     if (epoch !== state.epoch || !state.status.unlocked || state.entryMutation !== "favoriting") return;
     const currentSummary = state.entries.find((item) => item.id === id);
     if (currentSummary) currentSummary.favorite = favorite;
     if (state.draft?.id === id) {
       state.draft.favorite = favorite;
       updateSnapshotFavorite(favorite);
+      setCurrentEntryRevision(id, revision);
     }
     await Promise.all([
       loadVaultOverview(epoch).catch(() => undefined),
@@ -2947,7 +3089,7 @@ async function toggleCurrentFavorite(): Promise<void> {
   state.entryMutation = "favoriting";
   setEntryEditorFrozen(true);
   try {
-    await invokeCommand<void>("set_favorite", { id, favorite });
+    const revision = await invokeCommand<number>("set_favorite", { id, favorite });
     if (
       epoch !== state.epoch
       || !state.status.unlocked
@@ -2956,6 +3098,7 @@ async function toggleCurrentFavorite(): Promise<void> {
     ) return;
     state.draft.favorite = favorite;
     updateSnapshotFavorite(favorite);
+    setCurrentEntryRevision(id, revision);
     const summary = state.entries.find((entry) => entry.id === id);
     if (summary) summary.favorite = favorite;
     await loadVaultOverview(epoch).catch(() => undefined);
@@ -2980,6 +3123,11 @@ async function toggleCurrentFavorite(): Promise<void> {
   }
 }
 
+function setCurrentEntryRevision(id: string, revision: number): void {
+  if (state.entryMeta.id !== id) return;
+  state.entryMeta.revision = revision;
+}
+
 function updateSnapshotFavorite(favorite: boolean): void {
   if (!state.draftSnapshot) return;
   try {
@@ -2996,6 +3144,9 @@ function togglePasswordVisibility(): void {
     hidePassword();
     return;
   }
+  hideAllManagedSensitiveInputs();
+  hideGeneratorPassword();
+  hideNotes();
   state.passwordVisible = true;
   const input = document.querySelector<HTMLInputElement>("#entry-password");
   if (input) input.type = "text";
@@ -3107,6 +3258,9 @@ async function clearClipboardNow(showFeedback: boolean): Promise<void> {
 
 function openGenerator(source: "standalone" | "entry"): void {
   if (!state.status.unlocked || hasOpenModal() || blockEntryActionWhileMutating()) return;
+  hideAllManagedSensitiveInputs();
+  hidePassword();
+  hideNotes();
   state.generatorOpen = true;
   state.generatorSource = source;
   state.generatorResult = null;
@@ -3242,19 +3396,25 @@ function renderGeneratorDialog(): void {
   const generatorUser = createTextField("generator-user", "用户名或邮箱", state.generatorDraft.username, "name@example.com", false, 500);
   generatorUser.input.classList.add("generator-config-control");
   bindGeneratorInput(generatorUser.input, "username");
+  addSensitiveTextActions(generatorUser, "用户名");
   const generatorPurpose = createTextField("generator-purpose", "用途", state.generatorDraft.purpose, "例如：工作账号", false, 500);
   generatorPurpose.input.classList.add("generator-config-control");
   bindGeneratorInput(generatorPurpose.input, "purpose");
+  addSensitiveTextActions(generatorPurpose, "用途");
   metaTwo.append(generatorUser.wrapper, generatorPurpose.wrapper);
-  const generatorUrl = createTextField("generator-url", "网站地址", state.generatorDraft.url, "https://example.com", false, 2048);
+  const generatorUrl = createTextField("generator-url", "网站或主机地址", state.generatorDraft.url, "例如 example.com、10.0.0.5:3389 或 3389", false, 2048);
   generatorUrl.input.classList.add("generator-config-control");
-  generatorUrl.input.type = "url";
+  generatorUrl.input.autocomplete = "off";
+  generatorUrl.input.spellcheck = false;
   bindGeneratorInput(generatorUrl.input, "url");
+  addSensitiveTextActions(generatorUrl, "地址");
+  generatorUrl.wrapper.append(makeElement("p", "field-help", "支持网站、IP、主机名、端口或其他地址标记。"));
   const generatorTags = createTextField("generator-tags", "标签", state.generatorDraft.tags.join(", "), "工作, 管理员", false, 1400);
   generatorTags.input.classList.add("generator-config-control");
   generatorTags.input.addEventListener("input", () => {
     state.generatorDraft.tags = parseTags(generatorTags.input.value);
   });
+  addSensitiveTextActions(generatorTags, "标签");
   metadataCard.append(generatorTitle.wrapper, metaTwo, generatorUrl.wrapper, generatorTags.wrapper);
   columns.append(optionsCard, metadataCard);
   body.append(columns);
@@ -3404,7 +3564,7 @@ function updateGeneratorOutput(): void {
   const dialog = document.querySelector<HTMLElement>(".generator-dialog");
   dialog?.setAttribute("aria-busy", String(interactionBusy));
   dialog
-    ?.querySelectorAll<HTMLInputElement>(".generator-config-control")
+    ?.querySelectorAll<HTMLInputElement | HTMLButtonElement>(".generator-config-control")
     .forEach((control) => {
       control.disabled = state.generatorApplying;
     });
@@ -3415,6 +3575,9 @@ function toggleGeneratorVisibility(): void {
     hideGeneratorPassword();
     return;
   }
+  hideAllManagedSensitiveInputs();
+  hidePassword();
+  hideNotes();
   state.generatorVisible = true;
   const input = document.querySelector<HTMLInputElement>("#generated-password");
   if (input) input.type = "text";
@@ -3494,16 +3657,17 @@ async function applyGeneratedPassword(button: HTMLButtonElement): Promise<void> 
     await loadEntries(true);
     await selectEntry(summary.id);
     showToast("密码和应用信息已一起加密保存。", "success");
-  } catch {
+  } catch (error) {
     state.generatorApplying = false;
     setBusy(button, false);
     updateGeneratorOutput();
-    showToast("无法保存生成的密码。保险库未被修改。", "error");
+    presentEntrySaveFailure(error, "generator");
   }
 }
 
 function closeGenerator(force = false): void {
   if (!force && (state.generatorBusy || state.generatorApplying)) return;
+  hideAllManagedSensitiveInputs();
   state.generatorOpen = false;
   state.generatorVisible = false;
   state.generatorBusy = false;
@@ -3515,7 +3679,11 @@ function closeGenerator(force = false): void {
   generatorRevealTimeout = null;
   if (state.generatorResult) state.generatorResult.password = "";
   state.generatorResult = null;
+  state.generatorDraft.title = "";
   state.generatorDraft.username = "";
+  state.generatorDraft.purpose = "";
+  state.generatorDraft.url = "";
+  state.generatorDraft.tags.length = 0;
   state.generatorDraft = emptyGeneratorDraft();
   const region = document.querySelector<HTMLElement>("#modal-region");
   region?.querySelector(".generator-overlay")?.remove();
@@ -3621,7 +3789,7 @@ async function restoreBackup(): Promise<void> {
     if (!wasUnlocked) renderGate();
   } finally {
     masterPassword = "";
-    hideAllManagedPasswordFields();
+    hideAllManagedSensitiveInputs();
     if (!restoreApplied) {
       try {
         await invokeCommand<void>("cancel_pending_restore");
@@ -3685,9 +3853,10 @@ async function performLock(message: string, notify: boolean): Promise<void> {
 function clearSensitiveState(clearMetadata: boolean): void {
   state.quickUnlockOperation = null;
   state.syncOperation = null;
-  hideAllManagedPasswordFields();
+  hideAllManagedSensitiveInputs();
   hidePassword();
   hideGeneratorPassword();
+  hideNotes();
   dismissActiveModal();
   closeGenerator(true);
   stopClipboardTimer();
@@ -3743,9 +3912,10 @@ function recordActivity(): void {
 }
 
 async function handleFocusChange(focused: boolean): Promise<void> {
-  hideAllManagedPasswordFields();
+  hideAllManagedSensitiveInputs();
   hidePassword();
   hideGeneratorPassword();
+  hideNotes();
   if (!state.status.unlocked) return;
   if (trustedSystemInteractionDepth > 0) return;
   try {
@@ -4013,7 +4183,7 @@ function askMasterPassword(
       if (settled) return;
       settled = true;
       field.input.value = "";
-      hideAllManagedPasswordFields();
+      hideAllManagedSensitiveInputs();
       overlay.remove();
       deactivateModal();
       release();
@@ -4094,13 +4264,10 @@ function askWebDavConnection(
     body.id = ids.description;
 
     const endpoint = createTextField("webdav-endpoint", "WebDAV 目录地址", "", "https://cloud.example.com/remote.php/dav/files/name/CipherNest/", true, 2048);
-    endpoint.input.type = "url";
-    endpoint.input.autocomplete = "off";
-    endpoint.input.spellcheck = false;
+    addSensitiveTextActions(endpoint, "WebDAV 地址");
     endpoint.wrapper.append(makeElement("p", "field-help", "必须是已存在的 HTTPS 目录，并以 / 结尾；请勿在地址中嵌入凭据。"));
     const username = createTextField("webdav-username", "用户名", "", "WebDAV 用户名", true, 500);
-    username.input.autocomplete = "username";
-    username.input.spellcheck = false;
+    addSensitiveTextActions(username, "WebDAV 用户名");
     const appPassword = createPasswordField("webdav-app-password", "应用专用密码", "输入 WebDAV 应用专用密码", "off");
     appPassword.input.maxLength = 4096;
     appPassword.wrapper.append(makeElement("p", "field-help", "建议在服务端单独创建、可随时撤销的应用专用密码。它会加密保存在本机同步配置中。"));
@@ -4125,7 +4292,7 @@ function askWebDavConnection(
       username.input.value = "";
       appPassword.input.value = "";
       if (recovery) recovery.input.value = "";
-      hideAllManagedPasswordFields();
+      hideAllManagedSensitiveInputs();
     };
     const finish = (value: WebDavCredentials | WebDavJoinDetails | null) => {
       if (settled) return;
@@ -4224,14 +4391,14 @@ function showRecoveryCodeDialog(code: string, requireSaved: boolean, title: stri
     input.spellcheck = false;
     input.setAttribute("aria-label", "WebDAV 同步恢复码");
     const actionsInField = makeElement("div", "secret-actions");
-    let managedField: RevealedPasswordField;
+    let managedField: ManagedSensitiveInput;
     const reveal = iconButton("显示恢复码", "eye", () => {
-      if (input.type === "password") revealManagedPasswordField(managedField);
-      else hideManagedPasswordField(managedField);
+      if (input.type === "password") revealManagedSensitiveInput(managedField);
+      else hideManagedSensitiveInput(managedField);
     });
     reveal.setAttribute("aria-pressed", "false");
     const copy = iconButton("复制恢复码", "copy", () => copySecret(input.value, "恢复码"));
-    managedField = { input, button: reveal, timeout: null };
+    managedField = { input, button: reveal, label: "恢复码", timeout: null };
     actionsInField.append(reveal, copy);
     codeWrap.append(input, actionsInField);
 
@@ -4256,7 +4423,7 @@ function showRecoveryCodeDialog(code: string, requireSaved: boolean, title: stri
     const finish = () => {
       if (settled) return;
       settled = true;
-      hideManagedPasswordField(managedField);
+      hideManagedSensitiveInput(managedField);
       input.value = "";
       overlay.remove();
       deactivateModal();
@@ -4558,9 +4725,10 @@ window.addEventListener("blur", () => void handleFocusChange(false));
 window.addEventListener("focus", () => void handleFocusChange(true));
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) {
-    hideAllManagedPasswordFields();
+    hideAllManagedSensitiveInputs();
     hidePassword();
     hideGeneratorPassword();
+    hideNotes();
   }
 });
 window.addEventListener("beforeunload", () => {

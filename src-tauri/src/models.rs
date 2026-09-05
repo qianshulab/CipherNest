@@ -42,9 +42,6 @@ pub struct EntryInput {
 pub struct EntrySummary {
     pub id: String,
     pub title: String,
-    pub username: String,
-    pub purpose: String,
-    pub tags: Vec<String>,
     pub favorite: bool,
     pub created_at: u64,
     pub updated_at: u64,
@@ -108,7 +105,6 @@ pub struct VaultStatus {
 pub struct VaultOverview {
     pub total_entries: usize,
     pub favorite_count: usize,
-    pub tags: Vec<String>,
     pub security_issue_count: usize,
     pub last_backup_at: Option<u64>,
 }

@@ -5,7 +5,7 @@
 ## 自动化行为
 
 - 手动运行 `Package beta release` 只构建并保留 GitHub Actions artifacts，不创建 GitHub Release。
-- 推送与项目版本完全一致的 `v*` 标签（例如 `v0.3.0`）后，工作流才会构建并创建 GitHub prerelease。
+- 推送与项目版本完全一致的 `v*` 标签（例如 `v0.3.1`）后，工作流才会构建并创建 GitHub prerelease。
 - 标签版本必须同时匹配 `package.json`、`src-tauri/tauri.conf.json` 与 `src-tauri/Cargo.toml`；不一致会直接失败。
 - 每个构建显式指定目标架构，并检查最终原生可执行文件头，避免把 runner 的默认架构误标成发布架构。
 - 发布阶段要求四个安装包全部存在，并重新核对构建阶段生成的 SHA-256；缺包、重复包或哈希不一致都会失败关闭。

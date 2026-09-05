@@ -1,6 +1,6 @@
 use std::{
     cmp::Reverse,
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     ffi::OsString,
     fs::{self, File},
     io::Read,
@@ -425,14 +425,6 @@ impl VaultStore {
         self.touch();
         let vault = self.unlocked.as_ref().ok_or(VaultError::Locked)?;
         let password_counts = password_counts(&vault.data.entries);
-        let tags = vault
-            .data
-            .entries
-            .iter()
-            .flat_map(|entry| entry.tags.iter().cloned())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
         let security_issue_count = vault
             .data
             .entries
@@ -447,7 +439,6 @@ impl VaultStore {
                 .iter()
                 .filter(|entry| entry.favorite)
                 .count(),
-            tags,
             security_issue_count,
             last_backup_at: vault.data.last_backup_at,
         })
@@ -587,7 +578,7 @@ impl VaultStore {
         Ok(())
     }
 
-    pub fn set_favorite(&mut self, id: &str, favorite: bool) -> VaultResult<()> {
+    pub fn set_favorite(&mut self, id: &str, favorite: bool) -> VaultResult<u64> {
         validate_id(id)?;
         self.require_unlocked()?;
         let mut next_data = self
@@ -597,18 +588,21 @@ impl VaultStore {
             .data
             .clone();
         let now = now_ms();
-        let entry = next_data
-            .entries
-            .iter_mut()
-            .find(|entry| entry.id == id)
-            .ok_or(VaultError::EntryNotFound)?;
-        entry.favorite = favorite;
-        entry.updated_at = now;
-        entry.revision = entry.revision.saturating_add(1);
+        let revision = {
+            let entry = next_data
+                .entries
+                .iter_mut()
+                .find(|entry| entry.id == id)
+                .ok_or(VaultError::EntryNotFound)?;
+            entry.favorite = favorite;
+            entry.updated_at = now;
+            entry.revision = entry.revision.saturating_add(1);
+            entry.revision
+        };
         bump_generation(&mut next_data, now);
         self.persist(next_data)?;
         self.touch();
-        Ok(())
+        Ok(revision)
     }
 
     pub fn settings(&mut self) -> VaultResult<VaultSettings> {
@@ -1649,18 +1643,7 @@ fn validate_entry_fields(
     validate_bytes(password, 1, 4096, "密码")?;
     validate_text(purpose, 0, 500, "用途")?;
     validate_text(notes, 0, 20_000, "备注")?;
-    if url.chars().count() > 2048 {
-        return Err(VaultError::InvalidInput("网址过长".into()));
-    }
-    if !url.is_empty() {
-        let parsed =
-            Url::parse(url).map_err(|_| VaultError::InvalidInput("网址格式无效".into()))?;
-        if !matches!(parsed.scheme(), "https" | "http") || parsed.host_str().is_none() {
-            return Err(VaultError::InvalidInput(
-                "网址仅支持完整的 http 或 https 地址".into(),
-            ));
-        }
-    }
+    validate_text(url, 0, 2048, "地址")?;
     if tags.len() > 20 || tags.iter().any(|tag| tag.chars().count() > 50) {
         return Err(VaultError::InvalidInput("标签数量或长度超出限制".into()));
     }
@@ -1749,9 +1732,6 @@ fn entry_summary(entry: &VaultEntry, counts: &PasswordCounts) -> EntrySummary {
     EntrySummary {
         id: entry.id.clone(),
         title: entry.title.clone(),
-        username: entry.username.clone(),
-        purpose: entry.purpose.clone(),
-        tags: entry.tags.clone(),
         favorite: entry.favorite,
         created_at: entry.created_at,
         updated_at: entry.updated_at,
@@ -1998,13 +1978,23 @@ mod tests {
     }
 
     #[test]
-    fn url_validation_blocks_privileged_schemes() {
-        assert!(
-            validate_entry_fields("x", "", "secret", "javascript:alert(1)", "", "", &[]).is_err()
-        );
-        assert!(
-            validate_entry_fields("x", "", "secret", "https://example.com", "", "", &[]).is_ok()
-        );
+    fn address_field_accepts_plain_text_and_limits_length() {
+        for address in [
+            "3389",
+            "10.0.0.8:3389",
+            "internal-host",
+            "RDP 跳板机（仅限公司网络）",
+            "https://example.com",
+            "javascript:alert(1)",
+        ] {
+            assert!(
+                validate_entry_fields("x", "", "secret", address, "", "", &[]).is_ok(),
+                "address should be stored as plain text: {address}"
+            );
+        }
+
+        let too_long = "a".repeat(2049);
+        assert!(validate_entry_fields("x", "", "secret", &too_long, "", "", &[]).is_err());
     }
 
     #[test]
@@ -2021,11 +2011,34 @@ mod tests {
                 title: "Example".into(),
                 username: "local-user".into(),
                 password: "Z6!qL8@vN4#rT2$xP9".into(),
-                url: "https://example.com".into(),
+                url: "10.0.0.8:3389".into(),
                 purpose: "integration test".into(),
                 notes: "encrypted note".into(),
                 tags: vec!["test".into()],
                 favorite: true,
+            })
+            .unwrap();
+        let summary_json = serde_json::to_value(&summary).unwrap();
+        for sensitive_key in ["username", "url", "purpose", "notes", "tags", "password"] {
+            assert!(
+                summary_json.get(sensitive_key).is_none(),
+                "entry summaries must not expose {sensitive_key}"
+            );
+        }
+        let favorite_revision = store.set_favorite(&summary.id, false).unwrap();
+        assert_eq!(favorite_revision, 2);
+        store
+            .save_entry(EntryInput {
+                id: Some(summary.id.clone()),
+                expected_revision: Some(favorite_revision),
+                title: "Example".into(),
+                username: "local-user".into(),
+                password: "Z6!qL8@vN4#rT2$xP9".into(),
+                url: "10.0.0.8:3389".into(),
+                purpose: "updated after favorite".into(),
+                notes: "encrypted note".into(),
+                tags: vec!["test".into()],
+                favorite: false,
             })
             .unwrap();
         assert!(store.lock());
@@ -2038,6 +2051,10 @@ mod tests {
         let entry = store.get_entry(&summary.id).unwrap();
         assert_eq!(entry.title, "Example");
         assert_eq!(entry.password, "Z6!qL8@vN4#rT2$xP9");
+        assert_eq!(entry.url, "10.0.0.8:3389");
+        assert_eq!(entry.purpose, "updated after favorite");
+        assert!(!entry.favorite);
+        assert_eq!(entry.revision, 3);
         assert_eq!(store.list_entries(None, None, None).unwrap().len(), 1);
 
         store.delete_entry(&summary.id).unwrap();

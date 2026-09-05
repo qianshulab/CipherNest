@@ -1829,12 +1829,6 @@ fn validate_entry(entry: &VaultEntry) -> SyncResult<()> {
     {
         return Err(SyncError::InvalidData);
     }
-    if !entry.url.is_empty() {
-        let url = Url::parse(&entry.url).map_err(|_| SyncError::InvalidData)?;
-        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-            return Err(SyncError::InvalidData);
-        }
-    }
     Ok(())
 }
 
@@ -2335,6 +2329,33 @@ mod tests {
             "password".into()
         )
         .is_err());
+    }
+
+    #[test]
+    fn synced_entry_address_is_plain_text_with_a_length_limit() {
+        let id = Uuid::new_v4().to_string();
+        for address in [
+            "3389",
+            "10.0.0.8:3389",
+            "internal-host",
+            "RDP 跳板机（仅限公司网络）",
+            "https://example.com",
+            "javascript:alert(1)",
+        ] {
+            let mut candidate = entry(&id, "Remote host", "secret", 1);
+            candidate.url = address.into();
+            assert!(
+                validate_entry(&candidate).is_ok(),
+                "address should remain valid after sync: {address}"
+            );
+        }
+
+        let mut candidate = entry(&id, "Remote host", "secret", 1);
+        candidate.url = "a".repeat(2049);
+        assert!(matches!(
+            validate_entry(&candidate),
+            Err(SyncError::InvalidData)
+        ));
     }
 
     #[test]

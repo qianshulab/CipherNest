@@ -1,7 +1,7 @@
 {
   "name": "ciphernest-vault",
   "private": true,
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Local-first, encrypted password vault for Windows, macOS and Linux",
   "type": "module",
   "scripts": {

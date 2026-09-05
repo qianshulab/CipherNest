@@ -404,6 +404,54 @@ p {
   height: 34px;
 }
 
+.sensitive-input-with-actions .input {
+  padding-right: 76px;
+  font-family: var(--mono);
+}
+
+.sensitive-input-actions {
+  position: absolute;
+  right: 3px;
+  display: flex;
+  align-items: center;
+  gap: 1px;
+}
+
+.sensitive-input-with-actions .sensitive-input-actions .icon-button {
+  position: static;
+  right: auto;
+  width: 32px;
+  height: 32px;
+  flex: 0 0 32px;
+}
+
+.notes-with-actions {
+  position: relative;
+}
+
+.notes-with-actions .textarea {
+  padding-right: 76px;
+}
+
+.notes-actions {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  display: flex;
+  gap: 1px;
+}
+
+.notes-actions .icon-button {
+  width: 32px;
+  height: 32px;
+}
+
+.concealed-notes {
+  color: var(--text-muted);
+  font-family: var(--mono);
+  letter-spacing: 0.12em;
+}
+
 .select-wrap {
   position: relative;
 }
@@ -1102,7 +1150,7 @@ p {
   height: 36px;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  padding: 8px 35px 8px 34px;
+  padding: 8px 68px 8px 34px;
   background: var(--field);
   color: var(--text);
   font-size: 11px;
@@ -1117,9 +1165,16 @@ p {
   color: #5d6671;
 }
 
-.search-clear {
+.search-actions {
   position: absolute;
   right: 4px;
+  display: flex;
+  align-items: center;
+  gap: 1px;
+}
+
+.search-clear,
+.search-reveal {
   display: flex;
   width: 28px;
   height: 28px;
@@ -1131,7 +1186,14 @@ p {
   color: var(--text-muted);
 }
 
-.search-clear:hover {
+.search-actions .icon-button[hidden],
+.sensitive-input-actions .icon-button[hidden],
+.notes-actions .icon-button[hidden] {
+  display: none;
+}
+
+.search-clear:hover,
+.search-reveal:hover {
   background: rgba(255, 255, 255, 0.05);
   color: var(--text);
 }
@@ -1255,6 +1317,13 @@ p {
 .entry-subtitle {
   color: #89929e;
   font-size: 11px;
+}
+
+.entry-private-label {
+  color: #626b77;
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.08em;
 }
 
 .entry-row-meta {
@@ -2230,6 +2299,21 @@ p {
   color: var(--text-secondary);
   font-family: var(--mono);
   font-size: 11px;
+  text-align: right;
+}
+
+.sync-metadata-sensitive {
+  align-items: center;
+}
+
+.sync-metadata-sensitive dd {
+  width: 100%;
+}
+
+.sync-metadata-input {
+  height: 30px;
+  border-color: transparent;
+  background: transparent;
   text-align: right;
 }
 
