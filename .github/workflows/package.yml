@@ -89,7 +89,7 @@ jobs:
         env:
           MACOSX_DEPLOYMENT_TARGET: "11.0"
         run: >-
-          pnpm tauri build
+          pnpm exec tauri build
           --target ${{ matrix.target }}
           --bundles ${{ matrix.bundles }}
           --config '{"bundle":{"macOS":{"minimumSystemVersion":"11.0"}}}'
@@ -97,7 +97,7 @@ jobs:
 
       - name: Build Windows or Linux package
         if: runner.os != 'macOS'
-        run: pnpm tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} -- --locked
+        run: pnpm exec tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} -- --locked
 
       - name: Verify native executable architecture
         run: >-
