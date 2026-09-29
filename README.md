@@ -2,9 +2,10 @@
   <img src="docs/images/readme/hero.svg" alt="CipherNest：本地优先的加密密码库" width="100%">
 </p>
 
+<p align="center"><strong>本地优先的加密密码库</strong><br>安全保存密码 · 加密备份 · 按需同步</p>
+
 <p align="center">
   <a href="https://github.com/qianshulab/CipherNest/releases/tag/v0.3.3"><img src="https://img.shields.io/badge/release-v0.3.3%20beta-ff791c?style=flat-square&amp;labelColor=1b2029" alt="下载 v0.3.3 beta"></a>
-  <a href="https://github.com/qianshulab/CipherNest/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/qianshulab/CipherNest/ci.yml?branch=main&amp;style=flat-square&amp;label=CI&amp;labelColor=1b2029" alt="持续集成状态"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-ff791c?style=flat-square&amp;labelColor=1b2029" alt="MIT 许可证"></a>
 </p>
 
@@ -21,19 +22,27 @@
 
 CipherNest 是一款面向 Windows、macOS 和 Linux 的密码管理器。账号与密码保存在本机加密保险库中，由主密码解锁；加密备份用于迁移与恢复，WebDAV 手动同步用于跨设备使用。项目采用 Tauri 2、Rust 和 TypeScript 构建。
 
-<p align="center">
-  <img src="docs/images/readme/overview.svg" alt="CipherNest 提供本地保险库、加密备份和 WebDAV 手动同步" width="100%">
-</p>
+<table>
+  <tr>
+    <td width="33%" valign="top">
+      <img src="docs/images/readme/vault.svg" alt="" width="40" height="40"><br>
+      <strong>本地保险库</strong><br>
+      主密码解锁，账号与密码保存在本机。
+    </td>
+    <td width="33%" valign="top">
+      <img src="docs/images/readme/backup.svg" alt="" width="40" height="40"><br>
+      <strong>加密备份</strong><br>
+      导出独立的加密文件，用于迁移与恢复。
+    </td>
+    <td width="33%" valign="top">
+      <img src="docs/images/readme/sync.svg" alt="" width="40" height="40"><br>
+      <strong>手动同步</strong><br>
+      经 HTTPS WebDAV 按需同步，上传前加密。
+    </td>
+  </tr>
+</table>
 
 保险库支持搜索、筛选、排序、收藏和标签；密码生成器支持自定义长度与字符类别。本地安全检查会提示弱密码、重复密码和长期未更新的密码。敏感字段默认遮罩，并可设置自动锁定、失焦锁定和剪贴板清除时间。
-
-## 本版更新
-
-- Windows 正式构建启动时不再弹出命令行窗口。
-- 保存前检查保险库文件是否被外部修改，写入前保留加密快照，降低覆盖较新数据的风险。
-- 改进 WebDAV 条件请求探测和 HTTPS 连接错误提示。
-
-完整变更见 [v0.3.3 发布说明](https://github.com/qianshulab/CipherNest/releases/tag/v0.3.3)。
 
 ## 下载与安装
 

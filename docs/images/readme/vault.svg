@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" role="img" aria-label="本地保险库">
+  <rect width="64" height="64" rx="14" fill="#171c24"/>
+  <path d="m51 17-16-9a7 7 0 0 0-7 0l-16 9a7 7 0 0 0-3.5 6v18a7 7 0 0 0 3.5 6l16 9a7 7 0 0 0 7 0l16-9V37l-19 11-16-9V25l16-9 19 11V17Z" fill="#ff8225"/>
+  <path d="m32 22 11 6v10l-11 6-11-6V28l11-6Z" fill="#171c24" stroke="#ffa43d" stroke-width="1.5"/>
+  <circle cx="32" cy="31" r="2.8" fill="#ffa43d"/>
+  <path d="m31 33-1 6h4l-1-6" fill="#ffa43d"/>
+</svg>

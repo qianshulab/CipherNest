@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" role="img" aria-label="WebDAV 手动同步">
+  <rect width="64" height="64" rx="14" fill="#171c24"/>
+  <path d="M17 36a11 11 0 0 1-2-21 17 17 0 0 1 31 5 10 10 0 0 1 1 19" fill="none" stroke="#ff8225" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M18 43h24m-24 0 5-5m-5 5 5 5m23 6H22m24 0-5-5m5 5-5 5" fill="none" stroke="#f5f7fa" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

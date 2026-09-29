@@ -1,40 +1,35 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="360" viewBox="0 0 1280 360" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="320" viewBox="0 0 1280 320" role="img" aria-labelledby="title desc">
   <title id="title">CipherNest</title>
-  <desc id="desc">本地优先的加密密码库，支持加密备份与手动 WebDAV 同步。</desc>
+  <desc id="desc">CipherNest 密码管理器</desc>
   <defs>
     <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#11151d"/>
       <stop offset="1" stop-color="#080a0e"/>
     </linearGradient>
     <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#ffb147"/>
-      <stop offset=".5" stop-color="#ff791c"/>
-      <stop offset="1" stop-color="#e54812"/>
+      <stop offset="0" stop-color="#ffba39"/>
+      <stop offset=".55" stop-color="#ff791c"/>
+      <stop offset="1" stop-color="#e84608"/>
     </linearGradient>
     <radialGradient id="glow">
-      <stop offset="0" stop-color="#ff7920" stop-opacity=".38"/>
-      <stop offset="1" stop-color="#ff7920" stop-opacity="0"/>
+      <stop offset="0" stop-color="#ff791c" stop-opacity=".3"/>
+      <stop offset="1" stop-color="#ff791c" stop-opacity="0"/>
     </radialGradient>
     <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
       <path d="M40 0H0V40" fill="none" stroke="#ffffff" stroke-opacity=".045" stroke-width="1"/>
     </pattern>
   </defs>
-  <rect width="1280" height="360" rx="28" fill="url(#background)"/>
-  <rect width="1280" height="360" rx="28" fill="url(#grid)"/>
-  <circle cx="1083" cy="175" r="310" fill="url(#glow)"/>
-  <path d="M0 359H1280" stroke="#ff791c" stroke-opacity=".4" stroke-width="2"/>
-  <path d="M80 58h52" stroke="#ff8b27" stroke-width="4" stroke-linecap="round"/>
-  <text x="148" y="64" fill="#c1c6cf" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" letter-spacing="4">OPEN SOURCE DESKTOP VAULT</text>
-  <text x="78" y="169" fill="#ffffff" font-family="Segoe UI, Arial, sans-serif" font-size="82" font-weight="750" letter-spacing="-3">CipherNest</text>
-  <text x="82" y="229" fill="#f8fafc" font-family="Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="29" font-weight="600">本地优先的加密密码库</text>
-  <text x="82" y="274" fill="#aeb6c3" font-family="Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="19">安全保存密码 · 加密备份 · 按需同步</text>
-  <g transform="translate(904 37)">
-    <rect width="286" height="286" rx="68" fill="#171b23" stroke="#343b47" stroke-width="2"/>
-    <rect x="12" y="12" width="262" height="262" rx="58" fill="#11151c" stroke="#ff791c" stroke-opacity=".27"/>
-    <path d="M143 30 242 69v73c0 74-44 123-99 151-55-28-99-77-99-151V69l99-39Z" fill="#242932" stroke="url(#accent)" stroke-width="18" stroke-linejoin="round"/>
-    <path d="M105 145v-30a38 38 0 0 1 76 0v30" fill="none" stroke="#f5f6f8" stroke-width="18" stroke-linecap="round"/>
-    <rect x="89" y="140" width="108" height="82" rx="18" fill="url(#accent)"/>
-    <circle cx="143" cy="173" r="12" fill="#161b23"/>
-    <path d="M143 184v18" stroke="#161b23" stroke-width="10" stroke-linecap="round"/>
+  <rect width="1280" height="320" rx="28" fill="url(#background)"/>
+  <rect width="1280" height="320" rx="28" fill="url(#grid)"/>
+  <circle cx="1060" cy="160" r="280" fill="url(#glow)"/>
+  <path d="M0 319H1280" stroke="#ff791c" stroke-opacity=".4" stroke-width="2"/>
+  <text x="78" y="182" fill="#ffffff" font-family="Segoe UI, Arial, sans-serif" font-size="82" font-weight="750" letter-spacing="-3">CipherNest</text>
+  <g transform="translate(940 22)">
+    <rect width="276" height="276" rx="64" fill="#171b23" stroke="#343b47" stroke-width="2"/>
+    <rect x="12" y="12" width="252" height="252" rx="56" fill="#11151c" stroke="#ff791c" stroke-opacity=".25"/>
+    <path d="M224 77 152 35a28 28 0 0 0-28 0L53 76a28 28 0 0 0-14 24v76a28 28 0 0 0 14 24l71 41a28 28 0 0 0 28 0l72-42v-39l-86 50-65-38v-69l65-38 86 50V77Z" fill="url(#accent)"/>
+    <path d="m138 89 48 28v43l-48 28-48-28v-43l48-28Z" fill="#1b2028" stroke="#f87c20" stroke-width="4"/>
+    <circle cx="138" cy="130" r="11" fill="none" stroke="#ff9a24" stroke-width="5"/>
+    <path d="m134 140-4 19h16l-4-19" fill="#ff9a24"/>
   </g>
 </svg>
