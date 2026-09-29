@@ -382,6 +382,65 @@ function manifest(options) {
   process.stdout.write(`Verified ${manifestAssets.length} release assets and generated manifests.\n`);
 }
 
+function verifyUploaded(options) {
+  const assetsRoot = resolve(repositoryRoot, requireOption(options, "assets"));
+  const releasePath = resolve(repositoryRoot, requireOption(options, "release-json"));
+  const manifest = JSON.parse(readFileSync(join(assetsRoot, "release-manifest.json"), "utf8"));
+  const release = JSON.parse(readFileSync(releasePath, "utf8"));
+  const version = readProjectVersion();
+  const expectedPackages = expectedReleaseNames(version);
+  const packageNames = Array.isArray(manifest.assets)
+    ? manifest.assets.map((asset) => asset.name)
+    : null;
+  if (
+    manifest.schemaVersion !== 1 ||
+    manifest.version !== version ||
+    !Array.isArray(packageNames) ||
+    packageNames.length !== expectedPackages.length ||
+    !expectedPackages.every((name) => packageNames.includes(name))
+  ) {
+    fail("release manifest does not describe the exact current package set");
+  }
+  if (process.env.GITHUB_SHA && manifest.sourceCommit !== process.env.GITHUB_SHA) {
+    fail("release manifest source commit does not match this workflow run");
+  }
+  const expectedChecksums = manifest.assets
+    .map((asset) => `${asset.sha256}  ${asset.name}`)
+    .join("\n") + "\n";
+  if (readFileSync(join(assetsRoot, "SHA256SUMS.txt"), "utf8") !== expectedChecksums) {
+    fail("release checksums do not match the manifest");
+  }
+  if (release.tag_name !== `v${version}` || release.draft !== true || release.prerelease !== true) {
+    fail("uploaded assets must belong to the matching draft prerelease");
+  }
+
+  const expectedNames = [...expectedPackages, "SHA256SUMS.txt", "release-manifest.json"];
+  if (!Array.isArray(release.assets) || release.assets.length !== expectedNames.length) {
+    fail("GitHub draft release does not contain the exact expected asset count");
+  }
+  const seen = new Set();
+  for (const asset of release.assets) {
+    if (!expectedNames.includes(asset.name) || seen.has(asset.name)) {
+      fail(`unexpected or duplicate GitHub release asset: ${asset.name}`);
+    }
+    seen.add(asset.name);
+    const localPath = join(assetsRoot, asset.name);
+    if (!existsSync(localPath) || !lstatSync(localPath).isFile()) {
+      fail(`staged release asset is missing: ${asset.name}`);
+    }
+    const size = lstatSync(localPath).size;
+    const digest = `sha256:${sha256(localPath)}`;
+    const declared = manifest.assets.find((item) => item.name === asset.name);
+    if (declared && (declared.size !== size || `sha256:${declared.sha256}` !== digest)) {
+      fail(`staged release asset changed after manifest generation: ${asset.name}`);
+    }
+    if (asset.state !== "uploaded" || asset.size !== size || asset.digest !== digest) {
+      fail(`GitHub release asset does not match staged bytes: ${asset.name}`);
+    }
+  }
+  process.stdout.write(`Verified ${seen.size} uploaded GitHub release assets.\n`);
+}
+
 const [command, ...argumentValues] = process.argv.slice(2);
 const options = parseArguments(argumentValues);
 
@@ -398,6 +457,9 @@ switch (command) {
   case "manifest":
     manifest(options);
     break;
+  case "verify-uploaded":
+    verifyUploaded(options);
+    break;
   default:
-    fail("expected command: verify-version, verify-binary, stage, or manifest");
+    fail("expected command: verify-version, verify-binary, stage, manifest, or verify-uploaded");
 }

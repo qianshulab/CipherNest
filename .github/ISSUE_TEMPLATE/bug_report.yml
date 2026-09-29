@@ -1,0 +1,52 @@
+name: 缺陷报告
+description: 报告普通功能、界面或兼容性问题
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        可利用的安全漏洞请按 SECURITY.md 私下报告。公开报告中请勿附上真实保险库、密码、WebDAV 恢复码、账号或含个人信息的日志。
+  - type: input
+    id: version
+    attributes:
+      label: CipherNest 版本
+      placeholder: 例如 0.3.3 beta 或提交哈希
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: 操作系统
+      options:
+        - Windows
+        - macOS
+        - Linux
+        - 其他
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 请只使用虚构数据和测试保险库。
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期行为
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: 隐私检查
+      options:
+        - label: 我已移除真实密码、恢复码、保险库文件和其他个人数据。
+          required: true

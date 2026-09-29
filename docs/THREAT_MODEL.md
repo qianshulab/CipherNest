@@ -1,7 +1,7 @@
 # CipherNest 威胁模型
 
-状态：适用于 0.3.2 未审计 beta
-最后核对代码：2026-09-05
+状态：适用于 0.3.3 未审计 beta
+最后核对代码：2026-09-29
 
 本文描述当前仓库已经实现的安全边界，不是未来功能承诺。它不能证明应用没有漏洞，也不能替代独立密码学审计。
 
@@ -192,11 +192,11 @@ Argon2id(主密码) 解封 password slot → VRK → 正文
 客户端先用 `PROPFIND Depth: 0` 确认目标是 collection；配置时和每次提交前还会在该目录创建随机探测对象，验证：
 
 - `If-None-Match: *` 能阻止重复创建。
-- 错误 `If-Match` 返回 precondition failure，正确 `If-Match` 才能更新。
+- 错误 `If-Match` 返回 precondition failure，拒绝后重新读取可确认内容和强 ETag 未改变；正确 `If-Match` 才能更新。
 - 读取字节与写入内容完全一致，ETag 是强 ETag 且内容改变后 ETag 也改变。
 - 探测对象可按条件删除；失败路径只做尽力清理。
 
-WebDAV 的集合语义见 [RFC 4918](https://www.rfc-editor.org/info/rfc4918/)，HTTP 条件请求见 [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110.html)。账号使用 HTTP Basic authentication；Basic 自身不提供机密性，必须依赖经验证的 HTTPS，见 [RFC 7617](https://datatracker.ietf.org/doc/html/rfc7617.html)。
+读取请求使用 `Cache-Control: no-cache, no-store`，避免缓存的旧 head 被当作当前状态。WebDAV 的集合语义见 [RFC 4918](https://www.rfc-editor.org/info/rfc4918/)，HTTP 条件请求见 [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110.html)。账号使用 HTTP Basic authentication；Basic 自身不提供机密性，必须依赖经验证的 HTTPS，见 [RFC 7617](https://datatracker.ietf.org/doc/html/rfc7617.html)。
 
 #### 同步密钥与远端对象
 
@@ -261,22 +261,22 @@ snapshot 文件名中的 SHA-256 覆盖加密对象的精确字节。解密后�
 
 每次条目、收藏、设置或主密码发生持久化修改时：
 
-1. 在内存副本上修改数据并增加 generation。
-2. 把当前磁盘 envelope 复制为自动加密备份。
-3. 以新 nonce 重新加密完整正文。
+1. 在内存副本上修改数据、增加 generation，并以新 nonce 重新加密完整正文。
+2. 比较当前磁盘 envelope 与已解锁会话的完整快照；若被外部程序替换或删除，则停止写入。
+3. 把当前磁盘 envelope 复制为自动加密备份，并在轮换时保护该副本。
 4. 通过 `atomicwrites` 在同目录写入、同步文件并替换目标。
 5. Unix 上再同步父目录。
 6. 只有写入成功后才用新内存状态替换旧状态。
 
 Unix 新建文件会设置为 `0600`；本应用新建的数据目录会设置为 `0700`。如果数据父目录已经存在，代码不会主动修复其权限。Windows 没有显式 ACL 设置，依赖应用数据目录的继承 ACL。
 
-该设计降低部分写入和进程崩溃造成的损坏，但不能保证所有文件系统、网络盘或突然断电场景都具有相同原子/耐久语义。
+该设计降低部分写入和进程崩溃造成的损坏，但不能保证所有文件系统、网络盘或突然断电场景都具有相同原子/耐久语义。磁盘快照比较与最终原子替换之间仍存在跨进程竞态；不要让不同版本的应用同时使用同一保险库。
 
 加密同步 sidecar 同样使用同目录原子替换。同步应用远端内容时会核对捕获的 vault ID、generation 和 sidecar 摘要，防止网络返回覆盖请求期间的新本地编辑。旧版设备认证附属文件不参与这些事务，也不能提交解锁状态。
 
 ### 6.2 自动和手动备份
 
-- 自动备份通常名为 `backups/auto-<vault-id>-<20位generation>.cnvault`，不同保险库不会因相同 generation 互相覆盖。若该路径已存在，先比较当前 envelope 的精确规范 JSON 字节：相同则不重复保存；同一 vault ID/generation 但字节不同，则改用 `auto-<vault-id>-<20位generation>-<sha256>[-<uuid>].cnvault` 保存。内容哈希路径发生极端占用/冲突时追加随机 UUID，而不是静默跳过新快照；所有这些文件共同按修改时间保留最近 10 份。
+- 自动备份通常名为 `backups/auto-<vault-id>-<20位generation>.cnvault`，不同保险库不会因相同 generation 互相覆盖。若该路径已存在，先比较当前 envelope 的精确规范 JSON 字节：相同则不重复保存；同一 vault ID/generation 但字节不同，则改用 `auto-<vault-id>-<20位generation>-<sha256>[-<uuid>].cnvault` 保存。内容哈希路径发生极端占用/冲突时追加随机 UUID，而不是静默跳过新快照；所有这些文件共同计入 10 份轮换上限，轮换时保留本次写入前的回滚副本。
 - 自动备份是上一次完整 envelope，仍为认证密文。
 - 手动导出复制当前 envelope 到用户选择的位置，禁止明显覆盖当前保险库；导出成功后会在当前库中更新 `last_backup_at`。
 - 恢复采用两阶段流程：先读取不超过 16 MiB 的候选，验证 envelope、KDF 边界、备份主密码、AEAD 和字段约束，再向用户显示文件名、条目数、更新时间、generation 和 vault ID 摘要；只有用户明确确认后才备份并替换当前保险库。选择 token 最多保留 5 分钟且单次使用，取消/锁定会清除待恢复状态。

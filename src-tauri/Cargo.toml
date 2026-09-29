@@ -1,8 +1,10 @@
 [package]
 name = "ciphernest"
-version = "0.3.2"
+version = "0.3.3"
 description = "Local-first encrypted password vault"
 authors = ["CipherNest contributors"]
+license = "MIT"
+repository = "https://github.com/qianshulab/CipherNest"
 edition = "2021"
 rust-version = "1.85"
 
