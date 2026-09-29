@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File},
-    io::{self, Write},
+    io::{self, Read, Write},
     path::Path,
 };
 
@@ -34,7 +34,7 @@ const DEFAULT_PARALLELISM: u32 = 4;
 const MIN_MEMORY_KIB: u32 = 19 * 1024;
 const MAX_MEMORY_KIB: u32 = 256 * 1024;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KdfHeader {
     pub algorithm: String,
@@ -45,7 +45,7 @@ pub struct KdfHeader {
     pub salt: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CipherBlock {
     pub algorithm: String,
@@ -53,7 +53,7 @@ pub struct CipherBlock {
     pub ciphertext: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VaultEnvelope {
     pub format: String,
@@ -157,15 +157,18 @@ pub fn update_payload(
 }
 
 pub fn read_envelope(path: &Path) -> VaultResult<VaultEnvelope> {
-    let metadata = fs::metadata(path).map_err(|_| VaultError::NotFound)?;
-    if metadata.len() == 0 || metadata.len() > MAX_VAULT_BYTES {
+    let file = File::open(path).map_err(|_| VaultError::NotFound)?;
+    let metadata = file.metadata().map_err(|_| VaultError::InvalidVault)?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_VAULT_BYTES {
         return Err(VaultError::InvalidVault);
     }
-    let bytes = fs::read(path).map_err(|_| VaultError::InvalidVault)?;
-    let envelope: VaultEnvelope =
-        serde_json::from_slice(&bytes).map_err(|_| VaultError::InvalidVault)?;
-    validate_envelope_header(&envelope)?;
-    Ok(envelope)
+    // Read through the same handle used for metadata and cap the bytes even
+    // if the file grows between the size check and the read.
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_VAULT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| VaultError::InvalidVault)?;
+    parse_envelope_bytes(&bytes)
 }
 
 pub fn parse_envelope_bytes(bytes: &[u8]) -> VaultResult<VaultEnvelope> {
@@ -463,5 +466,30 @@ mod tests {
         write_envelope_atomic(&path, &envelope).unwrap();
         let loaded = read_envelope(&path).unwrap();
         assert_eq!(loaded.vault_id, envelope.vault_id);
+    }
+
+    #[test]
+    fn read_envelope_enforces_the_file_size_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vault.cnvault");
+        let (envelope, _) =
+            create_envelope("a sufficiently long master passphrase", &data()).unwrap();
+        let mut bytes = serde_json::to_vec(&envelope).unwrap();
+        bytes.resize(MAX_VAULT_BYTES as usize, b' ');
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(read_envelope(&path).unwrap(), envelope);
+
+        bytes.push(b' ');
+        fs::write(&path, &bytes).unwrap();
+        assert!(matches!(
+            read_envelope(&path),
+            Err(VaultError::InvalidVault)
+        ));
+
+        fs::write(&path, b"").unwrap();
+        assert!(matches!(
+            read_envelope(&path),
+            Err(VaultError::InvalidVault)
+        ));
     }
 }

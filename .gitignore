@@ -24,5 +24,7 @@ coverage/
 *.key
 *.jks
 *.keystore
+*.p8
+*.snk
 *.mobileprovision
 *.provisionprofile

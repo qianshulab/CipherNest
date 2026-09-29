@@ -41,13 +41,17 @@ jobs:
       - name: Install pinned pnpm
         run: corepack enable && corepack prepare pnpm@10.12.1 --activate
 
-      - name: Use current stable Rust
+      - name: Use release Rust toolchain
         run: |
-          rustup update stable --no-self-update
-          rustup default stable
+          rustup toolchain install 1.89.0 --profile minimal --no-self-update
+          rustup component add --toolchain 1.89.0 clippy rustfmt
+          rustup default 1.89.0
 
       - name: Install locked dependencies
         run: pnpm install --frozen-lockfile
+
+      - name: Test release validation tools
+        run: node --test scripts/release-tools.node-test.mjs
 
       - name: Run frontend and Rust tests
         run: pnpm check

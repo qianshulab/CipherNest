@@ -829,7 +829,7 @@ impl VaultStore {
                 "备份位置不能覆盖当前保险库".into(),
             ));
         }
-        let envelope = read_envelope(&self.vault_path)?;
+        let envelope = self.current_envelope()?;
         write_envelope_atomic(target, &envelope)?;
         self.mark_manual_backup()?;
         self.touch();
@@ -1205,11 +1205,21 @@ impl VaultStore {
     }
 
     fn backup_current(&self) -> VaultResult<()> {
-        if !self.vault_path.is_file() {
-            return Ok(());
-        }
-        let current = read_envelope(&self.vault_path)?;
+        let current = self.current_envelope()?;
         self.backup_envelope(&current)
+    }
+
+    /// A live session must never overwrite a vault that another process or a
+    /// manual file restore changed after unlock. The encrypted envelope is
+    /// compared in full so even a rewrite at the same generation is caught.
+    fn current_envelope(&self) -> VaultResult<VaultEnvelope> {
+        let unlocked = self.unlocked.as_ref().ok_or(VaultError::Locked)?;
+        let current =
+            read_envelope(&self.vault_path).map_err(|_| VaultError::VaultChangedOnDisk)?;
+        if current != unlocked.envelope {
+            return Err(VaultError::VaultChangedOnDisk);
+        }
+        Ok(current)
     }
 
     fn backup_envelope(&self, current: &VaultEnvelope) -> VaultResult<()> {
@@ -1224,7 +1234,7 @@ impl VaultStore {
         let backup_path = if !primary_path.exists() {
             primary_path
         } else if backup_file_matches(&primary_path, &canonical_bytes)? {
-            rotate_backups(&backup_directory)?;
+            rotate_backups(&backup_directory, &primary_path)?;
             return Ok(());
         } else {
             let content_hash = hex_sha256(&canonical_bytes);
@@ -1236,7 +1246,7 @@ impl VaultStore {
             if !hashed_path.exists() {
                 hashed_path
             } else if backup_file_matches(&hashed_path, &canonical_bytes)? {
-                rotate_backups(&backup_directory)?;
+                rotate_backups(&backup_directory, &hashed_path)?;
                 return Ok(());
             } else {
                 backup_directory.join(automatic_backup_collision_name(
@@ -1251,7 +1261,7 @@ impl VaultStore {
             return Err(VaultError::SaveFailed);
         }
         write_envelope_atomic(&backup_path, current)?;
-        rotate_backups(&backup_directory)
+        rotate_backups(&backup_directory, &backup_path)
     }
 
     fn preserve_current_before_restore(&self) -> VaultResult<Option<PathBuf>> {
@@ -1309,7 +1319,7 @@ fn bump_generation(data: &mut VaultData, now: u64) {
     data.updated_at = now;
 }
 
-fn rotate_backups(directory: &Path) -> VaultResult<()> {
+fn rotate_backups(directory: &Path, current_backup: &Path) -> VaultResult<()> {
     let mut backups: Vec<(SystemTime, PathBuf)> = fs::read_dir(directory)
         .map_err(|_| VaultError::SaveFailed)?
         .filter_map(Result::ok)
@@ -1329,7 +1339,14 @@ fn rotate_backups(directory: &Path) -> VaultResult<()> {
         .collect();
     backups.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
     let remove_count = backups.len().saturating_sub(AUTO_BACKUP_LIMIT);
-    for (_, path) in backups.into_iter().take(remove_count) {
+    // The backup of the on-disk vault is the rollback copy for the write that
+    // follows. Preserve it even when its timestamp is old or ties with other
+    // files (for example after a restore or across different vault IDs).
+    for (_, path) in backups
+        .into_iter()
+        .filter(|(_, path)| path != current_backup)
+        .take(remove_count)
+    {
         fs::remove_file(path).map_err(|_| VaultError::SaveFailed)?;
     }
     Ok(())
@@ -1921,6 +1938,117 @@ mod tests {
     }
 
     #[test]
+    fn reopening_the_same_data_directory_keeps_vault_backups_and_sync_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vault.cnvault");
+        let password = "upgrade preservation passphrase long enough";
+        let mut before = VaultStore::new(path.clone());
+        before.create(password).unwrap();
+        let entry = before
+            .save_entry(sample_entry_input(None, None, "Stored before upgrade"))
+            .unwrap();
+        let vault = before.unlocked.as_ref().unwrap();
+        let sync_state = test_sync_state(&vault.data, vault.data.generation);
+        sync::write_local_sync_state(
+            &before.sync_state_path,
+            &vault.data.vault_id,
+            &vault.root_key,
+            &sync_state,
+        )
+        .unwrap();
+        let backup_count = fs::read_dir(directory.path().join("backups"))
+            .unwrap()
+            .count();
+        drop(before);
+
+        // A replacement executable starts with fresh process state but the
+        // same app-data path. It must never create a blank vault over it.
+        let mut after = VaultStore::new(path);
+        assert!(after.status().0.exists);
+        assert!(matches!(
+            after.create(password),
+            Err(VaultError::AlreadyExists)
+        ));
+        after.unlock(password).unwrap();
+        assert_eq!(
+            after.get_entry(&entry.id).unwrap().title,
+            "Stored before upgrade"
+        );
+        assert!(after.webdav_sync_status().unwrap().configured);
+        assert_eq!(
+            fs::read_dir(directory.path().join("backups"))
+                .unwrap()
+                .count(),
+            backup_count
+        );
+    }
+
+    #[test]
+    fn stale_session_does_not_overwrite_a_newer_vault_on_disk() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vault.cnvault");
+        let password = "concurrent writer passphrase long enough";
+        let mut stale = VaultStore::new(path.clone());
+        stale.create(password).unwrap();
+        stale
+            .save_entry(sample_entry_input(None, None, "Original"))
+            .unwrap();
+
+        let mut newer = VaultStore::new(path.clone());
+        newer.unlock(password).unwrap();
+        let added = newer
+            .save_entry(sample_entry_input(None, None, "Newer entry"))
+            .unwrap();
+        let newer_bytes = fs::read(&path).unwrap();
+        assert!(matches!(
+            stale.save_entry(sample_entry_input(None, None, "Stale entry")),
+            Err(VaultError::VaultChangedOnDisk)
+        ));
+        assert_eq!(fs::read(&path).unwrap(), newer_bytes);
+
+        stale.lock();
+        stale.unlock(password).unwrap();
+        assert_eq!(stale.get_entry(&added.id).unwrap().title, "Newer entry");
+        assert_eq!(stale.list_entries(None, None, None).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn same_generation_replacement_is_not_overwritten() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vault.cnvault");
+        let password = "same generation passphrase long enough";
+        let mut store = VaultStore::new(path.clone());
+        store.create(password).unwrap();
+        let entry = store
+            .save_entry(sample_entry_input(None, None, "Original"))
+            .unwrap();
+        let replacement = {
+            let unlocked = store.unlocked.as_ref().unwrap();
+            let mut data = unlocked.data.clone();
+            data.entries[0].title = "Restored elsewhere".into();
+            update_payload(&unlocked.envelope, &unlocked.root_key, &data).unwrap()
+        };
+        assert_eq!(
+            replacement.generation,
+            store.unlocked.as_ref().unwrap().envelope.generation
+        );
+        write_envelope_atomic(&path, &replacement).unwrap();
+        let replacement_bytes = fs::read(&path).unwrap();
+
+        assert!(matches!(
+            store.save_entry(sample_entry_input(None, None, "Stale")),
+            Err(VaultError::VaultChangedOnDisk)
+        ));
+        assert_eq!(fs::read(&path).unwrap(), replacement_bytes);
+        store.lock();
+        store.unlock(password).unwrap();
+        assert_eq!(
+            store.get_entry(&entry.id).unwrap().title,
+            "Restored elsewhere"
+        );
+    }
+
+    #[test]
     fn client_ids_are_idempotent_and_updates_require_the_expected_revision() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("vault.cnvault");
@@ -2090,6 +2218,29 @@ mod tests {
         assert_eq!(names.len(), 2);
         assert!(names.contains(&automatic_backup_name(&first_envelope).unwrap()));
         assert!(names.contains(&automatic_backup_name(&second_envelope).unwrap()));
+    }
+
+    #[test]
+    fn rotation_keeps_the_current_vault_backup_even_when_it_is_oldest() {
+        let directory = tempfile::tempdir().unwrap();
+        let backup_directory = directory.path().join("backups");
+        fs::create_dir(&backup_directory).unwrap();
+        let current_backup = backup_directory.join("auto-000000.cnvault");
+        fs::write(&current_backup, b"current vault backup").unwrap();
+        for index in 1..=AUTO_BACKUP_LIMIT {
+            fs::write(
+                backup_directory.join(format!("auto-{index:06}.cnvault")),
+                b"another backup",
+            )
+            .unwrap();
+        }
+
+        rotate_backups(&backup_directory, &current_backup).unwrap();
+        assert!(current_backup.is_file());
+        assert_eq!(
+            fs::read_dir(&backup_directory).unwrap().count(),
+            AUTO_BACKUP_LIMIT
+        );
     }
 
     #[test]

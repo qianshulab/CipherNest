@@ -18,6 +18,9 @@ describe("entry save error presentation", () => {
     expect(describeEntrySaveFailure("该条目已在其他操作中发生变化，请重新加载后再保存。")).toEqual({
       message: "该条目已发生变化，请重新打开条目，确认最新内容后再保存。",
     });
+    expect(describeEntrySaveFailure("保险库文件在当前会话期间发生变化。已停止写入；请锁定后重新解锁，检查数据后重试。")).toEqual({
+      message: "保险库文件已在应用外发生变化，当前修改未保存。请锁定并重新解锁，核对最新数据后再编辑。",
+    });
   });
 
   it("does not expose unexpected backend or platform details", () => {

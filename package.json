@@ -1,8 +1,11 @@
 {
   "name": "ciphernest-vault",
   "private": true,
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Local-first, encrypted password vault for Windows, macOS and Linux",
+  "license": "MIT",
+  "repository": "https://github.com/qianshulab/CipherNest",
+  "homepage": "https://github.com/qianshulab/CipherNest",
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
@@ -11,7 +14,7 @@
     "test": "vitest run",
     "tauri": "tauri",
     "desktop:dev": "tauri dev",
-    "desktop:build": "pnpm test && node node_modules/@tauri-apps/cli/tauri.js build -- --locked",
+    "desktop:build": "pnpm test && node scripts/release-tools.mjs verify-version && node node_modules/@tauri-apps/cli/tauri.js build -- --locked",
     "check": "pnpm test && pnpm build && cargo test --manifest-path src-tauri/Cargo.toml --locked"
   },
   "dependencies": {

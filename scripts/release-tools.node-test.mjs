@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 // Kept outside Vitest's *.test.* discovery; this suite uses Node's built-in test runner.
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -47,6 +48,9 @@ test("recognizes the three expected executable architectures", (context) => {
   pe.writeUInt32LE(0x80, 0x3c);
   pe.writeUInt32LE(0x00004550, 0x80);
   pe.writeUInt16LE(0x8664, 0x84);
+  pe.writeUInt16LE(0xf0, 0x94);
+  pe.writeUInt16LE(0x20b, 0x98);
+  pe.writeUInt16LE(2, 0x98 + 68);
   const pePath = join(fixtureRoot, "ciphernest.exe");
   writeFixture(pePath, pe);
 
@@ -64,6 +68,11 @@ test("recognizes the three expected executable architectures", (context) => {
     run(["verify-binary", "--target", "x86_64-pc-windows-msvc", "--path", pePath]).status,
     0,
   );
+  pe.writeUInt16LE(3, 0x98 + 68);
+  writeFixture(pePath, pe);
+  const consoleBinary = run(["verify-binary", "--target", "x86_64-pc-windows-msvc", "--path", pePath]);
+  assert.notEqual(consoleBinary.status, 0);
+  assert.match(consoleBinary.stderr, /not a Windows GUI executable/);
   assert.equal(
     run(["verify-binary", "--target", "x86_64-unknown-linux-gnu", "--path", elfPath]).status,
     0,
@@ -111,6 +120,48 @@ test("stages an exact four-package set and verifies its hashes", (context) => {
   assert.equal(manifest.version, projectVersion);
   assert.equal(manifest.sourceCommit, "0123456789abcdef");
   assert.equal(manifest.assets.length, 4);
+
+  const releaseJsonPath = join(fixtureRoot, "draft-release.json");
+  const assetNames = [
+    ...manifest.assets.map((asset) => asset.name),
+    "SHA256SUMS.txt",
+    "release-manifest.json",
+  ];
+  const uploadedAssets = assetNames.map((name) => {
+    const path = join(output, name);
+    return {
+      name,
+      state: "uploaded",
+      size: statSync(path).size,
+      digest: `sha256:${createHash("sha256").update(readFileSync(path)).digest("hex")}`,
+    };
+  });
+  const release = {
+    tag_name: `v${projectVersion}`,
+    draft: true,
+    prerelease: true,
+    assets: uploadedAssets,
+  };
+  writeFixture(releaseJsonPath, JSON.stringify(release));
+  const verifyArgs = ["verify-uploaded", "--assets", output, "--release-json", releaseJsonPath];
+  assert.equal(run(verifyArgs, { GITHUB_SHA: "0123456789abcdef" }).status, 0);
+  release.assets[0].digest = `sha256:${"0".repeat(64)}`;
+  writeFixture(releaseJsonPath, JSON.stringify(release));
+  const mismatchedUpload = run(verifyArgs, { GITHUB_SHA: "0123456789abcdef" });
+  assert.notEqual(mismatchedUpload.status, 0);
+  assert.match(mismatchedUpload.stderr, /does not match staged bytes/);
+
+  const changedPackage = join(output, manifest.assets[0].name);
+  writeFixture(changedPackage, "repacked after manifest generation");
+  release.assets[0] = {
+    ...release.assets[0],
+    size: statSync(changedPackage).size,
+    digest: `sha256:${createHash("sha256").update(readFileSync(changedPackage)).digest("hex")}`,
+  };
+  writeFixture(releaseJsonPath, JSON.stringify(release));
+  const staleManifest = run(verifyArgs, { GITHUB_SHA: "0123456789abcdef" });
+  assert.notEqual(staleManifest.status, 0);
+  assert.match(staleManifest.stderr, /changed after manifest generation/);
 
   writeFixture(join(output, "unexpected-installer.exe"), "unexpected");
   const unexpected = run(["manifest", "--assets", output]);

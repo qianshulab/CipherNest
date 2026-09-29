@@ -94,6 +94,10 @@ pub enum SyncError {
     UnexpectedStatus(u16),
     #[error("WebDAV 网络操作失败。")]
     Transport,
+    #[error("WebDAV 网络请求超时。请检查网络及服务器端口。")]
+    Timeout,
+    #[error("无法建立 WebDAV HTTPS 连接。请检查服务器是否可达、端口是否启用 HTTPS，以及证书是否可信且与域名匹配。")]
+    SecureConnection,
     #[error("同步对象超过大小限制。")]
     TooLarge,
     #[error("同步数据包含无效字段。")]
@@ -346,7 +350,7 @@ impl WebDavClient {
             .body(PROPFIND_BODY)
             .send()
             .await
-            .map_err(|_| SyncError::Transport)?;
+            .map_err(classify_transport_error)?;
         if response.status() != StatusCode::MULTI_STATUS {
             return Err(status_error(response.status()));
         }
@@ -412,6 +416,12 @@ impl WebDavClient {
             if wrong_match != StatusCode::PRECONDITION_FAILED {
                 return Err(SyncError::UnsafeServer);
             }
+
+            // A broken intermediary may report 412 while still forwarding a
+            // write to the origin.  Do not trust the status alone: the exact
+            // object and its compare-and-swap token must still be unchanged.
+            let unchanged = self.get_resource(&probe_name, MAX_HEAD_BYTES).await?;
+            verify_rejected_probe_writes(unchanged.as_ref(), &first, &first_etag)?;
 
             let update = self
                 .put_resource(&probe_name, &second, Some((IF_MATCH, first_etag.as_str())))
@@ -953,7 +963,9 @@ impl WebDavClient {
         self.client
             .request(method, url)
             .basic_auth(&self.username, Some(self.app_password.as_str()))
-            .header(CACHE_CONTROL, "no-store")
+            // A cached head can make a download look up to date. Force caches
+            // to revalidate reads as well as avoid storing vault traffic.
+            .header(CACHE_CONTROL, "no-cache, no-store")
             .header(ACCEPT_ENCODING, "identity")
     }
 
@@ -974,7 +986,7 @@ impl WebDavClient {
             .header(ACCEPT, "application/octet-stream")
             .send()
             .await
-            .map_err(|_| SyncError::Transport)?;
+            .map_err(classify_transport_error)?;
         if response.status() == StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -1011,7 +1023,7 @@ impl WebDavClient {
             .send()
             .await
             .map(|response| response.status())
-            .map_err(|_| SyncError::Transport)
+            .map_err(classify_transport_error)
     }
 
     async fn delete_resource(&self, name: &str, etag: Option<&str>) -> SyncResult<StatusCode> {
@@ -1024,13 +1036,27 @@ impl WebDavClient {
             .send()
             .await
             .map(|response| response.status())
-            .map_err(|_| SyncError::Transport)
+            .map_err(classify_transport_error)
     }
 }
 
 struct FetchedSnapshot {
     hash: String,
     snapshot: SyncSnapshot,
+}
+
+fn verify_rejected_probe_writes(
+    fetched: Option<&RemoteResource>,
+    expected_bytes: &[u8],
+    expected_etag: &str,
+) -> SyncResult<()> {
+    let fetched = fetched.ok_or(SyncError::UnsafeServer)?;
+    if fetched.bytes.as_slice() != expected_bytes
+        || require_strong_etag(fetched.etag.as_deref())? != expected_etag
+    {
+        return Err(SyncError::UnsafeServer);
+    }
+    Ok(())
 }
 
 struct CheckpointLink {
@@ -2049,6 +2075,18 @@ fn dav_href_matches_endpoint(href: &str, endpoint: &Url) -> bool {
         && candidate.fragment().is_none()
 }
 
+fn classify_transport_error(error: reqwest::Error) -> SyncError {
+    // Reqwest errors can contain the requested URL. Only expose fixed,
+    // credential-free categories to the UI; never forward the error text.
+    if error.is_timeout() {
+        SyncError::Timeout
+    } else if error.is_connect() {
+        SyncError::SecureConnection
+    } else {
+        SyncError::Transport
+    }
+}
+
 async fn read_limited(mut response: reqwest::Response, limit: usize) -> SyncResult<Vec<u8>> {
     if response
         .content_length()
@@ -2057,7 +2095,7 @@ async fn read_limited(mut response: reqwest::Response, limit: usize) -> SyncResu
         return Err(SyncError::TooLarge);
     }
     let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|_| SyncError::Transport)? {
+    while let Some(chunk) = response.chunk().await.map_err(classify_transport_error)? {
         if bytes.len().saturating_add(chunk.len()) > limit {
             return Err(SyncError::TooLarge);
         }
@@ -2329,6 +2367,45 @@ mod tests {
             "password".into()
         )
         .is_err());
+    }
+
+    #[test]
+    fn rejected_conditional_writes_must_leave_probe_and_etag_unchanged() {
+        let expected = [7_u8; 32];
+        let original = RemoteResource {
+            bytes: expected.to_vec(),
+            etag: Some("\"probe-v1\"".into()),
+        };
+        assert!(verify_rejected_probe_writes(Some(&original), &expected, "\"probe-v1\"").is_ok());
+        assert!(matches!(
+            verify_rejected_probe_writes(None, &expected, "\"probe-v1\""),
+            Err(SyncError::UnsafeServer)
+        ));
+
+        let changed_body = RemoteResource {
+            bytes: vec![8_u8; 32],
+            etag: Some("\"probe-v1\"".into()),
+        };
+        assert!(matches!(
+            verify_rejected_probe_writes(Some(&changed_body), &expected, "\"probe-v1\""),
+            Err(SyncError::UnsafeServer)
+        ));
+        let changed_etag = RemoteResource {
+            bytes: expected.to_vec(),
+            etag: Some("\"probe-v2\"".into()),
+        };
+        assert!(matches!(
+            verify_rejected_probe_writes(Some(&changed_etag), &expected, "\"probe-v1\""),
+            Err(SyncError::UnsafeServer)
+        ));
+        let weak_etag = RemoteResource {
+            bytes: expected.to_vec(),
+            etag: Some("W/\"probe-v1\"".into()),
+        };
+        assert!(matches!(
+            verify_rejected_probe_writes(Some(&weak_etag), &expected, "\"probe-v1\""),
+            Err(SyncError::UnsafeServer)
+        ));
     }
 
     #[test]

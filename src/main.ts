@@ -1362,6 +1362,11 @@ function renderEntryEditor(): HTMLElement {
     if (state.draft) state.draft.notes = notes.value;
     setOptionalActionAvailable(copyNotes, Boolean(notes.value));
     clearFieldError("entry-notes");
+    if (revealedNotesInput === notes) scheduleNotesHide();
+  });
+  notes.addEventListener("blur", (event) => {
+    // Let the reveal button handle its own click; hide when editing moves elsewhere.
+    if (event.relatedTarget !== revealNotesButton && revealedNotesInput === notes) hideNotes();
   });
   const notesError = makeElement("p", "field-error");
   notesError.id = "entry-notes-error";
@@ -1512,10 +1517,15 @@ function revealNotes(input: HTMLTextAreaElement, button: HTMLButtonElement): voi
   button.setAttribute("aria-label", "隐藏备注");
   button.setAttribute("aria-pressed", "true");
   button.title = "隐藏备注";
-  const seconds = Math.max(1, state.settings.passwordRevealSeconds || DEFAULT_SETTINGS.passwordRevealSeconds);
-  notesRevealTimeout = window.setTimeout(hideNotes, seconds * 1000);
+  scheduleNotesHide();
   input.focus();
   input.setSelectionRange(input.value.length, input.value.length);
+}
+
+function scheduleNotesHide(): void {
+  if (notesRevealTimeout) window.clearTimeout(notesRevealTimeout);
+  const seconds = Math.max(1, state.settings.passwordRevealSeconds || DEFAULT_SETTINGS.passwordRevealSeconds);
+  notesRevealTimeout = window.setTimeout(hideNotes, seconds * 1000);
 }
 
 function hideNotes(): void {
@@ -2036,6 +2046,16 @@ async function applyWebDavOutcome(outcome: WebDavSyncOutcome, operationEpoch: nu
   showToast(messages[outcome.kind], "success", 5200);
 }
 
+function describeWebDavNetworkFailure(error: unknown, fallback: string): string {
+  const message = typeof error === "string" ? error : error instanceof Error ? error.message : "";
+  // Only fixed backend messages can be displayed; remote responses and
+  // other errors retain the existing generic UI wording.
+  return message === "WebDAV 网络请求超时。请检查网络及服务器端口。"
+    || message === "无法建立 WebDAV HTTPS 连接。请检查服务器是否可达、端口是否启用 HTTPS，以及证书是否可信且与域名匹配。"
+    ? message
+    : fallback;
+}
+
 async function createWebDavSyncSpace(): Promise<void> {
   if (state.syncStatus.configured || state.syncStatusError) return;
   const operationEpoch = beginSyncOperation("create");
@@ -2069,9 +2089,9 @@ async function createWebDavSyncSpace(): Promise<void> {
     recoveryCode = "";
     if (operationEpoch !== state.epoch || !state.status.unlocked) return;
     showToast("加密同步空间已创建。以后仍只会在你点击“立即同步”时联网。", "success", 5600);
-  } catch {
+  } catch (error) {
     if (operationEpoch === state.epoch) {
-      showToast("无法创建同步空间。请检查 HTTPS 地址、目录权限和应用专用密码后重试。", "error", 6200);
+      showToast(describeWebDavNetworkFailure(error, "无法创建同步空间。请检查 HTTPS 地址、目录权限和应用专用密码后重试。"), "error", 6200);
     }
   } finally {
     clearWebDavCredentials(credentials);
@@ -2143,9 +2163,9 @@ async function joinWebDavSyncSpace(): Promise<void> {
       closeJoin();
     }
     await applyWebDavOutcome(outcome, operationEpoch);
-  } catch {
+  } catch (error) {
     if (operationEpoch === state.epoch) {
-      showToast("无法加入此同步空间。凭据、恢复码、服务器状态或并发版本可能已变化。", "error", 6500);
+      showToast(describeWebDavNetworkFailure(error, "无法加入此同步空间。凭据、恢复码、服务器状态或并发版本可能已变化。"), "error", 6500);
     }
   } finally {
     clearWebDavJoinDetails(details);
@@ -2167,10 +2187,10 @@ async function syncWebDavNow(): Promise<void> {
     const outcome = await invokeCommand<WebDavSyncOutcome>("sync_webdav_now");
     closeProgress();
     await applyWebDavOutcome(outcome, operationEpoch);
-  } catch {
+  } catch (error) {
     closeProgress();
     if (operationEpoch === state.epoch) {
-      showToast("同步未完成，本机数据未被静默覆盖。请检查网络、服务器或并发修改后重试。", "error", 6200);
+      showToast(describeWebDavNetworkFailure(error, "同步未完成，本机数据未被静默覆盖。请检查网络、服务器或并发修改后重试。"), "error", 6200);
     }
   } finally {
     closeProgress();
@@ -2879,11 +2899,14 @@ async function copySecret(secret: string, label = "密码"): Promise<void> {
     showToast(`没有可复制的${label}。`, "warning");
     return;
   }
+  const epoch = state.epoch;
   try {
     await invokeCommand<void>("copy_secret", { secret });
+    if (epoch !== state.epoch || !state.status.unlocked) return;
     startClipboardTimer(state.settings.clipboardClearSeconds);
     showToast(`${label}已复制，将在 ${state.settings.clipboardClearSeconds} 秒后清除。`, "success");
   } catch {
+    if (epoch !== state.epoch || !state.status.unlocked) return;
     showToast(`无法复制${label}到系统剪贴板。`, "error");
   }
 }
@@ -3925,6 +3948,17 @@ function askWebDavConnection(
     const endpoint = createTextField("webdav-endpoint", "WebDAV 目录地址", "", "https://cloud.example.com/remote.php/dav/files/name/CipherNest/", true, 2048);
     addSensitiveTextActions(endpoint, "WebDAV 地址");
     endpoint.wrapper.append(makeElement("p", "field-help", "必须是已存在的 HTTPS 目录，并以 / 结尾；请勿在地址中嵌入凭据。"));
+    const portHint = makeElement("p", "field-help", "5005 在一些 WebDAV 服务中是 HTTP 端口。请确认此端口确实启用了 HTTPS；实际端口以服务器设置为准。");
+    portHint.hidden = true;
+    portHint.setAttribute("aria-live", "polite");
+    endpoint.wrapper.append(portHint);
+    endpoint.input.addEventListener("input", () => {
+      try {
+        portHint.hidden = new URL(endpoint.input.value.trim()).port !== "5005";
+      } catch {
+        portHint.hidden = true;
+      }
+    });
     const username = createTextField("webdav-username", "用户名", "", "WebDAV 用户名", true, 500);
     addSensitiveTextActions(username, "WebDAV 用户名");
     const appPassword = createPasswordField("webdav-app-password", "应用专用密码", "输入 WebDAV 应用专用密码", "off");

@@ -199,4 +199,18 @@ jobs:
           fi
 
           gh release upload "$tag" "${assets[@]}" --clobber
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" \
+            > release-assets/uploaded-release.json
+          node scripts/release-tools.mjs verify-uploaded \
+            --assets release-assets \
+            --release-json release-assets/uploaded-release.json
+
+          remote_tag_commit="$(git ls-remote origin "refs/tags/${tag}^{}" | cut -f1)"
+          if [[ -z "$remote_tag_commit" ]]; then
+            remote_tag_commit="$(git ls-remote origin "refs/tags/${tag}" | cut -f1)"
+          fi
+          if [[ "$remote_tag_commit" != "$GITHUB_SHA" ]]; then
+            echo "Tag $tag no longer points to the commit used for these packages." >&2
+            exit 1
+          fi
           gh release edit "$tag" --draft=false --prerelease
