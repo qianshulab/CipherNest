@@ -3,11 +3,13 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::OsString,
     fs::{self, File},
-    io::Read,
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use atomicwrites::{AtomicFile, DisallowOverwrite};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
 use uuid::Uuid;
@@ -15,19 +17,20 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     crypto::{
-        create_envelope, decrypt_envelope, read_envelope, update_payload, write_envelope_atomic,
-        VaultEnvelope, MAX_VAULT_BYTES,
+        create_envelope, decrypt_envelope, parse_envelope_bytes, read_envelope, update_payload,
+        write_envelope_atomic, VaultEnvelope, MAX_VAULT_BYTES,
     },
     error::{VaultError, VaultResult},
     models::{
-        EntryInput, EntrySummary, MasterPasswordChangeResult, SecurityIssue, SecurityReport,
-        Tombstone, VaultData, VaultEntry, VaultOverview, VaultSettings, VaultStatus,
-        WebDavSyncStatus, MAX_VAULT_ENTRIES, MAX_VAULT_TOMBSTONES,
+        AutoBackupStatus, EntryInput, EntrySummary, MasterPasswordChangeResult, SecurityIssue,
+        SecurityReport, Tombstone, VaultData, VaultEntry, VaultOverview, VaultSettings,
+        VaultStatus, WebDavSyncStatus, MAX_VAULT_ENTRIES, MAX_VAULT_TOMBSTONES,
     },
     sync::{self, LocalSyncState, SyncContent, SyncError},
 };
 
 const AUTO_BACKUP_LIMIT: usize = 10;
+const RESTORE_FINGERPRINT_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 const STALE_PASSWORD_MS: u64 = 365 * 24 * 60 * 60 * 1000;
 
 struct UnlockedVault {
@@ -35,6 +38,22 @@ struct UnlockedVault {
     data: VaultData,
     envelope: VaultEnvelope,
     session_id: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RestoreIntent {
+    version: u8,
+    source_digest: Option<[u8; 32]>,
+    target_digest: [u8; 32],
+    quarantine_id: String,
+}
+
+struct BackupInspection {
+    len: u64,
+    modified: SystemTime,
+    digest: [u8; 32],
+    vault_id: Option<String>,
 }
 
 pub(crate) struct NewSyncContext {
@@ -61,10 +80,14 @@ pub struct VaultStore {
     sync_transition_path: PathBuf,
     sync_restore_hold_path: PathBuf,
     sync_restore_next_hold_path: PathBuf,
+    restore_intent_path: PathBuf,
     unlocked: Option<UnlockedVault>,
     last_activity: Instant,
     failed_unlocks: u32,
     retry_after: Option<Instant>,
+    auto_backup_warning: Option<String>,
+    export_warning: Option<String>,
+    backup_inspections: HashMap<PathBuf, BackupInspection>,
 }
 
 impl VaultStore {
@@ -75,6 +98,7 @@ impl VaultStore {
         let sync_transition_path = sidecar_path_for(&vault_path, ".sync.next");
         let sync_restore_hold_path = sidecar_path_for(&vault_path, ".sync.restore-hold");
         let sync_restore_next_hold_path = sidecar_path_for(&vault_path, ".sync.next.restore-hold");
+        let restore_intent_path = sidecar_path_for(&vault_path, ".restore-intent");
         Self {
             vault_path,
             legacy_device_slots_path,
@@ -83,14 +107,19 @@ impl VaultStore {
             sync_transition_path,
             sync_restore_hold_path,
             sync_restore_next_hold_path,
+            restore_intent_path,
             unlocked: None,
             last_activity: Instant::now(),
             failed_unlocks: 0,
             retry_after: None,
+            auto_backup_warning: None,
+            export_warning: None,
+            backup_inspections: HashMap::new(),
         }
     }
 
     pub fn status(&mut self) -> (VaultStatus, bool) {
+        let _ = self.recover_interrupted_restore();
         let just_locked = self.enforce_auto_lock();
         let (item_count, auto_lock_minutes) = self
             .unlocked
@@ -104,7 +133,10 @@ impl VaultStore {
             .unwrap_or((0, VaultSettings::default().auto_lock_minutes));
         (
             VaultStatus {
-                exists: self.vault_path.is_file(),
+                exists: self.vault_path.is_file()
+                    || self.restore_intent_path.exists()
+                    || self.sync_restore_hold_path.exists()
+                    || self.sync_restore_next_hold_path.exists(),
                 unlocked: self.unlocked.is_some(),
                 item_count,
                 auto_lock_minutes,
@@ -114,7 +146,8 @@ impl VaultStore {
     }
 
     pub fn create(&mut self, master_password: &str) -> VaultResult<VaultStatus> {
-        if self.vault_path.exists() {
+        self.recover_interrupted_restore()?;
+        if self.vault_path.exists() || self.restore_intent_path.exists() {
             return Err(VaultError::AlreadyExists);
         }
         let now = now_ms();
@@ -147,10 +180,17 @@ impl VaultStore {
         self.failed_unlocks = 0;
         self.retry_after = None;
         self.last_activity = Instant::now();
+        self.complete_current_auto_backup(None);
         Ok(self.status().0)
     }
 
     pub fn unlock(&mut self, master_password: &str) -> VaultResult<VaultStatus> {
+        // A legacy interrupted restore can leave a hold without the newer
+        // transaction marker. Keep the hold inactive, but still allow access
+        // to an intact local vault so its data can be exported.
+        if self.restore_intent_path.exists() {
+            self.recover_interrupted_restore()?;
+        }
         if !self.vault_path.is_file() {
             return Err(VaultError::NotFound);
         }
@@ -183,6 +223,11 @@ impl VaultStore {
             return Err(VaultError::PasswordOnlyMigrationFailed);
         }
         self.cleanup_legacy_device_artifacts();
+        // Reconcile a staged checkpoint before a later local edit can make
+        // the crash boundary ambiguous. A damaged sync state does not prevent
+        // unlocking the local vault for export or repair.
+        let _ = self.load_sync_state();
+        self.complete_current_auto_backup(None);
         Ok(self.status().0)
     }
 
@@ -260,6 +305,7 @@ impl VaultStore {
     pub fn overview(&mut self) -> VaultResult<VaultOverview> {
         self.require_unlocked()?;
         self.touch();
+        let auto_backup = self.auto_backup_status();
         let vault = self.unlocked.as_ref().ok_or(VaultError::Locked)?;
         let password_counts = password_counts(&vault.data.entries);
         let security_issue_count = vault
@@ -278,6 +324,7 @@ impl VaultStore {
                 .count(),
             security_issue_count,
             last_backup_at: vault.data.last_backup_at,
+            auto_backup,
         })
     }
 
@@ -381,7 +428,7 @@ impl VaultStore {
             .ok_or(VaultError::EntryNotFound)
     }
 
-    pub fn delete_entry(&mut self, id: &str) -> VaultResult<()> {
+    pub fn delete_entry(&mut self, id: &str, expected_revision: u64) -> VaultResult<()> {
         validate_id(id)?;
         self.require_unlocked()?;
         let mut next_data = self
@@ -395,6 +442,9 @@ impl VaultStore {
             .iter()
             .position(|entry| entry.id == id)
             .ok_or(VaultError::EntryNotFound)?;
+        if next_data.entries[position].revision != expected_revision {
+            return Err(VaultError::RevisionConflict);
+        }
         let removed = next_data.entries.remove(position);
         let now = now_ms();
         next_data.tombstones.retain(|item| item.id != id);
@@ -415,7 +465,12 @@ impl VaultStore {
         Ok(())
     }
 
-    pub fn set_favorite(&mut self, id: &str, favorite: bool) -> VaultResult<u64> {
+    pub fn set_favorite(
+        &mut self,
+        id: &str,
+        favorite: bool,
+        expected_revision: u64,
+    ) -> VaultResult<u64> {
         validate_id(id)?;
         self.require_unlocked()?;
         let mut next_data = self
@@ -431,6 +486,9 @@ impl VaultStore {
                 .iter_mut()
                 .find(|entry| entry.id == id)
                 .ok_or(VaultError::EntryNotFound)?;
+            if entry.revision != expected_revision {
+                return Err(VaultError::RevisionConflict);
+            }
             entry.favorite = favorite;
             entry.updated_at = now;
             entry.revision = entry.revision.saturating_add(1);
@@ -590,7 +648,10 @@ impl VaultStore {
         bump_generation(&mut next_data, now_ms());
         validate_loaded_data(&next_data)?;
         if let Err(error) = self.persist(next_data) {
-            let _ = sync::remove_local_sync_state(&self.sync_transition_path);
+            // The vault replacement may have reached disk even when its final
+            // durability step reported an error. Keep the staged checkpoint
+            // and force a fresh unlock to inspect the actual disk generation.
+            self.lock();
             return Err(error);
         }
         let vault = self.unlocked.as_ref().ok_or(VaultError::Locked)?;
@@ -661,7 +722,7 @@ impl VaultStore {
             bump_generation(&mut next_data, now_ms());
             validate_loaded_data(&next_data)?;
             if let Err(error) = self.persist(next_data) {
-                let _ = sync::remove_local_sync_state(&self.sync_transition_path);
+                self.lock();
                 return Err(error);
             }
         }
@@ -777,25 +838,32 @@ impl VaultStore {
         if !data.password_only_unlock {
             return Err(VaultError::InvalidVault);
         }
+        self.recover_interrupted_restore()?;
+        let intent = self.begin_restore_intent(&envelope)?;
         // Move synchronization state out of its active names first. A failed
         // vault replacement restores it; a successful replacement leaves it
         // disabled, even if the process stops before cleanup.
-        self.hold_sync_sidecars_for_restore()?;
-        let quarantined = match self.preserve_current_before_restore() {
-            Ok(quarantined) => quarantined,
-            Err(error) => {
-                self.rollback_held_sync_sidecars();
-                return Err(error);
-            }
-        };
+        if let Err(error) = self.hold_sync_sidecars_for_restore() {
+            let _ = self.recover_interrupted_restore();
+            return Err(error);
+        }
+        let (quarantined, previous_backup) =
+            match self.preserve_current_before_restore(&intent.quarantine_id) {
+                Ok(preserved) => preserved,
+                Err(error) => {
+                    let _ = self.recover_interrupted_restore();
+                    return Err(error);
+                }
+            };
         if let Err(error) = self.invalidate_legacy_device_slots() {
             self.rollback_quarantine(quarantined.as_deref());
-            self.rollback_held_sync_sidecars();
+            let _ = self.recover_interrupted_restore();
             return Err(error);
         }
         if let Err(error) = write_envelope_atomic(&self.vault_path, &envelope) {
             self.rollback_quarantine(quarantined.as_deref());
-            self.rollback_held_sync_sidecars();
+            self.lock();
+            let _ = self.recover_interrupted_restore();
             return Err(error);
         }
         self.unlocked = Some(UnlockedVault {
@@ -808,8 +876,8 @@ impl VaultStore {
         self.last_activity = Instant::now();
         self.failed_unlocks = 0;
         self.retry_after = None;
-        let _ = sync::remove_local_sync_state(&self.sync_restore_hold_path);
-        let _ = sync::remove_local_sync_state(&self.sync_restore_next_hold_path);
+        let _ = self.recover_interrupted_restore();
+        self.complete_current_auto_backup(previous_backup.as_deref());
         Ok(())
     }
 
@@ -829,9 +897,35 @@ impl VaultStore {
                 "备份位置不能覆盖当前保险库".into(),
             ));
         }
+        let backup_directory = self
+            .vault_path
+            .parent()
+            .ok_or(VaultError::SaveFailed)?
+            .join("backups");
+        if target
+            .parent()
+            .and_then(|parent| parent.canonicalize().ok())
+            == backup_directory.canonicalize().ok()
+            && backup_directory.is_dir()
+        {
+            return Err(VaultError::InvalidInput(
+                "请将导出文件保存到自动备份目录以外的位置".into(),
+            ));
+        }
         let envelope = self.current_envelope()?;
-        write_envelope_atomic(target, &envelope)?;
-        self.mark_manual_backup()?;
+        let bytes = serde_json::to_vec(&envelope).map_err(|_| VaultError::SaveFailed)?;
+        write_private_exclusive(target, &bytes).map_err(|error| {
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                VaultError::InvalidInput("目标备份文件已存在，请选择其他文件名".into())
+            } else {
+                VaultError::SaveFailed
+            }
+        })?;
+        self.export_warning = if self.mark_manual_backup().is_err() {
+            Some("加密备份已导出，但上次导出时间未能记录。".into())
+        } else {
+            None
+        };
         self.touch();
         Ok(())
     }
@@ -905,7 +999,7 @@ impl VaultStore {
         } else {
             let _ = sync::remove_local_sync_state(&self.sync_transition_path);
         }
-        self.backup_current()?;
+        let previous_backup = self.backup_current()?;
 
         // Any reported write failure makes the unlock caller discard its in-memory session.
         // The next master-password unlock validates the actual disk state and retries when the
@@ -946,6 +1040,14 @@ impl VaultStore {
             }
         } else {
             (true, None)
+        };
+        self.complete_current_auto_backup(Some(&previous_backup));
+        let warning = match (warning, self.auto_backup_warning.as_ref()) {
+            (Some(sync_warning), Some(backup_warning)) => {
+                Some(format!("{sync_warning} {backup_warning}"))
+            }
+            (None, Some(backup_warning)) => Some(backup_warning.clone()),
+            (sync_warning, None) => sync_warning,
         };
         self.cleanup_legacy_device_auth_record();
         self.touch();
@@ -1025,71 +1127,78 @@ impl VaultStore {
     }
 
     fn load_sync_state(&self) -> VaultResult<Option<LocalSyncState>> {
+        self.recover_interrupted_restore()?;
         let vault = self.unlocked.as_ref().ok_or(VaultError::Locked)?;
         let vault_id = vault.data.vault_id.clone();
         let root_key = Zeroizing::new(*vault.root_key);
+        let active = self
+            .sync_state_path
+            .exists()
+            .then(|| sync::read_local_sync_state(&self.sync_state_path, &vault_id, &root_key));
+        let staged = self
+            .sync_transition_path
+            .exists()
+            .then(|| sync::read_local_sync_state(&self.sync_transition_path, &vault_id, &root_key));
 
-        // Restore holds are never auto-reactivated. A completed restore must
-        // disable the previous vault's sync configuration even when both
-        // vaults happen to use the same root key; an interrupted process may
-        // therefore fail closed by requiring sync setup again.
-        let _ = sync::remove_local_sync_state(&self.sync_restore_hold_path);
-        let _ = sync::remove_local_sync_state(&self.sync_restore_next_hold_path);
+        let promote = |state: LocalSyncState| -> VaultResult<Option<LocalSyncState>> {
+            validate_sync_generation_and_content(&state, &vault.data)?;
+            sync::write_local_sync_state(&self.sync_state_path, &vault_id, &root_key, &state)?;
+            let _ = sync::remove_local_sync_state(&self.sync_transition_path);
+            Ok(Some(state))
+        };
 
-        if self.sync_state_path.exists() {
-            match sync::read_local_sync_state(&self.sync_state_path, &vault_id, &root_key) {
-                Ok(state) => {
-                    // An active state that decrypts under the current vault is
-                    // authoritative; any `.next` file belongs to an aborted
-                    // pre-write transaction.
+        match (active, staged) {
+            (None, None) => Ok(None),
+            (Some(Ok(state)), None) => {
+                validate_sync_generation_and_content(&state, &vault.data)?;
+                Ok(Some(state))
+            }
+            (Some(Err(error)), None) => Err(error.into()),
+            (None, Some(Ok(state))) | (Some(Err(_)), Some(Ok(state))) => promote(state),
+            (None, Some(Err(error))) | (Some(Err(error)), Some(Err(_))) => Err(error.into()),
+            (Some(Ok(active)), Some(Err(_))) => {
+                validate_sync_generation_and_content(&active, &vault.data)?;
+                Ok(Some(active))
+            }
+            (Some(Ok(active)), Some(Ok(staged))) => {
+                let active_valid = validate_sync_generation_and_content(&active, &vault.data);
+                let staged_valid = validate_sync_generation_and_content(&staged, &vault.data);
+                if active_valid.is_ok()
+                    && staged_valid.is_ok()
+                    && (active.sync_id() != staged.sync_id()
+                        || active.endpoint() != staged.endpoint()
+                        || active.username() != staged.username())
+                {
+                    return Err(SyncError::InvalidLocalState.into());
+                }
+                if staged_valid.is_ok()
+                    && staged.last_local_generation() == vault.data.generation
+                    && active.last_local_generation() < staged.last_local_generation()
+                {
+                    return promote(staged);
+                }
+                active_valid?;
+                if staged.last_local_generation() > active.last_local_generation()
+                    && staged.last_local_generation() < vault.data.generation
+                {
+                    // A later local edit makes it impossible to prove whether
+                    // the staged remote content was ever installed.
+                    return Err(SyncError::InvalidLocalState.into());
+                }
+                if staged.last_local_generation() == active.last_local_generation()
+                    && staged_valid.is_ok()
+                    && sync_state_digest(&staged)? != sync_state_digest(&active)?
+                {
+                    return Err(SyncError::InvalidLocalState.into());
+                }
+                if staged.last_local_generation() <= active.last_local_generation()
+                    || staged.last_local_generation() > vault.data.generation
+                {
                     let _ = sync::remove_local_sync_state(&self.sync_transition_path);
-                    let _ = sync::remove_local_sync_state(&self.sync_restore_hold_path);
-                    let _ = sync::remove_local_sync_state(&self.sync_restore_next_hold_path);
-                    return Ok(Some(state));
                 }
-                Err(active_error) => {
-                    if !self.sync_transition_path.exists() {
-                        return Err(active_error.into());
-                    }
-                    match sync::read_local_sync_state(
-                        &self.sync_transition_path,
-                        &vault_id,
-                        &root_key,
-                    ) {
-                        Ok(state) => {
-                            // Best-effort promotion. Even if the filesystem is
-                            // temporarily read-only, the valid recovery copy is
-                            // retained and may be promoted on the next attempt.
-                            if sync::write_local_sync_state(
-                                &self.sync_state_path,
-                                &vault_id,
-                                &root_key,
-                                &state,
-                            )
-                            .is_ok()
-                            {
-                                let _ = sync::remove_local_sync_state(&self.sync_transition_path);
-                            }
-                            return Ok(Some(state));
-                        }
-                        Err(_) => return Err(active_error.into()),
-                    }
-                }
+                Ok(Some(active))
             }
         }
-
-        if self.sync_transition_path.exists() {
-            let state =
-                sync::read_local_sync_state(&self.sync_transition_path, &vault_id, &root_key)?;
-            if sync::write_local_sync_state(&self.sync_state_path, &vault_id, &root_key, &state)
-                .is_ok()
-            {
-                let _ = sync::remove_local_sync_state(&self.sync_transition_path);
-            }
-            return Ok(Some(state));
-        }
-
-        Ok(None)
     }
 
     fn remove_all_sync_sidecars(&self) -> VaultResult<()> {
@@ -1145,8 +1254,9 @@ impl VaultStore {
     }
 
     fn hold_sync_sidecars_for_restore(&self) -> VaultResult<()> {
-        sync::remove_local_sync_state(&self.sync_restore_hold_path)?;
-        sync::remove_local_sync_state(&self.sync_restore_next_hold_path)?;
+        if self.sync_restore_hold_path.exists() || self.sync_restore_next_hold_path.exists() {
+            return Err(SyncError::LocalStateIo.into());
+        }
 
         if self.sync_state_path.exists() {
             fs::rename(&self.sync_state_path, &self.sync_restore_hold_path)
@@ -1177,6 +1287,99 @@ impl VaultStore {
         }
     }
 
+    fn begin_restore_intent(&self, envelope: &VaultEnvelope) -> VaultResult<RestoreIntent> {
+        if self.restore_intent_path.exists() {
+            return Err(VaultError::SaveFailed);
+        }
+        let source_digest = self.restore_target_fingerprint()?;
+        let target_bytes = serde_json::to_vec(envelope).map_err(|_| VaultError::SaveFailed)?;
+        let target_digest = Sha256::digest(&target_bytes).into();
+        if source_digest == Some(target_digest) {
+            return Err(VaultError::InvalidInput(
+                "所选备份与当前保险库相同，无需恢复".into(),
+            ));
+        }
+        let intent = RestoreIntent {
+            version: 1,
+            source_digest,
+            target_digest,
+            quarantine_id: Uuid::new_v4().to_string(),
+        };
+        let bytes = serde_json::to_vec(&intent).map_err(|_| VaultError::SaveFailed)?;
+        write_private_exclusive(&self.restore_intent_path, &bytes)
+            .map_err(|_| VaultError::SaveFailed)?;
+        Ok(intent)
+    }
+
+    fn restore_quarantine_path(&self, quarantine_id: &str) -> VaultResult<PathBuf> {
+        let id = Uuid::parse_str(quarantine_id).map_err(|_| VaultError::SaveFailed)?;
+        if id.to_string() != quarantine_id {
+            return Err(VaultError::SaveFailed);
+        }
+        let parent = self.vault_path.parent().ok_or(VaultError::SaveFailed)?;
+        Ok(parent
+            .join("quarantine")
+            .join(format!("invalid-{quarantine_id}.cnvault")))
+    }
+
+    fn recover_interrupted_restore(&self) -> VaultResult<()> {
+        self.try_recover_interrupted_restore()
+            .map_err(|_| VaultError::RestoreRecoveryFailed)
+    }
+
+    fn try_recover_interrupted_restore(&self) -> VaultResult<()> {
+        if !self.restore_intent_path.exists() {
+            if self.sync_restore_hold_path.exists() || self.sync_restore_next_hold_path.exists() {
+                return Err(SyncError::LocalStateIo.into());
+            }
+            return Ok(());
+        }
+        let mut bytes = Vec::new();
+        File::open(&self.restore_intent_path)
+            .and_then(|file| file.take(4097).read_to_end(&mut bytes))
+            .map_err(|_| VaultError::SaveFailed)?;
+        if bytes.is_empty() || bytes.len() > 4096 {
+            return Err(VaultError::SaveFailed);
+        }
+        let intent: RestoreIntent =
+            serde_json::from_slice(&bytes).map_err(|_| VaultError::SaveFailed)?;
+        if intent.version != 1 || intent.source_digest == Some(intent.target_digest) {
+            return Err(VaultError::SaveFailed);
+        }
+        let quarantine_path = self.restore_quarantine_path(&intent.quarantine_id)?;
+        let current_digest = self.restore_target_fingerprint()?;
+        if current_digest == Some(intent.target_digest) {
+            if self.sync_state_path.exists() || self.sync_transition_path.exists() {
+                return Err(SyncError::LocalStateIo.into());
+            }
+            sync::remove_local_sync_state(&self.sync_restore_hold_path)?;
+            sync::remove_local_sync_state(&self.sync_restore_next_hold_path)?;
+        } else if current_digest == intent.source_digest {
+            if (self.sync_state_path.exists() && self.sync_restore_hold_path.exists())
+                || (self.sync_transition_path.exists() && self.sync_restore_next_hold_path.exists())
+            {
+                return Err(SyncError::LocalStateIo.into());
+            }
+            self.rollback_held_sync_sidecars();
+            if self.sync_restore_hold_path.exists() || self.sync_restore_next_hold_path.exists() {
+                return Err(SyncError::LocalStateIo.into());
+            }
+        } else if current_digest.is_none() && intent.source_digest.is_some() {
+            if fingerprint_file(&quarantine_path)? != intent.source_digest {
+                return Err(VaultError::SaveFailed);
+            }
+            fs::rename(&quarantine_path, &self.vault_path).map_err(|_| VaultError::SaveFailed)?;
+            self.rollback_held_sync_sidecars();
+            if self.sync_restore_hold_path.exists() || self.sync_restore_next_hold_path.exists() {
+                return Err(SyncError::LocalStateIo.into());
+            }
+        } else {
+            return Err(VaultError::SaveFailed);
+        }
+        sync::remove_local_sync_state(&self.restore_intent_path)?;
+        Ok(())
+    }
+
     fn enforce_auto_lock(&mut self) -> bool {
         let should_lock = self.unlocked.as_ref().is_some_and(|vault| {
             self.last_activity.elapsed()
@@ -1196,15 +1399,181 @@ impl VaultStore {
             let unlocked = self.unlocked.as_ref().ok_or(VaultError::Locked)?;
             update_payload(&unlocked.envelope, &unlocked.root_key, &data)?
         };
-        self.backup_current()?;
+        let previous_backup = self.backup_current()?;
         write_envelope_atomic(&self.vault_path, &next_envelope)?;
         let unlocked = self.unlocked.as_mut().ok_or(VaultError::Locked)?;
         unlocked.data = data;
         unlocked.envelope = next_envelope;
+        // The active vault is already committed. A failure to write the extra
+        // snapshot must be reported separately, never as a failed user edit.
+        self.complete_current_auto_backup(Some(&previous_backup));
         Ok(())
     }
 
-    fn backup_current(&self) -> VaultResult<()> {
+    fn complete_current_auto_backup(&mut self, previous_backup: Option<&Path>) {
+        self.auto_backup_warning = self
+            .current_envelope()
+            .and_then(|envelope| self.backup_envelope_with_protection(&envelope, previous_backup))
+            .err()
+            .map(|_| {
+                "保险库数据已保存，但当前版本的自动备份未完成。请检查磁盘空间和备份目录权限。"
+                    .into()
+            });
+    }
+
+    fn auto_backup_status(&mut self) -> AutoBackupStatus {
+        let mut status = AutoBackupStatus {
+            count: 0,
+            latest_at: None,
+            current_covered: false,
+            inspection_failed: false,
+            warning: None,
+        };
+        let Some(vault) = self.unlocked.as_ref() else {
+            return status;
+        };
+        let mut warnings = Vec::new();
+        if let Some(warning) = self.auto_backup_warning.as_ref() {
+            warnings.push(warning.clone());
+        }
+        if let Some(warning) = self.export_warning.as_ref() {
+            warnings.push(warning.clone());
+        }
+        let disk_matches_session = self.current_envelope().is_ok();
+        if !disk_matches_session {
+            status.inspection_failed = true;
+            warnings.push("当前保险库文件已变化，无法确认自动备份是否覆盖当前版本。".into());
+        }
+        let vault_id = vault.data.vault_id.clone();
+        let expected_bytes = match serde_json::to_vec(&vault.envelope) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                status.inspection_failed = true;
+                warnings.push("无法检查自动备份状态。".into());
+                status.warning = Some(warnings.join(" "));
+                return status;
+            }
+        };
+        let Some(parent) = self.vault_path.parent() else {
+            status.inspection_failed = true;
+            warnings.push("无法检查自动备份目录。".into());
+            status.warning = Some(warnings.join(" "));
+            return status;
+        };
+        let directory = parent.join("backups");
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                warnings.push("当前版本尚无自动备份。".into());
+                status.warning = Some(warnings.join(" "));
+                return status;
+            }
+            Err(_) => {
+                status.inspection_failed = true;
+                warnings.push("无法检查自动备份目录。".into());
+                status.warning = Some(warnings.join(" "));
+                return status;
+            }
+        };
+        let expected_digest: [u8; 32] = Sha256::digest(&expected_bytes).into();
+        let prefix = format!("auto-{vault_id}-");
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    status.inspection_failed = true;
+                    continue;
+                }
+            };
+            let file_name = entry.file_name();
+            let Some(name) = file_name.to_str() else {
+                continue;
+            };
+            if !name.starts_with(&prefix) || !name.ends_with(".cnvault") {
+                continue;
+            }
+            let metadata = match fs::symlink_metadata(entry.path()) {
+                Ok(metadata)
+                    if metadata.file_type().is_file() && metadata.len() <= MAX_VAULT_BYTES =>
+                {
+                    metadata
+                }
+                _ => {
+                    status.inspection_failed = true;
+                    continue;
+                }
+            };
+            let modified = match metadata.modified() {
+                Ok(modified) => modified,
+                Err(_) => {
+                    status.inspection_failed = true;
+                    continue;
+                }
+            };
+            let path = entry.path();
+            let inspection = self
+                .backup_inspections
+                .get(&path)
+                .filter(|cached| cached.len == metadata.len() && cached.modified == modified);
+            let (digest, recorded_vault_id) = if let Some(cached) = inspection {
+                (cached.digest, cached.vault_id.clone())
+            } else {
+                let mut bytes = Vec::with_capacity(metadata.len() as usize);
+                let read = File::open(&path)
+                    .and_then(|file| file.take(MAX_VAULT_BYTES + 1).read_to_end(&mut bytes));
+                if read.is_err() || bytes.is_empty() || bytes.len() as u64 > MAX_VAULT_BYTES {
+                    status.inspection_failed = true;
+                    continue;
+                }
+                let digest = Sha256::digest(&bytes).into();
+                let recorded_vault_id = parse_envelope_bytes(&bytes)
+                    .ok()
+                    .map(|envelope| envelope.vault_id);
+                if self.backup_inspections.len() >= 256 {
+                    self.backup_inspections.clear();
+                }
+                self.backup_inspections.insert(
+                    path,
+                    BackupInspection {
+                        len: metadata.len(),
+                        modified,
+                        digest,
+                        vault_id: recorded_vault_id.clone(),
+                    },
+                );
+                (digest, recorded_vault_id)
+            };
+            if recorded_vault_id.as_deref() != Some(vault_id.as_str()) {
+                status.inspection_failed = true;
+                continue;
+            }
+            status.count += 1;
+            if let Ok(duration) = modified.duration_since(UNIX_EPOCH) {
+                let timestamp = duration.as_millis().try_into().unwrap_or(u64::MAX);
+                status.latest_at = Some(status.latest_at.unwrap_or(0).max(timestamp));
+            } else {
+                status.inspection_failed = true;
+            }
+            if disk_matches_session
+                && digest == expected_digest
+                && metadata.len() == expected_bytes.len() as u64
+            {
+                status.current_covered = true;
+            }
+        }
+        if status.inspection_failed {
+            warnings.push("部分自动备份无法检查，备份状态可能不完整。".into());
+        }
+        if !status.current_covered && !status.inspection_failed {
+            warnings.push("当前版本尚无自动备份。".into());
+        }
+        if !warnings.is_empty() {
+            status.warning = Some(warnings.join(" "));
+        }
+        status
+    }
+
+    fn backup_current(&self) -> VaultResult<PathBuf> {
         let current = self.current_envelope()?;
         self.backup_envelope(&current)
     }
@@ -1222,51 +1591,85 @@ impl VaultStore {
         Ok(current)
     }
 
-    fn backup_envelope(&self, current: &VaultEnvelope) -> VaultResult<()> {
+    pub(crate) fn restore_target_fingerprint(&self) -> VaultResult<Option<[u8; 32]>> {
+        fingerprint_file(&self.vault_path)
+    }
+
+    fn backup_envelope(&self, current: &VaultEnvelope) -> VaultResult<PathBuf> {
+        self.backup_envelope_with_protection(current, None)
+    }
+
+    fn backup_envelope_with_protection(
+        &self,
+        current: &VaultEnvelope,
+        previous_backup: Option<&Path>,
+    ) -> VaultResult<PathBuf> {
         let parent = self.vault_path.parent().ok_or(VaultError::SaveFailed)?;
         let backup_directory = parent.join("backups");
+        fs::create_dir_all(&backup_directory).map_err(|_| VaultError::SaveFailed)?;
+        set_private_directory_permissions(&backup_directory)?;
         let canonical_bytes = serde_json::to_vec(current).map_err(|_| VaultError::SaveFailed)?;
         if canonical_bytes.is_empty() || canonical_bytes.len() as u64 > MAX_VAULT_BYTES {
             return Err(VaultError::SaveFailed);
         }
 
         let primary_path = backup_directory.join(automatic_backup_name(current)?);
-        let backup_path = if !primary_path.exists() {
-            primary_path
-        } else if backup_file_matches(&primary_path, &canonical_bytes)? {
-            rotate_backups(&backup_directory, &primary_path)?;
-            return Ok(());
-        } else {
-            let content_hash = hex_sha256(&canonical_bytes);
-            let hashed_path = backup_directory.join(automatic_backup_collision_name(
-                current,
-                &content_hash,
-                None,
-            )?);
-            if !hashed_path.exists() {
-                hashed_path
-            } else if backup_file_matches(&hashed_path, &canonical_bytes)? {
-                rotate_backups(&backup_directory, &hashed_path)?;
-                return Ok(());
+        let content_hash = hex_sha256(&canonical_bytes);
+        for attempt in 0..32 {
+            let backup_path = if attempt == 0 {
+                primary_path.clone()
             } else {
                 backup_directory.join(automatic_backup_collision_name(
                     current,
                     &content_hash,
-                    Some(&Uuid::new_v4().to_string()),
+                    (attempt > 1).then(|| Uuid::new_v4().to_string()).as_deref(),
                 )?)
+            };
+            if backup_path.exists() {
+                if backup_file_matches(&backup_path, &canonical_bytes)? {
+                    rotate_backups(
+                        &backup_directory,
+                        &current.vault_id,
+                        &backup_path,
+                        previous_backup,
+                    )?;
+                    return Ok(backup_path);
+                }
+                continue;
             }
-        };
-
-        if backup_path.exists() {
-            return Err(VaultError::SaveFailed);
+            match write_private_exclusive(&backup_path, &canonical_bytes) {
+                Ok(()) => {
+                    rotate_backups(
+                        &backup_directory,
+                        &current.vault_id,
+                        &backup_path,
+                        previous_backup,
+                    )?;
+                    return Ok(backup_path);
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    if backup_file_matches(&backup_path, &canonical_bytes)? {
+                        rotate_backups(
+                            &backup_directory,
+                            &current.vault_id,
+                            &backup_path,
+                            previous_backup,
+                        )?;
+                        return Ok(backup_path);
+                    }
+                }
+                Err(_) => return Err(VaultError::SaveFailed),
+            }
         }
-        write_envelope_atomic(&backup_path, current)?;
-        rotate_backups(&backup_directory, &backup_path)
+        Err(VaultError::SaveFailed)
     }
 
-    fn preserve_current_before_restore(&self) -> VaultResult<Option<PathBuf>> {
+    fn preserve_current_before_restore(
+        &self,
+        quarantine_id: &str,
+    ) -> VaultResult<(Option<PathBuf>, Option<PathBuf>)> {
         if !self.vault_path.exists() {
-            return Ok(None);
+            return Ok((None, None));
         }
         if !self.vault_path.is_file() {
             return Err(VaultError::SaveFailed);
@@ -1274,29 +1677,26 @@ impl VaultStore {
 
         match read_envelope(&self.vault_path) {
             Ok(current) if Uuid::parse_str(&current.vault_id).is_ok() => {
-                self.backup_envelope(&current)?;
-                Ok(None)
+                let backup_path = self.backup_envelope(&current)?;
+                Ok((None, Some(backup_path)))
             }
-            Ok(_) | Err(_) => self.quarantine_invalid_current().map(Some),
+            Ok(_) | Err(_) => self
+                .quarantine_invalid_current(quarantine_id)
+                .map(|path| (Some(path), None)),
         }
     }
 
-    fn quarantine_invalid_current(&self) -> VaultResult<PathBuf> {
+    fn quarantine_invalid_current(&self, quarantine_id: &str) -> VaultResult<PathBuf> {
+        let quarantine_path = self.restore_quarantine_path(quarantine_id)?;
+        let quarantine_directory = quarantine_path.parent().ok_or(VaultError::SaveFailed)?;
         let parent = self.vault_path.parent().ok_or(VaultError::SaveFailed)?;
-        let quarantine_directory = parent.join("quarantine");
-        fs::create_dir_all(&quarantine_directory).map_err(|_| VaultError::SaveFailed)?;
-        set_private_directory_permissions(&quarantine_directory)?;
-
-        let quarantine_path = quarantine_directory.join(format!(
-            "invalid-{:020}-{}.cnvault",
-            now_ms(),
-            Uuid::new_v4()
-        ));
-
-        // Rename within the same application-data filesystem. This preserves the exact raw file
-        // without parsing or allocating based on an attacker-controlled malformed length.
+        fs::create_dir_all(quarantine_directory).map_err(|_| VaultError::SaveFailed)?;
+        set_private_directory_permissions(quarantine_directory)?;
+        if quarantine_path.exists() {
+            return Err(VaultError::SaveFailed);
+        }
         fs::rename(&self.vault_path, &quarantine_path).map_err(|_| VaultError::SaveFailed)?;
-        if let Err(error) = secure_quarantined_file(&quarantine_path, parent, &quarantine_directory)
+        if let Err(error) = secure_quarantined_file(&quarantine_path, parent, quarantine_directory)
         {
             let _ = fs::rename(&quarantine_path, &self.vault_path);
             return Err(error);
@@ -1314,37 +1714,72 @@ impl VaultStore {
     }
 }
 
+fn fingerprint_file(path: &Path) -> VaultResult<Option<[u8; 32]>> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(VaultError::SaveFailed),
+    };
+    let metadata = file.metadata().map_err(|_| VaultError::SaveFailed)?;
+    if !metadata.is_file() || metadata.len() > RESTORE_FINGERPRINT_MAX_BYTES {
+        return Err(VaultError::InvalidInput(
+            "当前保险库文件过大或类型无效，无法安全核对恢复目标".into(),
+        ));
+    }
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let read = file.read(&mut buffer).map_err(|_| VaultError::SaveFailed)?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read as u64);
+        if total > RESTORE_FINGERPRINT_MAX_BYTES {
+            return Err(VaultError::InvalidInput(
+                "当前保险库文件过大，无法安全核对恢复目标".into(),
+            ));
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(Some(digest.finalize().into()))
+}
+
 fn bump_generation(data: &mut VaultData, now: u64) {
     data.generation = data.generation.saturating_add(1);
     data.updated_at = now;
 }
 
-fn rotate_backups(directory: &Path, current_backup: &Path) -> VaultResult<()> {
-    let mut backups: Vec<(SystemTime, PathBuf)> = fs::read_dir(directory)
-        .map_err(|_| VaultError::SaveFailed)?
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let path = entry.path();
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("auto-") && name.ends_with(".cnvault"))
-                .then(|| {
-                    let modified = entry
-                        .metadata()
-                        .and_then(|metadata| metadata.modified())
-                        .unwrap_or(UNIX_EPOCH);
-                    (modified, path)
-                })
-        })
-        .collect();
+fn rotate_backups(
+    directory: &Path,
+    vault_id: &str,
+    current_backup: &Path,
+    previous_backup: Option<&Path>,
+) -> VaultResult<()> {
+    let prefix = format!("auto-{vault_id}-");
+    let mut backups: Vec<(SystemTime, PathBuf)> = Vec::new();
+    for entry in fs::read_dir(directory).map_err(|_| VaultError::SaveFailed)? {
+        let entry = entry.map_err(|_| VaultError::SaveFailed)?;
+        let path = entry.path();
+        let belongs_to_vault = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".cnvault"));
+        if !belongs_to_vault {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&path).map_err(|_| VaultError::SaveFailed)?;
+        if metadata.file_type().is_file() {
+            backups.push((metadata.modified().unwrap_or(UNIX_EPOCH), path));
+        }
+    }
     backups.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
     let remove_count = backups.len().saturating_sub(AUTO_BACKUP_LIMIT);
-    // The backup of the on-disk vault is the rollback copy for the write that
-    // follows. Preserve it even when its timestamp is old or ties with other
-    // files (for example after a restore or across different vault IDs).
+    // Protect both the committed version and the immediate rollback version,
+    // even when their timestamps are older than unrelated snapshots.
     for (_, path) in backups
         .into_iter()
-        .filter(|(_, path)| path != current_backup)
+        .filter(|(_, path)| path != current_backup && previous_backup != Some(path.as_path()))
         .take(remove_count)
     {
         fs::remove_file(path).map_err(|_| VaultError::SaveFailed)?;
@@ -1405,7 +1840,31 @@ fn hex_sha256(bytes: &[u8]) -> String {
         .collect()
 }
 
+fn write_private_exclusive(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    if bytes.is_empty() || bytes.len() as u64 > MAX_VAULT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid encrypted vault size",
+        ));
+    }
+    AtomicFile::new(path, DisallowOverwrite)
+        .write(|file| -> io::Result<()> {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            }
+            file.write_all(bytes)?;
+            file.sync_all()
+        })
+        .map_err(Into::into)
+}
+
 fn set_private_directory_permissions(path: &Path) -> VaultResult<()> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| VaultError::SaveFailed)?;
+    if !metadata.file_type().is_dir() {
+        return Err(VaultError::SaveFailed);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1613,6 +2072,7 @@ fn entry_summary(entry: &VaultEntry, counts: &PasswordCounts) -> EntrySummary {
     }
     EntrySummary {
         id: entry.id.clone(),
+        revision: entry.revision,
         title: entry.title.clone(),
         favorite: entry.favorite,
         created_at: entry.created_at,
@@ -1901,7 +2361,9 @@ mod tests {
                 "entry summaries must not expose {sensitive_key}"
             );
         }
-        let favorite_revision = store.set_favorite(&summary.id, false).unwrap();
+        let favorite_revision = store
+            .set_favorite(&summary.id, false, summary.revision)
+            .unwrap();
         assert_eq!(favorite_revision, 2);
         store
             .save_entry(EntryInput {
@@ -1933,7 +2395,7 @@ mod tests {
         assert_eq!(entry.revision, 3);
         assert_eq!(store.list_entries(None, None, None).unwrap().len(), 1);
 
-        store.delete_entry(&summary.id).unwrap();
+        store.delete_entry(&summary.id, 3).unwrap();
         assert!(store.list_entries(None, None, None).unwrap().is_empty());
     }
 
@@ -2098,7 +2560,7 @@ mod tests {
         assert_eq!(after_conflict.title, "Updated once");
         assert_eq!(after_conflict.revision, 2);
 
-        store.delete_entry(&client_id).unwrap();
+        store.delete_entry(&client_id, 2).unwrap();
         assert!(matches!(
             store.save_entry(sample_entry_input(
                 Some(client_id),
@@ -2107,6 +2569,32 @@ mod tests {
             )),
             Err(VaultError::EntryAlreadyExists)
         ));
+    }
+
+    #[test]
+    fn favorite_and_delete_reject_stale_revisions_without_changing_the_vault() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vault.cnvault");
+        let mut store = VaultStore::new(path.clone());
+        store
+            .create("revision checks passphrase long enough")
+            .unwrap();
+        let entry = store
+            .save_entry(sample_entry_input(None, None, "Keep this entry"))
+            .unwrap();
+        let next_revision = store.set_favorite(&entry.id, true, entry.revision).unwrap();
+        let committed = fs::read(&path).unwrap();
+        assert!(matches!(
+            store.set_favorite(&entry.id, false, entry.revision),
+            Err(VaultError::RevisionConflict)
+        ));
+        assert!(matches!(
+            store.delete_entry(&entry.id, entry.revision),
+            Err(VaultError::RevisionConflict)
+        ));
+        assert_eq!(fs::read(&path).unwrap(), committed);
+        assert!(store.get_entry(&entry.id).unwrap().favorite);
+        store.delete_entry(&entry.id, next_revision).unwrap();
     }
 
     #[test]
@@ -2160,7 +2648,7 @@ mod tests {
         let before = fs::read(&path).unwrap();
 
         assert!(matches!(
-            store.delete_entry(&saved.id),
+            store.delete_entry(&saved.id, saved.revision),
             Err(VaultError::InvalidInput(_))
         ));
         assert_eq!(fs::read(&path).unwrap(), before);
@@ -2221,25 +2709,127 @@ mod tests {
     }
 
     #[test]
+    fn current_version_is_snapshotted_after_create_save_and_unlock_without_duplicates() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vault.cnvault");
+        let password = "automatic backup passphrase long enough";
+        let mut store = VaultStore::new(path.clone());
+        store.create(password).unwrap();
+        let initial = store.overview().unwrap().auto_backup;
+        assert_eq!(initial.count, 1);
+        assert!(initial.current_covered);
+        assert!(!initial.inspection_failed);
+
+        store
+            .save_entry(sample_entry_input(None, None, "Latest entry"))
+            .unwrap();
+        let after_save = store.overview().unwrap().auto_backup;
+        assert_eq!(after_save.count, 2);
+        assert!(after_save.current_covered);
+        assert!(after_save.warning.is_none());
+
+        store.lock();
+        store.unlock(password).unwrap();
+        let after_unlock = store.overview().unwrap().auto_backup;
+        assert_eq!(after_unlock.count, 2);
+        assert!(after_unlock.current_covered);
+        let current = fs::read(&path).unwrap();
+        assert!(fs::read_dir(directory.path().join("backups"))
+            .unwrap()
+            .any(|entry| fs::read(entry.unwrap().path()).unwrap() == current));
+    }
+
+    #[test]
+    fn automatic_backup_status_flags_a_corrupt_snapshot_instead_of_claiming_health() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vault.cnvault");
+        let mut store = VaultStore::new(path.clone());
+        store
+            .create("backup status passphrase long enough")
+            .unwrap();
+        let envelope = read_envelope(&path).unwrap();
+        let backup_path = directory
+            .path()
+            .join("backups")
+            .join(automatic_backup_name(&envelope).unwrap());
+        assert!(store.overview().unwrap().auto_backup.current_covered);
+        fs::write(&backup_path, b"corrupt encrypted snapshot").unwrap();
+        let status = store.overview().unwrap().auto_backup;
+        assert_eq!(status.count, 0);
+        assert!(!status.current_covered);
+        assert!(status.inspection_failed);
+        assert!(status.warning.is_some());
+    }
+
+    #[test]
+    fn rotation_keeps_current_and_immediate_previous_even_when_both_are_oldest() {
+        let directory = tempfile::tempdir().unwrap();
+        let backup_directory = directory.path().join("backups");
+        fs::create_dir(&backup_directory).unwrap();
+        let vault_id = Uuid::new_v4().to_string();
+        let previous = backup_directory.join(format!("auto-{vault_id}-000000.cnvault"));
+        let current = backup_directory.join(format!("auto-{vault_id}-000001.cnvault"));
+        fs::write(&previous, b"previous vault backup").unwrap();
+        fs::write(&current, b"current vault backup").unwrap();
+        for index in 2..=AUTO_BACKUP_LIMIT + 1 {
+            fs::write(
+                backup_directory.join(format!("auto-{vault_id}-{index:06}.cnvault")),
+                b"older history",
+            )
+            .unwrap();
+        }
+        rotate_backups(&backup_directory, &vault_id, &current, Some(&previous)).unwrap();
+        assert!(current.is_file());
+        assert!(previous.is_file());
+        assert_eq!(
+            fs::read_dir(&backup_directory).unwrap().count(),
+            AUTO_BACKUP_LIMIT
+        );
+    }
+
+    #[test]
     fn rotation_keeps_the_current_vault_backup_even_when_it_is_oldest() {
         let directory = tempfile::tempdir().unwrap();
         let backup_directory = directory.path().join("backups");
         fs::create_dir(&backup_directory).unwrap();
-        let current_backup = backup_directory.join("auto-000000.cnvault");
+        let vault_id = Uuid::new_v4().to_string();
+        let current_backup = backup_directory.join(format!("auto-{vault_id}-000000.cnvault"));
         fs::write(&current_backup, b"current vault backup").unwrap();
         for index in 1..=AUTO_BACKUP_LIMIT {
             fs::write(
-                backup_directory.join(format!("auto-{index:06}.cnvault")),
+                backup_directory.join(format!("auto-{vault_id}-{index:06}.cnvault")),
                 b"another backup",
             )
             .unwrap();
         }
 
-        rotate_backups(&backup_directory, &current_backup).unwrap();
+        rotate_backups(&backup_directory, &vault_id, &current_backup, None).unwrap();
         assert!(current_backup.is_file());
         assert_eq!(
             fs::read_dir(&backup_directory).unwrap().count(),
             AUTO_BACKUP_LIMIT
+        );
+    }
+
+    #[test]
+    fn rotation_preserves_other_vaults_snapshots() {
+        let directory = tempfile::tempdir().unwrap();
+        let backup_directory = directory.path().join("backups");
+        fs::create_dir(&backup_directory).unwrap();
+        let current_id = Uuid::new_v4().to_string();
+        let old_id = Uuid::new_v4().to_string();
+        let old_snapshot = backup_directory.join(format!("auto-{old_id}-000001.cnvault"));
+        fs::write(&old_snapshot, b"previous vault history").unwrap();
+        let mut current = PathBuf::new();
+        for index in 0..=AUTO_BACKUP_LIMIT {
+            current = backup_directory.join(format!("auto-{current_id}-{index:06}.cnvault"));
+            fs::write(&current, b"current vault history").unwrap();
+        }
+        rotate_backups(&backup_directory, &current_id, &current, None).unwrap();
+        assert!(old_snapshot.is_file());
+        assert_eq!(
+            fs::read_dir(&backup_directory).unwrap().count(),
+            AUTO_BACKUP_LIMIT + 1
         );
     }
 
@@ -2405,7 +2995,12 @@ mod tests {
 
         // A regular file at the backup directory path forces backup_current() to fail after
         // password verification. The legacy slot must already be absent at that point.
-        fs::write(directory.path().join("backups"), b"not-a-directory").unwrap();
+        let backup_directory = directory.path().join("backups");
+        for backup in fs::read_dir(&backup_directory).unwrap() {
+            fs::remove_file(backup.unwrap().path()).unwrap();
+        }
+        fs::remove_dir(&backup_directory).unwrap();
+        fs::write(&backup_directory, b"not-a-directory").unwrap();
         assert!(matches!(
             store.unlock(master_password),
             Err(VaultError::PasswordOnlyMigrationFailed)
@@ -2418,6 +3013,57 @@ mod tests {
         let (_, unchanged_data) = decrypt_envelope(master_password, &unchanged).unwrap();
         assert!(!unchanged_data.password_only_unlock);
         assert_eq!(unchanged.generation, legacy_envelope.generation);
+    }
+
+    #[test]
+    fn manual_export_never_overwrites_an_existing_file_or_enters_managed_backups() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vault.cnvault");
+        let mut store = VaultStore::new(path);
+        store
+            .create("exclusive export passphrase long enough")
+            .unwrap();
+        let target = directory.path().join("manual.cnvault");
+        fs::write(&target, b"existing backup bytes").unwrap();
+        assert!(matches!(
+            store.export_to(&target),
+            Err(VaultError::InvalidInput(_))
+        ));
+        assert_eq!(fs::read(&target).unwrap(), b"existing backup bytes");
+
+        let managed_target = directory.path().join("backups").join("my-backup.cnvault");
+        assert!(matches!(
+            store.export_to(&managed_target),
+            Err(VaultError::InvalidInput(_))
+        ));
+        assert!(!managed_target.exists());
+    }
+
+    #[test]
+    fn successful_manual_export_is_not_reported_failed_when_timestamp_update_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vault.cnvault");
+        let password = "export timestamp passphrase long enough";
+        let mut store = VaultStore::new(path);
+        store.create(password).unwrap();
+        let backup_directory = directory.path().join("backups");
+        for backup in fs::read_dir(&backup_directory).unwrap() {
+            fs::remove_file(backup.unwrap().path()).unwrap();
+        }
+        fs::remove_dir(&backup_directory).unwrap();
+        fs::write(&backup_directory, b"directory unavailable").unwrap();
+
+        let target = directory.path().join("manual.cnvault");
+        store.export_to(&target).unwrap();
+        let (_, restored) = decrypt_envelope(password, &read_envelope(&target).unwrap()).unwrap();
+        assert!(restored.last_backup_at.is_none());
+        assert!(store
+            .overview()
+            .unwrap()
+            .auto_backup
+            .warning
+            .unwrap()
+            .contains("已导出"));
     }
 
     #[test]
@@ -2583,6 +3229,10 @@ mod tests {
         .unwrap();
 
         store
+            .save_entry(sample_entry_input(None, None, "newer than restore point"))
+            .unwrap();
+
+        store
             .replace_with_verified_backup(envelope, backup_root_key, backup_data)
             .unwrap();
         assert!(!store.sync_state_path.exists());
@@ -2590,6 +3240,221 @@ mod tests {
         assert!(!store.sync_restore_hold_path.exists());
         assert!(!store.sync_restore_next_hold_path.exists());
         assert!(!store.webdav_sync_status().unwrap().configured);
+    }
+
+    #[test]
+    fn staged_sync_checkpoint_is_promoted_only_after_vault_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vault.cnvault");
+        let password = "checkpoint crash recovery passphrase";
+        let mut store = VaultStore::new(path.clone());
+        store.create(password).unwrap();
+        let vault = store.unlocked.as_ref().unwrap();
+        let old_data = vault.data.clone();
+        let vault_id = old_data.vault_id.clone();
+        let root_key = Zeroizing::new(*vault.root_key);
+        let old_state = test_sync_state(&old_data, old_data.generation);
+        sync::write_local_sync_state(&store.sync_state_path, &vault_id, &root_key, &old_state)
+            .unwrap();
+
+        let mut next_data = old_data.clone();
+        let entry = store
+            .save_entry(sample_entry_input(None, None, "staged remote record"))
+            .unwrap();
+        // Return the encrypted vault to the original generation while keeping
+        // the staged candidate; this is the interrupted pre-write phase.
+        let old_envelope =
+            update_payload(&read_envelope(&path).unwrap(), &root_key, &old_data).unwrap();
+        write_envelope_atomic(&path, &old_envelope).unwrap();
+        next_data.entries = vec![store.get_entry(&entry.id).unwrap()];
+        next_data.generation = old_data.generation + 1;
+        let mut next_state_value = serde_json::to_value(&old_state).unwrap();
+        next_state_value["lastLocalGeneration"] = serde_json::json!(next_data.generation);
+        next_state_value["baseSnapshot"]["entries"] =
+            serde_json::to_value(&next_data.entries).unwrap();
+        next_state_value["checkpointHash"] = serde_json::json!("b".repeat(64));
+        let next_state: LocalSyncState = serde_json::from_value(next_state_value).unwrap();
+        sync::write_local_sync_state(
+            &store.sync_transition_path,
+            &vault_id,
+            &root_key,
+            &next_state,
+        )
+        .unwrap();
+        drop(store);
+
+        let mut reopened = VaultStore::new(path.clone());
+        reopened.unlock(password).unwrap();
+        assert_eq!(
+            reopened
+                .load_sync_state()
+                .unwrap()
+                .unwrap()
+                .last_local_generation(),
+            old_data.generation
+        );
+        assert!(!reopened.sync_transition_path.exists());
+
+        // The vault write completed, but the active sidecar did not. Reopen
+        // must retain the newer checkpoint instead of discarding `.sync.next`.
+        let next_envelope = update_payload(&old_envelope, &root_key, &next_data).unwrap();
+        sync::write_local_sync_state(
+            &reopened.sync_transition_path,
+            &vault_id,
+            &root_key,
+            &next_state,
+        )
+        .unwrap();
+        write_envelope_atomic(&path, &next_envelope).unwrap();
+        drop(reopened);
+        let mut after_commit = VaultStore::new(path);
+        after_commit.unlock(password).unwrap();
+        assert_eq!(
+            after_commit
+                .load_sync_state()
+                .unwrap()
+                .unwrap()
+                .last_local_generation(),
+            next_data.generation
+        );
+        assert!(!after_commit.sync_transition_path.exists());
+    }
+
+    #[test]
+    fn interrupted_restore_recovers_held_sync_state_before_vault_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vault.cnvault");
+        let password = "restore hold recovery passphrase";
+        let mut store = VaultStore::new(path.clone());
+        store.create(password).unwrap();
+        let vault = store.unlocked.as_ref().unwrap();
+        let old_data = vault.data.clone();
+        let root_key = Zeroizing::new(*vault.root_key);
+        let state = test_sync_state(&old_data, old_data.generation);
+        sync::write_local_sync_state(
+            &store.sync_state_path,
+            &old_data.vault_id,
+            &root_key,
+            &state,
+        )
+        .unwrap();
+        let mut restored_data = old_data.clone();
+        bump_generation(&mut restored_data, now_ms());
+        let target = update_payload(&vault.envelope, &root_key, &restored_data).unwrap();
+        store.begin_restore_intent(&target).unwrap();
+        store.hold_sync_sidecars_for_restore().unwrap();
+        drop(store);
+
+        let mut reopened = VaultStore::new(path.clone());
+        assert!(reopened.status().0.exists);
+        reopened.unlock(password).unwrap();
+        assert!(reopened.webdav_sync_status().unwrap().configured);
+        assert!(!reopened.restore_intent_path.exists());
+        assert!(!reopened.sync_restore_hold_path.exists());
+
+        reopened.begin_restore_intent(&target).unwrap();
+        reopened.hold_sync_sidecars_for_restore().unwrap();
+        write_envelope_atomic(&path, &target).unwrap();
+        drop(reopened);
+        let mut after_commit = VaultStore::new(path);
+        after_commit.unlock(password).unwrap();
+        assert!(!after_commit.webdav_sync_status().unwrap().configured);
+        assert!(!after_commit.restore_intent_path.exists());
+        assert!(!after_commit.sync_restore_hold_path.exists());
+    }
+
+    #[test]
+    fn restoring_the_identical_vault_keeps_existing_sync_configuration() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vault.cnvault");
+        let password = "identical restore passphrase";
+        let mut store = VaultStore::new(path.clone());
+        store.create(password).unwrap();
+        let envelope = read_envelope(&path).unwrap();
+        let (root_key, data) = decrypt_envelope(password, &envelope).unwrap();
+        let state = test_sync_state(&data, data.generation);
+        sync::write_local_sync_state(&store.sync_state_path, &data.vault_id, &root_key, &state)
+            .unwrap();
+        assert!(store
+            .replace_with_verified_backup(envelope, root_key, data)
+            .is_err());
+        assert!(store.sync_state_path.exists());
+        assert!(!store.restore_intent_path.exists());
+        assert!(store.webdav_sync_status().unwrap().configured);
+    }
+
+    #[test]
+    fn interrupted_restore_returns_quarantined_vault_before_create_gate() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vault.cnvault");
+        let password = "quarantine interruption passphrase";
+        let mut store = VaultStore::new(path.clone());
+        store.create(password).unwrap();
+        let target = read_envelope(&path).unwrap();
+        let corrupt_bytes = b"corrupt existing encrypted vault";
+        fs::write(&path, corrupt_bytes).unwrap();
+        let intent = store.begin_restore_intent(&target).unwrap();
+        store.hold_sync_sidecars_for_restore().unwrap();
+        store
+            .quarantine_invalid_current(&intent.quarantine_id)
+            .unwrap();
+        assert!(!path.exists());
+        drop(store);
+
+        let mut reopened = VaultStore::new(path.clone());
+        assert!(reopened.status().0.exists);
+        assert_eq!(fs::read(&path).unwrap(), corrupt_bytes);
+        assert!(!reopened.restore_intent_path.exists());
+        assert!(reopened.create(password).is_err());
+    }
+
+    #[test]
+    fn malformed_restore_intent_blocks_unlock_with_recovery_guidance() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vault.cnvault");
+        let password = "malformed restore intent passphrase";
+        let mut store = VaultStore::new(path.clone());
+        store.create(password).unwrap();
+        fs::write(&store.restore_intent_path, b"not a restore transaction").unwrap();
+        let mut reopened = VaultStore::new(path);
+        assert!(reopened.status().0.exists);
+        assert!(matches!(
+            reopened.unlock(password),
+            Err(VaultError::RestoreRecoveryFailed)
+        ));
+    }
+
+    #[test]
+    fn legacy_orphaned_sync_hold_does_not_block_local_vault_access() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vault.cnvault");
+        let password = "legacy hold access passphrase";
+        let mut store = VaultStore::new(path.clone());
+        store.create(password).unwrap();
+        let entry = store
+            .save_entry(sample_entry_input(None, None, "recoverable local entry"))
+            .unwrap();
+        let vault = store.unlocked.as_ref().unwrap();
+        let state = test_sync_state(&vault.data, vault.data.generation);
+        sync::write_local_sync_state(
+            &store.sync_state_path,
+            &vault.data.vault_id,
+            &vault.root_key,
+            &state,
+        )
+        .unwrap();
+        fs::rename(&store.sync_state_path, &store.sync_restore_hold_path).unwrap();
+        drop(store);
+
+        let mut reopened = VaultStore::new(path);
+        assert!(reopened.status().0.exists);
+        reopened.unlock(password).unwrap();
+        assert_eq!(
+            reopened.get_entry(&entry.id).unwrap().title,
+            "recoverable local entry"
+        );
+        assert!(reopened.webdav_sync_status().is_err());
+        assert!(reopened.sync_restore_hold_path.exists());
     }
 
     #[test]

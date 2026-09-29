@@ -34,6 +34,8 @@ describe("entry save error presentation", () => {
 
   it("distinguishes a failed password-only migration without exposing unknown errors", () => {
     expect(describeUnlockFailure("保险库安全升级未完成。")).toContain("保险库升级未完成");
+    expect(describeUnlockFailure("检测到未完成的保险库恢复，无法自动确认磁盘状态。请保留应用数据目录并检查备份后再继续。"))
+      .toContain("请保留应用数据目录和备份文件");
     expect(describeUnlockFailure(new Error("failed to write /private/vault.cnvault"))).toBe(
       "无法解锁保险库，请检查主密码或保险库文件是否正确。",
     );

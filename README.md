@@ -5,7 +5,7 @@
 <p align="center"><strong>本地优先的加密密码库</strong><br>安全保存密码 · 加密备份 · 按需同步</p>
 
 <p align="center">
-  <a href="https://github.com/qianshulab/CipherNest/releases/tag/v0.3.3"><img src="https://img.shields.io/badge/release-v0.3.3%20beta-ff791c?style=flat-square&amp;labelColor=1b2029" alt="下载 v0.3.3 beta"></a>
+  <a href="https://github.com/qianshulab/CipherNest/releases/tag/v0.3.4"><img src="https://img.shields.io/badge/release-v0.3.4%20beta-ff791c?style=flat-square&amp;labelColor=1b2029" alt="下载 v0.3.4 beta"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-ff791c?style=flat-square&amp;labelColor=1b2029" alt="MIT 许可证"></a>
 </p>
 
@@ -32,7 +32,7 @@ CipherNest 是一款面向 Windows、macOS 和 Linux 的密码管理器。账号
     <td width="33%" valign="top">
       <img src="docs/images/readme/backup.svg" alt="" width="40" height="40"><br>
       <strong>加密备份</strong><br>
-      导出独立的加密文件，用于迁移与恢复。
+      本机自动快照与手动导出，支持迁移和恢复。
     </td>
     <td width="33%" valign="top">
       <img src="docs/images/readme/sync.svg" alt="" width="40" height="40"><br>
@@ -60,7 +60,7 @@ CipherNest 是一款面向 Windows、macOS 和 Linux 的密码管理器。账号
 
 1. 启动应用，设置至少 12 个字符的主密码。建议使用独有的长口令，并妥善保管。
 2. 添加密码条目，或使用内置生成器创建密码。
-3. 从设置中导出加密备份，将副本保存到另一块磁盘或离线介质。
+3. 每次成功保存后，应用会在本机保留加密快照。另从设置中导出加密备份，将副本保存到另一块磁盘或离线介质。
 4. 如需跨设备使用，在各设备上配置 [WebDAV 同步](docs/WEBDAV.md)。
 
 CipherNest 不提供主密码重置服务。请妥善保存用于解锁保险库和各份加密备份的主密码。
@@ -78,7 +78,9 @@ CipherNest 不提供主密码重置服务。请妥善保存用于解锁保险库
 > [!IMPORTANT]
 > 升级前先导出一份加密备份，退出旧版应用，然后安装新版。安装后使用原主密码解锁，核对条目和同步设置。卸载时若系统提供清除应用数据的选项，请保留应用数据。
 
-`vault.cnvault` 是本地保险库；`backups/` 保存本地加密快照。配置 WebDAV 后，`vault.cnvault.sync` 保存本机加密同步配置。应用导出的 `.cnvault` **不包含**该同步配置；迁移设备时还需保管同步恢复码和 WebDAV 凭据。
+`vault.cnvault` 是本地保险库；`backups/` 保存本机自动加密快照。快照只覆盖已保存的数据，保存在同一应用数据目录中，不能代替异盘或离线备份。手动导出的 `.cnvault` 文件可保存到用户选择的位置；已有目标文件不会被覆盖。备份策略、冲突保护和恢复步骤见[备份与恢复](docs/BACKUPS.md)。
+
+配置 WebDAV 后，`vault.cnvault.sync` 保存本机加密同步配置。加密备份**不包含**该同步配置；迁移设备时还需保管同步恢复码和 WebDAV 凭据。
 
 从 v0.3.1 或更早版本升级时，首次解锁会完成 v0.3.2 引入的密钥迁移。迁移后不要再用旧版程序打开同一保险库。已导出的旧备份仍使用导出时的主密码。
 

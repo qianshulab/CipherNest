@@ -35,7 +35,7 @@ use crate::{
         WebDavJoinInput, WebDavJoinMode, WebDavRecoveryCode, WebDavRemotePreview,
         WebDavSyncOutcome, WebDavSyncOutcomeKind, WebDavSyncStatus,
     },
-    sync::{self, SyncError, WebDavClient},
+    sync::{self, SyncContent, SyncError, WebDavClient},
     vault::{now_ms, sync_contents_equal, ExistingSyncContext, VaultStore},
 };
 
@@ -67,6 +67,7 @@ struct PendingRestore {
     file_name: String,
     envelope: VaultEnvelope,
     verified: Option<VerifiedRestore>,
+    target_fingerprint: Option<[u8; 32]>,
 }
 
 fn prepare_verified_restore(
@@ -113,6 +114,7 @@ struct PendingSyncPreview {
     sequence: u64,
     vault_id: String,
     session_id: String,
+    local_generation: u64,
 }
 
 struct SyncOperationGuard {
@@ -282,9 +284,16 @@ pub async fn save_entry(
 }
 
 #[tauri::command]
-pub async fn delete_entry(state: State<'_, AppState>, id: String) -> VaultResult<()> {
+pub async fn delete_entry(
+    state: State<'_, AppState>,
+    id: String,
+    expected_revision: u64,
+) -> VaultResult<()> {
     let store = Arc::clone(&state.store);
-    run_store(store, move |store| store.delete_entry(&id)).await
+    run_store(store, move |store| {
+        store.delete_entry(&id, expected_revision)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -292,9 +301,13 @@ pub async fn set_favorite(
     state: State<'_, AppState>,
     id: String,
     favorite: bool,
+    expected_revision: u64,
 ) -> VaultResult<u64> {
     let store = Arc::clone(&state.store);
-    run_store(store, move |store| store.set_favorite(&id, favorite)).await
+    run_store(store, move |store| {
+        store.set_favorite(&id, favorite, expected_revision)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -398,6 +411,8 @@ pub async fn inspect_webdav_sync(
     require_sync_epoch(&state.sync_cancel_epoch, authorized_epoch)?;
     require_cursor_checkpoint(&cursor, true)?;
     require_state_matches_client(&client, &joined_state)?;
+    let local_has_history =
+        !context.content.entries.is_empty() || !context.content.tombstones.is_empty();
     let preview_token = Uuid::new_v4().to_string();
     replace_pending_sync_preview(
         &state.pending_sync_preview,
@@ -411,6 +426,7 @@ pub async fn inspect_webdav_sync(
             sequence: cursor.snapshot().sequence(),
             vault_id: context.vault_id,
             session_id: context.session_id,
+            local_generation: context.generation,
         },
     )?;
     Ok(WebDavRemotePreview {
@@ -420,6 +436,7 @@ pub async fn inspect_webdav_sync(
         sequence: cursor.snapshot().sequence(),
         sync_id_short: joined_state.sync_id().chars().take(8).collect(),
         checkpoint_trusted: false,
+        local_has_history,
     })
 }
 
@@ -438,9 +455,11 @@ pub async fn join_webdav_sync(
         || pending.username != client.username()
         || pending.vault_id != context.vault_id
         || pending.session_id != context.session_id
+        || pending.local_generation != context.generation
     {
         return Err(VaultError::PendingSyncPreviewUnavailable);
     }
+    require_join_replace_confirmation(&context.content, request.mode, request.confirm_replace)?;
     let recovery_code = Zeroizing::new(std::mem::take(&mut request.recovery_code));
     let device_id = Uuid::new_v4().to_string();
     let timestamp = now_ms();
@@ -823,12 +842,18 @@ pub async fn select_backup_for_restore(
     // Starting a new selection invalidates any previously verified plaintext and root key.
     clear_pending_restore_state(&state.pending_restore)?;
     clear_pending_sync_preview_state(&state.pending_sync_preview)?;
-    let selected = app
+    let mut picker = app
         .dialog()
         .file()
         .set_title("选择要恢复的加密备份")
-        .add_filter("CipherNest 加密保险库", &["cnvault"])
-        .blocking_pick_file();
+        .add_filter("CipherNest 加密保险库", &["cnvault"]);
+    if let Ok(app_data) = app.path().app_data_dir() {
+        let automatic_backups = app_data.join("backups");
+        if automatic_backups.is_dir() {
+            picker = picker.set_directory(automatic_backups);
+        }
+    }
+    let selected = picker.blocking_pick_file();
     let Some(selected) = selected else {
         return Ok(None);
     };
@@ -847,6 +872,7 @@ pub async fn select_backup_for_restore(
         file_name: file_name.clone(),
         envelope,
         verified: None,
+        target_fingerprint: None,
     };
     replace_pending_restore(&state.pending_restore, pending)?;
     Ok(Some(RestoreSelection {
@@ -895,11 +921,23 @@ pub async fn inspect_selected_backup(
         generation: prepared.source_generation,
         vault_id_short: canonical_vault_id[..8].to_string(),
     };
+    let target_fingerprint = match run_store(Arc::clone(&state.store), |store| {
+        store.restore_target_fingerprint()
+    })
+    .await
+    {
+        Ok(fingerprint) => fingerprint,
+        Err(error) => {
+            clear_pending_restore_if_token(&state.pending_restore, &token)?;
+            return Err(error);
+        }
+    };
     commit_verified_restore(
         &state.pending_restore,
         &token,
         prepared.envelope,
         prepared.verified,
+        target_fingerprint,
     )?;
     Ok(preview)
 }
@@ -939,6 +977,7 @@ pub async fn apply_selected_backup(
         let mut store = store.lock().map_err(|_| VaultError::StateUnavailable)?;
         drop(pending_guard);
 
+        ensure_restore_target_unchanged(&store, pending.target_fingerprint)?;
         store.replace_with_verified_backup(pending.envelope, verified.root_key, verified.data)?;
         Ok(store.status().0)
     })
@@ -1241,6 +1280,7 @@ fn commit_verified_restore(
     token: &str,
     envelope: VaultEnvelope,
     verified: VerifiedRestore,
+    target_fingerprint: Option<[u8; 32]>,
 ) -> VaultResult<()> {
     let mut pending = pending_restore
         .lock()
@@ -1255,7 +1295,34 @@ fn commit_verified_restore(
         .ok_or(VaultError::PendingRestoreUnavailable)?;
     current.envelope = envelope;
     current.verified = Some(verified);
+    current.target_fingerprint = target_fingerprint;
     Ok(())
+}
+
+fn ensure_restore_target_unchanged(
+    store: &VaultStore,
+    expected: Option<[u8; 32]>,
+) -> VaultResult<()> {
+    if store.restore_target_fingerprint()? == expected {
+        Ok(())
+    } else {
+        Err(VaultError::RestoreTargetChanged)
+    }
+}
+
+fn require_join_replace_confirmation(
+    local: &SyncContent,
+    mode: WebDavJoinMode,
+    confirmed: bool,
+) -> VaultResult<()> {
+    let local_has_history = !local.entries.is_empty() || !local.tombstones.is_empty();
+    if matches!(mode, WebDavJoinMode::Remote) && local_has_history && !confirmed {
+        Err(VaultError::InvalidInput(
+            "本机已有条目或删除记录，请明确确认以远端替换本机".into(),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1377,6 +1444,7 @@ mod tests {
             file_name: "backup.cnvault".into(),
             envelope: test_envelope(&vault_id),
             verified: None,
+            target_fingerprint: None,
         }
     }
 
@@ -1391,6 +1459,7 @@ mod tests {
             sequence: 7,
             vault_id: Uuid::new_v4().to_string(),
             session_id: Uuid::new_v4().to_string(),
+            local_generation: 7,
         }
     }
 
@@ -1408,7 +1477,7 @@ mod tests {
             root_key: Zeroizing::new([7_u8; 32]),
             data: test_data(&envelope.vault_id),
         };
-        commit_verified_restore(&pending, "current-token", envelope, verified).unwrap();
+        commit_verified_restore(&pending, "current-token", envelope, verified, None).unwrap();
 
         let consumed = take_pending_restore(&pending, "current-token").unwrap();
         assert!(consumed.verified.is_some());
@@ -1424,6 +1493,55 @@ mod tests {
             Err(VaultError::PendingRestoreUnavailable)
         ));
         assert!(pending.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn restore_confirmation_rejects_a_target_changed_after_preview() {
+        let directory = tempfile::tempdir().unwrap();
+        let vault_path = directory.path().join("vault.cnvault");
+        let mut store = VaultStore::new(vault_path.clone());
+        let absent_at_preview = store.restore_target_fingerprint().unwrap();
+        assert!(absent_at_preview.is_none());
+
+        store
+            .create("restore conflict passphrase long enough")
+            .unwrap();
+        assert!(matches!(
+            ensure_restore_target_unchanged(&store, absent_at_preview),
+            Err(VaultError::RestoreTargetChanged)
+        ));
+
+        let current_at_preview = store.restore_target_fingerprint().unwrap();
+        ensure_restore_target_unchanged(&store, current_at_preview).unwrap();
+        fs::write(&vault_path, b"changed by another process").unwrap();
+        assert!(matches!(
+            ensure_restore_target_unchanged(&store, current_at_preview),
+            Err(VaultError::RestoreTargetChanged)
+        ));
+    }
+
+    #[test]
+    fn join_requires_explicit_replace_when_local_deletions_exist() {
+        let empty = SyncContent {
+            entries: Vec::new(),
+            tombstones: Vec::new(),
+        };
+        require_join_replace_confirmation(&empty, WebDavJoinMode::Remote, false).unwrap();
+
+        let deleted = SyncContent {
+            entries: Vec::new(),
+            tombstones: vec![crate::models::Tombstone {
+                id: Uuid::new_v4().to_string(),
+                revision: 2,
+                deleted_at: 1,
+            }],
+        };
+        assert!(matches!(
+            require_join_replace_confirmation(&deleted, WebDavJoinMode::Remote, false),
+            Err(VaultError::InvalidInput(_))
+        ));
+        require_join_replace_confirmation(&deleted, WebDavJoinMode::Remote, true).unwrap();
+        require_join_replace_confirmation(&deleted, WebDavJoinMode::Merge, false).unwrap();
     }
 
     #[test]
@@ -1460,12 +1578,14 @@ mod tests {
             file_name: "legacy.cnvault".into(),
             envelope: legacy_envelope,
             verified: None,
+            target_fingerprint: None,
         })));
         commit_verified_restore(
             &pending,
             "restore-token",
             migrated_envelope.clone(),
             verified,
+            None,
         )
         .unwrap();
         let pending = take_pending_restore(&pending, "restore-token").unwrap();

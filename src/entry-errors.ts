@@ -21,6 +21,8 @@ const GENERIC_SAVE_FAILURE = "无法保存条目。现有保险库内容未被�
 const GENERIC_UNLOCK_FAILURE = "无法解锁保险库，请检查主密码或保险库文件是否正确。";
 const MIGRATION_WRITE_FAILURE =
   "保险库升级未完成，未交付解锁会话；保险库仍保持加密。请检查可用空间和应用数据目录权限，然后重新输入主密码。";
+const RESTORE_RECOVERY_FAILURE =
+  "检测到未完成的恢复，应用无法确认磁盘状态。请保留应用数据目录和备份文件，检查磁盘空间及文件权限后再重试。";
 
 export function describeEntrySaveFailure(error: unknown): EntrySaveFailure {
   const raw = readableErrorText(error);
@@ -42,9 +44,12 @@ export function describeEntrySaveFailure(error: unknown): EntrySaveFailure {
 }
 
 export function describeUnlockFailure(error: unknown): string {
-  return readableErrorText(error) === "保险库安全升级未完成。"
-    ? MIGRATION_WRITE_FAILURE
-    : GENERIC_UNLOCK_FAILURE;
+  const raw = readableErrorText(error);
+  if (raw === "保险库安全升级未完成。") return MIGRATION_WRITE_FAILURE;
+  if (raw === "检测到未完成的保险库恢复，无法自动确认磁盘状态。请保留应用数据目录并检查备份后再继续。") {
+    return RESTORE_RECOVERY_FAILURE;
+  }
+  return GENERIC_UNLOCK_FAILURE;
 }
 
 function readableErrorText(error: unknown): string | null {
