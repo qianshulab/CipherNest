@@ -1533,7 +1533,7 @@ impl VaultStore {
                     self.backup_inspections.clear();
                 }
                 self.backup_inspections.insert(
-                    path,
+                    path.clone(),
                     BackupInspection {
                         len: metadata.len(),
                         modified,
@@ -1558,7 +1558,10 @@ impl VaultStore {
                 && digest == expected_digest
                 && metadata.len() == expected_bytes.len() as u64
             {
-                status.current_covered = true;
+                match backup_file_matches(&path, &expected_bytes) {
+                    Ok(true) => status.current_covered = true,
+                    Ok(false) | Err(_) => status.inspection_failed = true,
+                }
             }
         }
         if status.inspection_failed {
@@ -2759,6 +2762,29 @@ mod tests {
         assert!(!status.current_covered);
         assert!(status.inspection_failed);
         assert!(status.warning.is_some());
+    }
+
+    #[test]
+    fn current_snapshot_is_checked_even_when_cached_metadata_looks_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vault.cnvault");
+        let mut store = VaultStore::new(path.clone());
+        store.create("snapshot metadata cache passphrase").unwrap();
+        assert!(store.overview().unwrap().auto_backup.current_covered);
+        let envelope = read_envelope(&path).unwrap();
+        let backup_path = directory
+            .path()
+            .join("backups")
+            .join(automatic_backup_name(&envelope).unwrap());
+        let length = fs::metadata(&backup_path).unwrap().len() as usize;
+        fs::write(&backup_path, vec![b'X'; length]).unwrap();
+        let altered_metadata = fs::metadata(&backup_path).unwrap();
+        let cached = store.backup_inspections.get_mut(&backup_path).unwrap();
+        cached.len = altered_metadata.len();
+        cached.modified = altered_metadata.modified().unwrap();
+        let status = store.overview().unwrap().auto_backup;
+        assert!(!status.current_covered);
+        assert!(status.inspection_failed);
     }
 
     #[test]
