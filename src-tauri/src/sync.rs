@@ -413,6 +413,12 @@ impl WebDavClient {
                 return Err(SyncError::UnsafeServer);
             }
 
+            // A broken intermediary may report 412 while still forwarding a
+            // write to the origin.  Do not trust the status alone: the exact
+            // object and its compare-and-swap token must still be unchanged.
+            let unchanged = self.get_resource(&probe_name, MAX_HEAD_BYTES).await?;
+            verify_rejected_probe_writes(unchanged.as_ref(), &first, &first_etag)?;
+
             let update = self
                 .put_resource(&probe_name, &second, Some((IF_MATCH, first_etag.as_str())))
                 .await?;
@@ -953,7 +959,9 @@ impl WebDavClient {
         self.client
             .request(method, url)
             .basic_auth(&self.username, Some(self.app_password.as_str()))
-            .header(CACHE_CONTROL, "no-store")
+            // A cached head can make a download look up to date. Force caches
+            // to revalidate reads as well as avoid storing vault traffic.
+            .header(CACHE_CONTROL, "no-cache, no-store")
             .header(ACCEPT_ENCODING, "identity")
     }
 
@@ -1031,6 +1039,20 @@ impl WebDavClient {
 struct FetchedSnapshot {
     hash: String,
     snapshot: SyncSnapshot,
+}
+
+fn verify_rejected_probe_writes(
+    fetched: Option<&RemoteResource>,
+    expected_bytes: &[u8],
+    expected_etag: &str,
+) -> SyncResult<()> {
+    let fetched = fetched.ok_or(SyncError::UnsafeServer)?;
+    if fetched.bytes.as_slice() != expected_bytes
+        || require_strong_etag(fetched.etag.as_deref())? != expected_etag
+    {
+        return Err(SyncError::UnsafeServer);
+    }
+    Ok(())
 }
 
 struct CheckpointLink {
@@ -2329,6 +2351,45 @@ mod tests {
             "password".into()
         )
         .is_err());
+    }
+
+    #[test]
+    fn rejected_conditional_writes_must_leave_probe_and_etag_unchanged() {
+        let expected = [7_u8; 32];
+        let original = RemoteResource {
+            bytes: expected.to_vec(),
+            etag: Some("\"probe-v1\"".into()),
+        };
+        assert!(verify_rejected_probe_writes(Some(&original), &expected, "\"probe-v1\"").is_ok());
+        assert!(matches!(
+            verify_rejected_probe_writes(None, &expected, "\"probe-v1\""),
+            Err(SyncError::UnsafeServer)
+        ));
+
+        let changed_body = RemoteResource {
+            bytes: vec![8_u8; 32],
+            etag: Some("\"probe-v1\"".into()),
+        };
+        assert!(matches!(
+            verify_rejected_probe_writes(Some(&changed_body), &expected, "\"probe-v1\""),
+            Err(SyncError::UnsafeServer)
+        ));
+        let changed_etag = RemoteResource {
+            bytes: expected.to_vec(),
+            etag: Some("\"probe-v2\"".into()),
+        };
+        assert!(matches!(
+            verify_rejected_probe_writes(Some(&changed_etag), &expected, "\"probe-v1\""),
+            Err(SyncError::UnsafeServer)
+        ));
+        let weak_etag = RemoteResource {
+            bytes: expected.to_vec(),
+            etag: Some("W/\"probe-v1\"".into()),
+        };
+        assert!(matches!(
+            verify_rejected_probe_writes(Some(&weak_etag), &expected, "\"probe-v1\""),
+            Err(SyncError::UnsafeServer)
+        ));
     }
 
     #[test]

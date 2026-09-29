@@ -1362,6 +1362,11 @@ function renderEntryEditor(): HTMLElement {
     if (state.draft) state.draft.notes = notes.value;
     setOptionalActionAvailable(copyNotes, Boolean(notes.value));
     clearFieldError("entry-notes");
+    if (revealedNotesInput === notes) scheduleNotesHide();
+  });
+  notes.addEventListener("blur", (event) => {
+    // Let the reveal button handle its own click; hide when editing moves elsewhere.
+    if (event.relatedTarget !== revealNotesButton && revealedNotesInput === notes) hideNotes();
   });
   const notesError = makeElement("p", "field-error");
   notesError.id = "entry-notes-error";
@@ -1512,10 +1517,15 @@ function revealNotes(input: HTMLTextAreaElement, button: HTMLButtonElement): voi
   button.setAttribute("aria-label", "隐藏备注");
   button.setAttribute("aria-pressed", "true");
   button.title = "隐藏备注";
-  const seconds = Math.max(1, state.settings.passwordRevealSeconds || DEFAULT_SETTINGS.passwordRevealSeconds);
-  notesRevealTimeout = window.setTimeout(hideNotes, seconds * 1000);
+  scheduleNotesHide();
   input.focus();
   input.setSelectionRange(input.value.length, input.value.length);
+}
+
+function scheduleNotesHide(): void {
+  if (notesRevealTimeout) window.clearTimeout(notesRevealTimeout);
+  const seconds = Math.max(1, state.settings.passwordRevealSeconds || DEFAULT_SETTINGS.passwordRevealSeconds);
+  notesRevealTimeout = window.setTimeout(hideNotes, seconds * 1000);
 }
 
 function hideNotes(): void {
@@ -2879,11 +2889,14 @@ async function copySecret(secret: string, label = "密码"): Promise<void> {
     showToast(`没有可复制的${label}。`, "warning");
     return;
   }
+  const epoch = state.epoch;
   try {
     await invokeCommand<void>("copy_secret", { secret });
+    if (epoch !== state.epoch || !state.status.unlocked) return;
     startClipboardTimer(state.settings.clipboardClearSeconds);
     showToast(`${label}已复制，将在 ${state.settings.clipboardClearSeconds} 秒后清除。`, "success");
   } catch {
+    if (epoch !== state.epoch || !state.status.unlocked) return;
     showToast(`无法复制${label}到系统剪贴板。`, "error");
   }
 }

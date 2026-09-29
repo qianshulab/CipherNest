@@ -32,6 +32,8 @@ pub enum VaultError {
     PendingRestoreNotVerified,
     #[error("无法安全保存保险库。")]
     SaveFailed,
+    #[error("保险库文件在当前会话期间发生变化。已停止写入；请锁定后重新解锁，检查数据后重试。")]
+    VaultChangedOnDisk,
     #[error("保险库安全升级未完成。")]
     PasswordOnlyMigrationFailed,
     #[error("系统剪贴板不可用。")]

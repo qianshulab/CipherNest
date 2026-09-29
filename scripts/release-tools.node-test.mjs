@@ -47,6 +47,9 @@ test("recognizes the three expected executable architectures", (context) => {
   pe.writeUInt32LE(0x80, 0x3c);
   pe.writeUInt32LE(0x00004550, 0x80);
   pe.writeUInt16LE(0x8664, 0x84);
+  pe.writeUInt16LE(0xf0, 0x94);
+  pe.writeUInt16LE(0x20b, 0x98);
+  pe.writeUInt16LE(2, 0x98 + 68);
   const pePath = join(fixtureRoot, "ciphernest.exe");
   writeFixture(pePath, pe);
 
@@ -64,6 +67,11 @@ test("recognizes the three expected executable architectures", (context) => {
     run(["verify-binary", "--target", "x86_64-pc-windows-msvc", "--path", pePath]).status,
     0,
   );
+  pe.writeUInt16LE(3, 0x98 + 68);
+  writeFixture(pePath, pe);
+  const consoleBinary = run(["verify-binary", "--target", "x86_64-pc-windows-msvc", "--path", pePath]);
+  assert.notEqual(consoleBinary.status, 0);
+  assert.match(consoleBinary.stderr, /not a Windows GUI executable/);
   assert.equal(
     run(["verify-binary", "--target", "x86_64-unknown-linux-gnu", "--path", elfPath]).status,
     0,

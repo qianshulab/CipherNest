@@ -745,22 +745,26 @@ pub async fn copy_secret(
         return Err(VaultError::InvalidInput("复制内容长度无效".into()));
     }
     let store = Arc::clone(&state.store);
-    let ttl = run_store(store, VaultStore::prepare_sensitive_action).await?;
     let clipboard = Arc::clone(&state.clipboard);
     let token = Uuid::new_v4().to_string();
     let timer_token = token.clone();
-    let digest: [u8; 32] = Sha256::digest(secret.as_bytes()).into();
     let app_for_write = app.clone();
 
-    tauri::async_runtime::spawn_blocking(move || {
+    let ttl = tauri::async_runtime::spawn_blocking(move || {
         let secret = Zeroizing::new(secret);
+        // Keep the vault lock until the write is complete. Otherwise an explicit or
+        // lifecycle lock can clear the clipboard between the authorization check and
+        // this write, leaving a newly copied secret behind in a locked session.
+        let mut store = store.lock().map_err(|_| VaultError::StateUnavailable)?;
+        let ttl = store.prepare_sensitive_action()?;
         let mut lease = clipboard.lock().map_err(|_| VaultError::Clipboard)?;
         app_for_write
             .clipboard()
             .write_text(secret.as_str())
             .map_err(|_| VaultError::Clipboard)?;
+        let digest: [u8; 32] = Sha256::digest(secret.as_bytes()).into();
         *lease = Some(ClipboardLease { token, digest });
-        Ok::<(), VaultError>(())
+        Ok::<u32, VaultError>(ttl)
     })
     .await
     .map_err(|_| VaultError::Clipboard)??;

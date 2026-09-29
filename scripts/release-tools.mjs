@@ -108,6 +108,11 @@ function readProjectVersion() {
   const tauriConfig = JSON.parse(
     readFileSync(join(repositoryRoot, "src-tauri", "tauri.conf.json"), "utf8"),
   );
+  // Changing this identifier moves app_data_dir and makes an existing vault
+  // appear missing. A new identifier needs an explicit, tested migration.
+  if (tauriConfig.identifier !== "com.ciphernest.vault") {
+    fail("Tauri identifier changed; add and verify a vault data migration before release");
+  }
   const cargoVersion = packageVersionFromCargo(
     readFileSync(join(repositoryRoot, "src-tauri", "Cargo.toml"), "utf8"),
   );
@@ -161,11 +166,24 @@ function verifyBinary(options) {
       fail(`${binaryPath} is not a PE executable`);
     }
     const peOffset = bytes.readUInt32LE(0x3c);
-    if (peOffset + 6 > bytes.length || bytes.readUInt32LE(peOffset) !== 0x00004550) {
+    if (peOffset + 24 > bytes.length || bytes.readUInt32LE(peOffset) !== 0x00004550) {
       fail(`${binaryPath} has an invalid PE header`);
     }
     if (bytes.readUInt16LE(peOffset + 4) !== 0x8664) {
       fail(`${binaryPath} is not PE x86_64`);
+    }
+    const optionalHeaderSize = bytes.readUInt16LE(peOffset + 20);
+    const optionalHeaderOffset = peOffset + 24;
+    // IMAGE_SUBSYSTEM_WINDOWS_GUI lives at offset 68 in the PE32+ optional header.
+    if (
+      optionalHeaderSize < 70
+      || optionalHeaderOffset + optionalHeaderSize > bytes.length
+      || bytes.readUInt16LE(optionalHeaderOffset) !== 0x20b
+    ) {
+      fail(`${binaryPath} has an invalid PE32+ optional header`);
+    }
+    if (bytes.readUInt16LE(optionalHeaderOffset + 68) !== 2) {
+      fail(`${binaryPath} is not a Windows GUI executable (console window would open)`);
     }
   } else if (target === "x86_64-unknown-linux-gnu") {
     const isElf64 =
