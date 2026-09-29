@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="360" viewBox="0 0 1280 360" role="img" aria-labelledby="title desc">
+  <title id="title">CipherNest</title>
+  <desc id="desc">本地优先的加密密码库，支持加密备份与手动 WebDAV 同步。</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#11151d"/>
+      <stop offset="1" stop-color="#080a0e"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffb147"/>
+      <stop offset=".5" stop-color="#ff791c"/>
+      <stop offset="1" stop-color="#e54812"/>
+    </linearGradient>
+    <radialGradient id="glow">
+      <stop offset="0" stop-color="#ff7920" stop-opacity=".38"/>
+      <stop offset="1" stop-color="#ff7920" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M40 0H0V40" fill="none" stroke="#ffffff" stroke-opacity=".045" stroke-width="1"/>
+    </pattern>
+  </defs>
+  <rect width="1280" height="360" rx="28" fill="url(#background)"/>
+  <rect width="1280" height="360" rx="28" fill="url(#grid)"/>
+  <circle cx="1083" cy="175" r="310" fill="url(#glow)"/>
+  <path d="M0 359H1280" stroke="#ff791c" stroke-opacity=".4" stroke-width="2"/>
+  <path d="M80 58h52" stroke="#ff8b27" stroke-width="4" stroke-linecap="round"/>
+  <text x="148" y="64" fill="#c1c6cf" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" letter-spacing="4">OPEN SOURCE DESKTOP VAULT</text>
+  <text x="78" y="169" fill="#ffffff" font-family="Segoe UI, Arial, sans-serif" font-size="82" font-weight="750" letter-spacing="-3">CipherNest</text>
+  <text x="82" y="229" fill="#f8fafc" font-family="Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="29" font-weight="600">本地优先的加密密码库</text>
+  <text x="82" y="274" fill="#aeb6c3" font-family="Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="19">安全保存密码 · 加密备份 · 按需同步</text>
+  <g transform="translate(904 37)">
+    <rect width="286" height="286" rx="68" fill="#171b23" stroke="#343b47" stroke-width="2"/>
+    <rect x="12" y="12" width="262" height="262" rx="58" fill="#11151c" stroke="#ff791c" stroke-opacity=".27"/>
+    <path d="M143 30 242 69v73c0 74-44 123-99 151-55-28-99-77-99-151V69l99-39Z" fill="#242932" stroke="url(#accent)" stroke-width="18" stroke-linejoin="round"/>
+    <path d="M105 145v-30a38 38 0 0 1 76 0v30" fill="none" stroke="#f5f6f8" stroke-width="18" stroke-linecap="round"/>
+    <rect x="89" y="140" width="108" height="82" rx="18" fill="url(#accent)"/>
+    <circle cx="143" cy="173" r="12" fill="#161b23"/>
+    <path d="M143 184v18" stroke="#161b23" stroke-width="10" stroke-linecap="round"/>
+  </g>
+</svg>

@@ -1,17 +1,39 @@
-# CipherNest
+<p align="center">
+  <img src="docs/images/readme/hero.svg" alt="CipherNest：本地优先的加密密码库" width="100%">
+</p>
 
-CipherNest 是一款面向 Windows、macOS 和 Linux 的本地密码管理器。保险库保存在设备上，由主密码解锁；需要跨设备使用时，可以通过 WebDAV 手动同步加密数据。应用基于 Tauri 2、Rust 和 TypeScript 构建。
+<p align="center">
+  <a href="https://github.com/qianshulab/CipherNest/releases/tag/v0.3.3"><img src="https://img.shields.io/badge/release-v0.3.3%20beta-ff791c?style=flat-square&amp;labelColor=1b2029" alt="下载 v0.3.3 beta"></a>
+  <a href="https://github.com/qianshulab/CipherNest/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/qianshulab/CipherNest/ci.yml?branch=main&amp;style=flat-square&amp;label=CI&amp;labelColor=1b2029" alt="持续集成状态"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-ff791c?style=flat-square&amp;labelColor=1b2029" alt="MIT 许可证"></a>
+</p>
 
-**当前版本：** [v0.3.3 beta](https://github.com/qianshulab/CipherNest/releases/tag/v0.3.3) · [MIT 许可证](LICENSE)
+<p align="center">
+  <a href="#下载与安装">下载</a> ·
+  <a href="#开始使用">快速开始</a> ·
+  <a href="#更新与数据">升级与备份</a> ·
+  <a href="#webdav-同步">WebDAV</a> ·
+  <a href="#安全说明">安全</a> ·
+  <a href="#从源码构建">开发</a>
+</p>
 
-## 功能
+## 项目简介
 
-- **密码库管理：** 保存账号、密码、网址、备注和标签，支持搜索、筛选、排序与收藏。
-- **密码生成：** 自定义长度与字符类别，可排除易混淆字符。
-- **本地安全提示：** 识别弱密码、重复密码和长期未更新的密码。
-- **会话保护：** 空闲自动锁定、可选失焦锁定、敏感字段限时显示和剪贴板定时清除。
-- **加密备份：** 导出和恢复 `.cnvault` 文件；写入前保留本地加密快照。
-- **WebDAV 同步：** 在用户主动操作时同步加密数据，并保留冲突副本供核对。
+CipherNest 是一款面向 Windows、macOS 和 Linux 的密码管理器。账号与密码保存在本机加密保险库中，由主密码解锁；加密备份用于迁移与恢复，WebDAV 手动同步用于跨设备使用。项目采用 Tauri 2、Rust 和 TypeScript 构建。
+
+<p align="center">
+  <img src="docs/images/readme/overview.svg" alt="CipherNest 提供本地保险库、加密备份和 WebDAV 手动同步" width="100%">
+</p>
+
+保险库支持搜索、筛选、排序、收藏和标签；密码生成器支持自定义长度与字符类别。本地安全检查会提示弱密码、重复密码和长期未更新的密码。敏感字段默认遮罩，并可设置自动锁定、失焦锁定和剪贴板清除时间。
+
+## 本版更新
+
+- Windows 正式构建启动时不再弹出命令行窗口。
+- 保存前检查保险库文件是否被外部修改，写入前保留加密快照，降低覆盖较新数据的风险。
+- 改进 WebDAV 条件请求探测和 HTTPS 连接错误提示。
+
+完整变更见 [v0.3.3 发布说明](https://github.com/qianshulab/CipherNest/releases/tag/v0.3.3)。
 
 ## 下载与安装
 
@@ -44,7 +66,8 @@ CipherNest 不提供主密码重置服务。请妥善保存用于解锁保险库
 | macOS | `~/Library/Application Support/com.ciphernest.vault/` |
 | Linux | `$XDG_DATA_HOME/com.ciphernest.vault/`，未设置时通常为 `~/.local/share/com.ciphernest.vault/` |
 
-升级前先导出一份加密备份，退出旧版应用，然后安装新版。安装后使用原主密码解锁，核对条目和同步设置。卸载时若系统提供清除应用数据的选项，请保留应用数据。
+> [!IMPORTANT]
+> 升级前先导出一份加密备份，退出旧版应用，然后安装新版。安装后使用原主密码解锁，核对条目和同步设置。卸载时若系统提供清除应用数据的选项，请保留应用数据。
 
 `vault.cnvault` 是本地保险库；`backups/` 保存本地加密快照。配置 WebDAV 后，`vault.cnvault.sync` 保存本机加密同步配置。应用导出的 `.cnvault` **不包含**该同步配置；迁移设备时还需保管同步恢复码和 WebDAV 凭据。
 

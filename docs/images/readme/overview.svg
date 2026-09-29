@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="284" viewBox="0 0 1280 284" role="img" aria-labelledby="title desc">
+  <title id="title">CipherNest 的三项核心能力</title>
+  <desc id="desc">本地保险库、加密备份与可选的 WebDAV 手动同步。</desc>
+  <defs>
+    <linearGradient id="panel" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1b2029"/>
+      <stop offset="1" stop-color="#11151b"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffab42"/>
+      <stop offset="1" stop-color="#f26319"/>
+    </linearGradient>
+  </defs>
+  <rect width="1280" height="284" rx="24" fill="#0d1117"/>
+  <g font-family="Segoe UI, PingFang SC, Microsoft YaHei, sans-serif">
+    <rect x="20" y="20" width="400" height="244" rx="18" fill="url(#panel)" stroke="#353b47"/>
+    <rect x="440" y="20" width="400" height="244" rx="18" fill="url(#panel)" stroke="#353b47"/>
+    <rect x="860" y="20" width="400" height="244" rx="18" fill="url(#panel)" stroke="#353b47"/>
+    <text x="376" y="60" text-anchor="end" fill="#697381" font-size="15" font-weight="700">01</text>
+    <text x="796" y="60" text-anchor="end" fill="#697381" font-size="15" font-weight="700">02</text>
+    <text x="1216" y="60" text-anchor="end" fill="#697381" font-size="15" font-weight="700">03</text>
+    <g transform="translate(52 46)" fill="none" stroke="url(#accent)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M28 2 50 10v18c0 17-9 28-22 35C15 56 6 45 6 28V10L28 2Z"/>
+      <path d="M19 28v-7a9 9 0 0 1 18 0v7"/>
+      <rect x="16" y="28" width="24" height="18" rx="4"/>
+    </g>
+    <g transform="translate(472 46)" fill="none" stroke="url(#accent)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M12 4h30l10 10v44H12z"/>
+      <path d="M42 4v12h10M23 31h18M23 41h12"/>
+      <path d="M34 51v8m-6-6 6 6 6-6"/>
+    </g>
+    <g transform="translate(892 51)" fill="none" stroke="url(#accent)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M13 39a15 15 0 0 1-2-29 21 21 0 0 1 39 5 13 13 0 0 1 0 25H13Z"/>
+      <path d="M20 49h26m-26 0 7-7m-7 7 7 7m26 10H27m26 0-7-7m7 7-7 7"/>
+    </g>
+    <text x="52" y="153" fill="#f7f8fa" font-size="25" font-weight="700">本地保险库</text>
+    <text x="472" y="153" fill="#f7f8fa" font-size="25" font-weight="700">加密备份</text>
+    <text x="892" y="153" fill="#f7f8fa" font-size="25" font-weight="700">手动同步</text>
+    <text x="52" y="190" fill="#c0c7d1" font-size="17">主密码解锁，条目保存在本机</text>
+    <text x="52" y="219" fill="#8993a2" font-size="16">搜索、整理与密码生成</text>
+    <text x="472" y="190" fill="#c0c7d1" font-size="17">导出加密文件，独立保存副本</text>
+    <text x="472" y="219" fill="#8993a2" font-size="16">恢复前预览并确认</text>
+    <text x="892" y="190" fill="#c0c7d1" font-size="17">通过 HTTPS WebDAV 按需同步</text>
+    <text x="892" y="219" fill="#8993a2" font-size="16">同步数据上传前加密</text>
+  </g>
+</svg>
