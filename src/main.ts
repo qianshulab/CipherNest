@@ -100,6 +100,7 @@ interface AppState {
   query: string;
   entries: EntrySummary[];
   listLoading: boolean;
+  listError: boolean;
   selectedId: string | null;
   entryMeta: EntryMeta;
   draft: EntryInput | null;
@@ -108,6 +109,7 @@ interface AppState {
   detailLoading: boolean;
   report: SecurityReport | null;
   reportLoading: boolean;
+  reportError: boolean;
   passwordVisible: boolean;
   mobileNavOpen: boolean;
   generatorOpen: boolean;
@@ -139,6 +141,8 @@ const DEFAULT_GENERATOR_OPTIONS: GeneratorOptions = {
 };
 
 const CONCEALED_TEXT = "••••••••••••";
+const ENTRY_REVISION_CONFLICT = "该条目已在其他操作中发生变化，请重新加载后再保存。";
+const RESTORE_TARGET_CHANGED = "预览后本地保险库已发生变化。为避免覆盖新数据，请重新选择并预览备份。";
 
 const EMPTY_STATUS: VaultStatus = {
   exists: false,
@@ -151,6 +155,11 @@ const EMPTY_OVERVIEW: VaultOverview = {
   totalEntries: 0,
   favoriteCount: 0,
   securityIssueCount: 0,
+  autoBackup: {
+    count: 0,
+    currentCovered: false,
+    inspectionFailed: false,
+  },
 };
 
 const EMPTY_SYNC_STATUS: WebDavSyncStatus = {
@@ -171,6 +180,7 @@ const state: AppState = {
   query: "",
   entries: [],
   listLoading: false,
+  listError: false,
   selectedId: null,
   entryMeta: {},
   draft: null,
@@ -179,6 +189,7 @@ const state: AppState = {
   detailLoading: false,
   report: null,
   reportLoading: false,
+  reportError: false,
   passwordVisible: false,
   mobileNavOpen: false,
   generatorOpen: false,
@@ -238,6 +249,7 @@ let generatorFocusRelease: (() => void) | null = null;
 let activeModalClose: (() => void) | null = null;
 let modalSequence = 0;
 let trustedSystemInteractionDepth = 0;
+let settingsUiEpoch = -1;
 const revealedSensitiveInputs = new Set<ManagedSensitiveInput>();
 let revealedNotesInput: HTMLTextAreaElement | null = null;
 let notesRevealButton: HTMLButtonElement | null = null;
@@ -853,6 +865,16 @@ function renderMainShell(): void {
     renderGate();
     return;
   }
+  const reusableSettingsCards = state.view === "settings" && settingsUiEpoch === state.epoch
+    ? {
+        security: app.querySelector<HTMLElement>(".settings-security-card"),
+        master: app.querySelector<HTMLElement>(".settings-master-card"),
+      }
+    : null;
+  const focusedSettingsElement = reusableSettingsCards?.security?.contains(document.activeElement)
+    || reusableSettingsCards?.master?.contains(document.activeElement)
+    ? document.activeElement as HTMLElement
+    : null;
   hideAllManagedSensitiveInputs();
   hideNotes();
   clearNode(app);
@@ -866,40 +888,35 @@ function renderMainShell(): void {
   const content = makeElement("main", "main-content");
   content.id = "main-content";
   if (state.view === "security") content.append(renderSecurityPage());
-  else if (state.view === "settings") content.append(renderSettingsPage());
+  else if (state.view === "settings") {
+    const settingsPage = renderSettingsPage();
+    if (reusableSettingsCards?.security && reusableSettingsCards.master) {
+      settingsPage.querySelector(".settings-security-card")?.replaceWith(reusableSettingsCards.security);
+      settingsPage.querySelector(".settings-master-card")?.replaceWith(reusableSettingsCards.master);
+    }
+    content.append(settingsPage);
+    settingsUiEpoch = state.epoch;
+  }
   else content.append(renderVaultColumns());
   body.append(content);
   shell.append(body);
   const statusbar = renderStatusbar();
   shell.append(statusbar);
-  if (compactNavigationMedia.matches && state.mobileNavOpen) {
-    content.inert = true;
-    content.setAttribute("aria-hidden", "true");
-    const actions = topbar.querySelector<HTMLElement>(".topbar-actions");
-    if (actions) actions.inert = true;
-    statusbar.inert = true;
-  }
   app.append(shell);
+  setMobileNavOpen(state.mobileNavOpen);
   setModalBackgroundHidden(hasOpenModal());
   setEntryEditorFrozen(
     state.entryMutation !== null || state.syncOperation !== null || state.securityOperation !== null,
   );
   updateClipboardStatus();
+  if (focusedSettingsElement?.isConnected) focusedSettingsElement.focus({ preventScroll: true });
 }
 
 function renderTopbar(): HTMLElement {
   const topbar = makeElement("header", "topbar");
   const left = makeElement("div", "topbar-left");
   const menu = iconButton("打开导航", "menu", () => {
-    const opening = !state.mobileNavOpen;
-    state.mobileNavOpen = opening;
-    renderMainShell();
-    window.setTimeout(() => {
-      const target = opening
-        ? document.querySelector<HTMLButtonElement>(".sidebar-close")
-        : document.querySelector<HTMLButtonElement>(".mobile-menu");
-      target?.focus();
-    }, 0);
+    setMobileNavOpen(!state.mobileNavOpen, true);
   }, "icon-button mobile-menu");
   menu.setAttribute("aria-controls", "vault-sidebar");
   menu.setAttribute("aria-expanded", String(state.mobileNavOpen));
@@ -929,9 +946,7 @@ function renderSidebar(): HTMLElement {
   const overlay = makeElement("div", `sidebar-overlay${state.mobileNavOpen ? " is-open" : ""}`);
   overlay.setAttribute("aria-hidden", "true");
   overlay.addEventListener("click", () => {
-    state.mobileNavOpen = false;
-    renderMainShell();
-    window.setTimeout(() => document.querySelector<HTMLButtonElement>(".mobile-menu")?.focus(), 0);
+    setMobileNavOpen(false, true);
   });
   const sidebar = makeElement("aside", `sidebar${state.mobileNavOpen ? " is-open" : ""}`);
   sidebar.id = "vault-sidebar";
@@ -946,9 +961,7 @@ function renderSidebar(): HTMLElement {
   headingLabel.append(brandIcon("sidebar-brand-icon"), makeElement("span", "", "保险库"));
   heading.append(headingLabel);
   heading.append(iconButton("关闭导航", "x", () => {
-    state.mobileNavOpen = false;
-    renderMainShell();
-    window.setTimeout(() => document.querySelector<HTMLButtonElement>(".mobile-menu")?.focus(), 0);
+    setMobileNavOpen(false, true);
   }, "icon-button sidebar-close"));
   sidebar.append(heading);
 
@@ -1019,11 +1032,43 @@ function totalSecurityFlags(): number {
   return state.overview.securityIssueCount;
 }
 
+function setMobileNavOpen(open: boolean, restoreFocus = false): void {
+  const compact = compactNavigationMedia.matches;
+  state.mobileNavOpen = compact && open;
+  const menu = document.querySelector<HTMLButtonElement>(".mobile-menu");
+  menu?.setAttribute("aria-expanded", String(state.mobileNavOpen));
+  document.querySelector(".sidebar-overlay")?.classList.toggle("is-open", state.mobileNavOpen);
+  const sidebar = document.querySelector<HTMLElement>(".sidebar");
+  sidebar?.classList.toggle("is-open", state.mobileNavOpen);
+  if (sidebar) {
+    sidebar.inert = compact && !state.mobileNavOpen;
+    if (sidebar.inert) sidebar.setAttribute("aria-hidden", "true");
+    else sidebar.removeAttribute("aria-hidden");
+  }
+  const content = document.querySelector<HTMLElement>(".main-content");
+  const actions = document.querySelector<HTMLElement>(".topbar-actions");
+  const statusbar = document.querySelector<HTMLElement>(".statusbar");
+  for (const element of [content, actions, statusbar]) {
+    if (!element) continue;
+    element.inert = state.mobileNavOpen;
+    if (state.mobileNavOpen) element.setAttribute("aria-hidden", "true");
+    else element.removeAttribute("aria-hidden");
+  }
+  if (restoreFocus) {
+    window.setTimeout(() => {
+      const target = state.mobileNavOpen
+        ? document.querySelector<HTMLButtonElement>(".sidebar-close")
+        : document.querySelector<HTMLButtonElement>(".mobile-menu");
+      target?.focus();
+    }, 0);
+  }
+}
+
 async function switchView(view: VaultView): Promise<void> {
   if (blockEntryActionWhileMutating()) return;
   if (view === state.view) {
-    state.mobileNavOpen = false;
-    renderMainShell();
+    if (state.mobileNavOpen) setMobileNavOpen(false, true);
+    if (state.listError && (view === "all" || view === "favorites")) await loadEntries(true);
     return;
   }
   if (hasUnsavedDraft()) {
@@ -1040,6 +1085,7 @@ async function switchView(view: VaultView): Promise<void> {
   state.mobileNavOpen = false;
   if (view === "security") {
     state.reportLoading = true;
+    state.reportError = false;
     renderMainShell();
     await loadSecurityReport();
   } else if (view === "all" || view === "favorites") {
@@ -1134,6 +1180,18 @@ function renderEntryList(): HTMLElement {
     loadingStatus.setAttribute("role", "status");
     list.append(loadingStatus);
     for (let index = 0; index < 5; index += 1) list.append(renderListSkeleton());
+  } else if (state.listError) {
+    const failure = makeElement("div", "list-empty");
+    failure.setAttribute("role", "listitem");
+    const graphic = makeElement("div", "empty-icon");
+    graphic.append(icon("alert", 25));
+    failure.append(
+      graphic,
+      makeElement("h2", "", "条目列表未能读取"),
+      makeElement("p", "", "当前没有显示旧列表，以免把过期内容当成最新数据。"),
+      makeButton("重试读取", "button button-secondary button-small", () => { void loadEntries(true); }, "refresh"),
+    );
+    list.append(failure);
   } else if (!state.entries.length) {
     list.append(renderListEmpty());
   } else {
@@ -1568,6 +1626,7 @@ function renderSecurityPage(): HTMLElement {
   const header = pageHeader("SECURITY REPORT", "安全检查", "检查弱密码、重复使用和长期未更换的密码。所有分析均在本机完成。");
   const refresh = makeButton("重新检查", "button button-secondary", async () => {
     state.reportLoading = true;
+    state.reportError = false;
     renderMainShell();
     await loadSecurityReport();
   }, "refresh");
@@ -1581,7 +1640,20 @@ function renderSecurityPage(): HTMLElement {
     return page;
   }
 
-  const report = state.report ?? { issues: [], totalEntries: state.status.itemCount, weakCount: 0, reusedCount: 0, staleCount: 0 };
+  if (state.reportError || !state.report) {
+    const failure = makeElement("section", "content-card issue-card");
+    failure.setAttribute("role", "alert");
+    failure.append(
+      makeElement("h2", "", state.reportError ? "安全检查未完成" : "尚未运行安全检查"),
+      makeElement("p", "", state.reportError
+        ? "当前无法读取检查结果。请重新检查；在检查成功前不会显示安全结论。"
+        : "点击“重新检查”分析当前保险库。"),
+    );
+    page.append(failure);
+    return page;
+  }
+
+  const report = state.report;
   const grid = makeElement("div", "security-summary-grid");
   grid.append(
     securitySummary("已检查条目", report.totalEntries, "shield", "neutral"),
@@ -1721,6 +1793,9 @@ function renderSettingsPage(): HTMLElement {
       state.settings = settings;
       state.status.autoLockMinutes = settings.autoLockMinutes;
       scheduleAutoLock();
+      await loadVaultOverview(epoch).catch(() => undefined);
+      if (epoch !== state.epoch || !state.status.unlocked) return;
+      renderMainShell();
       showToast("安全设置已保存。", "success");
     } catch {
       if (epoch !== state.epoch || !state.status.unlocked) return;
@@ -1739,21 +1814,36 @@ function renderSettingsPage(): HTMLElement {
   security.append(form);
 
   const backup = makeElement("section", "content-card settings-card settings-backup-card");
-  backup.append(settingsCardHeader("archive", "加密备份", "手动迁移保险库，不产生明文导出文件。"));
+  backup.append(settingsCardHeader("archive", "加密备份", "本机自动快照与手动导出均保持加密。"));
+  const autoBackup = state.overview.autoBackup;
+  const autoStatus = makeElement("div", "inline-notice inline-notice-compact");
+  autoStatus.append(icon(autoBackup.inspectionFailed || autoBackup.warning ? "alert" : "shield", 17));
+  const autoCopy = makeElement("p");
+  autoCopy.append(makeElement("strong", "", "本机自动快照"), document.createElement("br"));
+  autoCopy.append(document.createTextNode(autoBackup.inspectionFailed
+    ? "状态未知：快照检查失败，请检查应用数据目录并另行导出加密备份。"
+    : `每次成功保存后为当前版本建立快照，最多保留 10 份。现有 ${autoBackup.count} 份；${autoBackup.latestAt ? `最近 ${formatFullDate(autoBackup.latestAt)}` : "暂无快照"}；${autoBackup.currentCovered ? "当前版本已有快照" : "当前版本尚无可确认的快照"}。`));
+  autoStatus.append(autoCopy);
+  backup.append(autoStatus);
+  if (autoBackup.warning) {
+    const autoWarning = makeElement("div", "inline-notice inline-notice-warning inline-notice-compact");
+    autoWarning.append(icon("alert", 17), makeElement("p", "", autoBackup.warning));
+    backup.append(autoWarning);
+  }
   const backupStatus = makeElement(
     "p",
     "backup-last-export",
     state.overview.lastBackupAt
-      ? `上次成功导出：${formatFullDate(state.overview.lastBackupAt)}`
-      : "上次成功导出：尚未导出",
+      ? `上次手动导出：${formatFullDate(state.overview.lastBackupAt)}`
+      : "上次手动导出：尚未导出",
   );
   const backupNotice = makeElement("div", "inline-notice inline-notice-compact");
-  backupNotice.append(icon("alert", 17), makeElement("p", "", "旧备份可能仍包含后来删除或修改的条目，请像保护保险库一样保护备份。"));
+  backupNotice.append(icon("alert", 17), makeElement("p", "", "恢复时可选择本机自动快照或外部导出的加密文件。本机快照不能防范设备损坏或整盘丢失；请定期将备份导出到其他磁盘或离线介质。未保存的编辑内容不在备份中。"));
   const backupActions = makeElement("div", "settings-actions");
   const exportButton = makeButton("导出加密备份", "button button-secondary", async () => exportBackup(exportButton), "download");
   exportButton.dataset.securityMutation = "true";
   exportButton.disabled = state.syncOperation !== null || state.securityOperation !== null;
-  const restoreButton = makeButton("恢复加密备份", "button button-ghost", restoreBackup, "upload");
+  const restoreButton = makeButton("恢复加密备份（含本机快照）", "button button-ghost", restoreBackup, "upload");
   restoreButton.dataset.securityMutation = "true";
   restoreButton.disabled = state.securityOperation !== null || state.syncOperation !== null;
   backupActions.append(exportButton, restoreButton);
@@ -1814,6 +1904,7 @@ function renderSettingsPage(): HTMLElement {
       const syncState = result.syncConfigPreserved
         ? await loadWebDavSyncStatusSafely(state.syncStatus)
         : { status: { ...EMPTY_SYNC_STATUS }, error: false };
+      await loadVaultOverview(operationEpoch).catch(() => undefined);
       if (operationEpoch === state.epoch && state.status.unlocked) {
         state.syncStatus = syncState.status;
         state.syncStatusError = syncState.error;
@@ -1863,6 +1954,27 @@ function renderSettingsPage(): HTMLElement {
   }
   page.append(layout);
   return page;
+}
+
+function reflowSettingsLayout(): void {
+  if (!state.status.unlocked || state.view !== "settings") return;
+  const layout = document.querySelector<HTMLElement>(".settings-layout");
+  const security = layout?.querySelector<HTMLElement>(".settings-security-card");
+  const backup = layout?.querySelector<HTMLElement>(".settings-backup-card");
+  const master = layout?.querySelector<HTMLElement>(".settings-master-card");
+  const sync = layout?.querySelector<HTMLElement>(".settings-sync-card");
+  if (!layout || !security || !backup || !master || !sync) return;
+  const focused = layout.contains(document.activeElement) ? document.activeElement as HTMLElement : null;
+  if (compactSettingsMedia.matches) {
+    layout.replaceChildren(security, backup, master, sync);
+  } else {
+    const primary = makeElement("div", "settings-column");
+    const secondary = makeElement("div", "settings-column");
+    primary.append(security, sync);
+    secondary.append(backup, master);
+    layout.replaceChildren(primary, secondary);
+  }
+  if (focused?.isConnected) focused.focus({ preventScroll: true });
 }
 
 function renderWebDavSyncSettingsCard(): HTMLElement {
@@ -2020,15 +2132,23 @@ async function applyWebDavOutcome(outcome: WebDavSyncOutcome, operationEpoch: nu
   if (operationEpoch !== state.epoch || !state.status.unlocked) return;
   state.syncStatus = normalizeWebDavSyncStatus(outcome.status);
   state.syncStatusError = false;
+  let listRefreshed = true;
   if (outcome.kind === "downloaded" || outcome.kind === "merged") {
+    clearEntryDraft();
     state.report = null;
-    await Promise.all([
-      loadVaultOverview(operationEpoch).catch(() => undefined),
-      loadEntries(false, operationEpoch),
-    ]);
+    listRefreshed = await loadEntries(false, operationEpoch, false, false);
   }
+  await loadVaultOverview(operationEpoch).catch(() => undefined);
   if (operationEpoch !== state.epoch || !state.status.unlocked) return;
   const sequence = `远端序列 #${outcome.sequence.toLocaleString("zh-CN")}`;
+  if (!listRefreshed) {
+    showToast(
+      `同步已提交（${sequence}），但条目列表未能刷新。请切换到条目页重新读取；若仍失败，点击“重试读取”${outcome.conflicts > 0 ? `，然后核对 ${outcome.conflicts} 个冲突副本` : ""}。`,
+      "warning",
+      8200,
+    );
+    return;
+  }
   if (outcome.conflicts > 0) {
     showToast(
       `同步完成（${sequence}）。已保留 ${outcome.conflicts} 个冲突副本，并标记“同步冲突”供你核对。`,
@@ -2048,16 +2168,36 @@ async function applyWebDavOutcome(outcome: WebDavSyncOutcome, operationEpoch: nu
 
 function describeWebDavNetworkFailure(error: unknown, fallback: string): string {
   const message = typeof error === "string" ? error : error instanceof Error ? error.message : "";
-  // Only fixed backend messages can be displayed; remote responses and
-  // other errors retain the existing generic UI wording.
-  return message === "WebDAV 网络请求超时。请检查网络及服务器端口。"
-    || message === "无法建立 WebDAV HTTPS 连接。请检查服务器是否可达、端口是否启用 HTTPS，以及证书是否可信且与域名匹配。"
-    ? message
-    : fallback;
+  const guidance = new Map<string, string>([
+    ["WebDAV 网络请求超时。请检查网络及服务器端口。", "WebDAV 请求超时。请检查服务器地址、网络和 HTTPS 端口后重试。"],
+    ["无法建立 WebDAV HTTPS 连接。请检查服务器是否可达、端口是否启用 HTTPS，以及证书是否可信且与域名匹配。", "无法建立 HTTPS 连接。请确认端口启用了 HTTPS，且证书受本机信任并与访问域名或 IP 匹配。"],
+    ["WebDAV 服务器返回了不支持的状态码 401。", "WebDAV 身份验证失败（401）。请检查用户名和应用专用密码。"],
+    ["WebDAV 服务器返回了不支持的状态码 403。", "WebDAV 拒绝访问（403）。请检查账号对该目录的读取、创建、修改和删除权限。"],
+    ["WebDAV 服务器返回了不支持的状态码 404。", "WebDAV 目录不存在（404）。请先在服务器创建目录，并核对完整地址。"],
+    ["WebDAV 服务器返回了不支持的状态码 405。", "WebDAV 方法被拒绝（405）。请检查服务器及反向代理是否允许 WebDAV 请求。"],
+    ["WebDAV 服务器返回了不支持的状态码 409。", "WebDAV 目录发生冲突（409）。请确认父目录存在，并重新检查目录权限。"],
+    ["WebDAV 服务器返回了不支持的状态码 412。", "远端版本已变化（412）。本机内容未被覆盖，请重新同步并核对冲突副本。"],
+    ["WebDAV 地址不是现有集合。", "填写的地址不是现有 WebDAV 目录。请先创建目录，并以“/”结束地址。"],
+    ["远端尚未初始化此 CipherNest 同步空间。", "该目录中尚无 CipherNest 同步空间。请核对地址，或先在第一台设备创建同步空间。"],
+    ["远端已存在此 CipherNest 同步空间。", "该目录已有 CipherNest 同步空间。请使用“加入已有空间”和恢复码。"],
+    ["远端已被另一台设备更新，请重新拉取并合并。", "远端已被另一台设备更新。本机内容未被覆盖，请重新同步并核对冲突副本。"],
+    ["WebDAV 服务器不支持安全同步所需的条件请求或强 ETag。", "服务器缺少安全同步所需的强 ETag 或条件写入能力。请检查 WebDAV 服务和反向代理配置。"],
+    ["同步恢复码无效。", "同步恢复码无效。请核对完整的 CN1 恢复码。"],
+    ["本地同步状态无效或已损坏。", "本机同步配置无法验证，同步已停止。请检查设备上的同步配置。"],
+    ["本地保险库版本早于上次同步版本，已拒绝覆盖远端数据。", "本机保险库版本早于同步检查点。请先导出本机备份，核对其他设备后再处理。"],
+    ["检测到远端回滚、分叉或缺失的父快照。", "远端同步历史无法通过安全检查。请先导出本机备份，再核对服务器与其他设备。"],
+    ["远端快照链超过安全检查上限。", "远端历史超过安全检查上限。请先导出本机备份，再核对较新的可信设备。"],
+    ["同步期间本地保险库已发生变化；远端内容未覆盖这些更改，请重新同步。", "同步期间本机保险库发生变化，远端内容未覆盖本机修改。请重新同步。"],
+  ]);
+  return guidance.get(message) ?? fallback;
 }
 
 async function createWebDavSyncSpace(): Promise<void> {
   if (state.syncStatus.configured || state.syncStatusError) return;
+  if (hasUnsavedDraft()) {
+    showToast("请先保存或放弃当前条目的修改，再创建同步空间。", "warning");
+    return;
+  }
   const operationEpoch = beginSyncOperation("create");
   if (operationEpoch === null) return;
   let credentials: WebDavCredentials | null = null;
@@ -2083,6 +2223,7 @@ async function createWebDavSyncSpace(): Promise<void> {
     if (operationEpoch !== state.epoch || !state.status.unlocked) return;
     state.syncStatus = normalizeWebDavSyncStatus(createResult.status);
     state.syncStatusError = false;
+    await loadVaultOverview(operationEpoch).catch(() => undefined);
     recoveryCode = createResult.recoveryCode;
     createResult.recoveryCode = "";
     await showRecoveryCodeDialog(recoveryCode, true, "保存 WebDAV 恢复码");
@@ -2103,6 +2244,10 @@ async function createWebDavSyncSpace(): Promise<void> {
 
 async function joinWebDavSyncSpace(): Promise<void> {
   if (state.syncStatus.configured || state.syncStatusError) return;
+  if (hasUnsavedDraft()) {
+    showToast("请先保存或放弃当前条目的修改，再加入同步空间。", "warning");
+    return;
+  }
   const operationEpoch = beginSyncOperation("inspect");
   if (operationEpoch === null) return;
   let details: WebDavJoinDetails | null = null;
@@ -2130,10 +2275,10 @@ async function joinWebDavSyncSpace(): Promise<void> {
 
     const mode = await showWebDavJoinPreview(preview, state.overview.totalEntries);
     if (!mode || operationEpoch !== state.epoch) return;
-    if (mode === "remote" && state.overview.totalEntries > 0) {
+    if (mode === "remote" && preview.localHasHistory) {
       const replace = await showConfirm(
         "再次确认：以远端内容替换本机？",
-        `本机现有 ${state.overview.totalEntries.toLocaleString("zh-CN")} 个条目将被远端快照替换。若不确定，请取消并选择“合并（推荐）”。`,
+        `本机现有 ${state.overview.totalEntries.toLocaleString("zh-CN")} 个条目及删除历史将被远端快照替换。若不确定，请取消并选择“合并（推荐）”。`,
         "确认以远端替换",
         true,
       );
@@ -2154,6 +2299,7 @@ async function joinWebDavSyncSpace(): Promise<void> {
           recoveryCode: details.recoveryCode,
           previewToken: preview.previewToken,
           mode,
+          confirmReplace: mode === "remote" && preview.localHasHistory,
         },
       });
       preview.previewToken = "";
@@ -2176,6 +2322,10 @@ async function joinWebDavSyncSpace(): Promise<void> {
 
 async function syncWebDavNow(): Promise<void> {
   if (!state.syncStatus.configured || state.syncStatusError) return;
+  if (hasUnsavedDraft()) {
+    showToast("请先保存或放弃当前条目的修改，再同步。", "warning");
+    return;
+  }
   const operationEpoch = beginSyncOperation("sync");
   if (operationEpoch === null) return;
   const closeProgress = showRestoreProgress(
@@ -2370,7 +2520,12 @@ function renderStatusbar(): HTMLElement {
   return statusbar;
 }
 
-async function loadEntries(render = true, requestedEpoch = state.epoch, restoreSearchFocus = false): Promise<void> {
+async function loadEntries(
+  render = true,
+  requestedEpoch = state.epoch,
+  restoreSearchFocus = false,
+  notifyFailure = true,
+): Promise<boolean> {
   const epoch = requestedEpoch;
   const requestId = ++listRequestId;
   state.listLoading = true;
@@ -2384,28 +2539,45 @@ async function loadEntries(render = true, requestedEpoch = state.epoch, restoreS
   try {
     const entries = await invokeCommand<EntrySummary[]>("list_entries", args);
     if (epoch !== state.epoch || requestId !== listRequestId || !state.status.unlocked) {
-      return;
+      return false;
     }
     state.entries = entries;
     state.status.itemCount = Math.max(state.status.itemCount, entries.length);
     state.listLoading = false;
+    state.listError = false;
     if (render) {
       renderMainShell();
       if (restoreSearchFocus) focusSearchAtEnd();
     }
+    return true;
   } catch {
-    if (epoch !== state.epoch || requestId !== listRequestId) return;
+    if (epoch !== state.epoch || requestId !== listRequestId) return false;
+    state.entries = [];
     state.listLoading = false;
-    if (render) renderMainShell();
-    showToast("无法读取条目列表，请重试。", "error");
+    state.listError = true;
+    if (render || document.querySelector(".entry-list")) renderMainShell();
+    if (notifyFailure) showToast("无法读取条目列表。列表已隐藏，请点击“重试读取”。", "error");
+    return false;
   }
 }
 
 async function loadVaultOverview(requestedEpoch = state.epoch): Promise<void> {
-  const overview = await invokeCommand<VaultOverview>("vault_overview");
-  if (requestedEpoch !== state.epoch || !state.status.unlocked) return;
-  state.overview = overview;
-  state.status.itemCount = overview.totalEntries;
+  try {
+    const overview = await invokeCommand<VaultOverview>("vault_overview");
+    if (requestedEpoch !== state.epoch || !state.status.unlocked) return;
+    state.overview = overview;
+    state.status.itemCount = overview.totalEntries;
+  } catch (error) {
+    if (requestedEpoch === state.epoch && state.status.unlocked) {
+      state.overview.autoBackup = {
+        count: 0,
+        currentCovered: false,
+        inspectionFailed: true,
+        warning: "无法确认本机自动快照状态，请另行导出加密备份。",
+      };
+    }
+    throw error;
+  }
 }
 
 async function loadSecurityReport(): Promise<void> {
@@ -2415,21 +2587,24 @@ async function loadSecurityReport(): Promise<void> {
     if (epoch !== state.epoch || !state.status.unlocked) return;
     state.report = report;
     state.reportLoading = false;
+    state.reportError = false;
     renderMainShell();
   } catch {
     if (epoch !== state.epoch) return;
+    state.report = null;
     state.reportLoading = false;
+    state.reportError = true;
     renderMainShell();
     showToast("无法完成安全检查，请重试。", "error");
   }
 }
 
-async function selectEntry(id: string): Promise<void> {
-  if (blockEntryActionWhileMutating()) return;
-  if (id === state.selectedId && state.draft) return;
+async function selectEntry(id: string): Promise<boolean> {
+  if (blockEntryActionWhileMutating()) return false;
+  if (id === state.selectedId && state.draft) return true;
   if (hasUnsavedDraft()) {
     const discard = await showConfirm("放弃未保存的修改？", "打开其他条目将丢弃当前修改。", "放弃修改", true);
-    if (!discard) return;
+    if (!discard) return false;
   }
   hidePassword();
   clearEntryDraft();
@@ -2441,7 +2616,7 @@ async function selectEntry(id: string): Promise<void> {
     const entry = await invokeCommand<VaultEntry>("get_entry", { id });
     if (epoch !== state.epoch || state.selectedId !== id || !state.status.unlocked) {
       clearVaultEntrySensitiveFields(entry);
-      return;
+      return false;
     }
     state.entryMeta = {
       id: entry.id,
@@ -2455,12 +2630,14 @@ async function selectEntry(id: string): Promise<void> {
     clearVaultEntrySensitiveFields(entry);
     state.detailLoading = false;
     renderMainShell();
+    return true;
   } catch {
-    if (epoch !== state.epoch || state.selectedId !== id) return;
+    if (epoch !== state.epoch || state.selectedId !== id) return false;
     state.detailLoading = false;
     state.selectedId = null;
     renderMainShell();
     showToast("无法打开该条目，请重试。", "error");
+    return false;
   }
 }
 
@@ -2546,7 +2723,7 @@ async function saveCurrentEntry(button?: HTMLButtonElement): Promise<boolean> {
     if (epoch !== state.epoch || !state.status.unlocked || state.entryMutation !== "saving") return false;
     state.selectedId = summary.id;
     state.status.itemCount = Math.max(state.status.itemCount, state.entries.length + (input.id ? 0 : 1));
-    await loadEntries(false, epoch);
+    const listRefreshed = await loadEntries(false, epoch, false, false);
     await loadVaultOverview(epoch).catch(() => undefined);
     const entry = await invokeCommand<VaultEntry>("get_entry", { id: summary.id });
     if (epoch !== state.epoch || !state.status.unlocked || state.entryMutation !== "saving") {
@@ -2577,10 +2754,14 @@ async function saveCurrentEntry(button?: HTMLButtonElement): Promise<boolean> {
     state.entryMutation = null;
     renderMainShell();
     showToast(
-      draftChangedWhileSaving
-        ? "上一版已保存；保存期间检测到的新修改仍保留在编辑器中。"
-        : "条目已加密保存到本地。",
-      draftChangedWhileSaving ? "warning" : "success",
+      !listRefreshed
+        ? draftChangedWhileSaving
+          ? "上一版已保存，新的编辑仍保留；条目列表刷新失败，请重试读取。"
+          : "条目已加密保存，但列表刷新失败，请点击“重试读取”。"
+        : draftChangedWhileSaving
+          ? "上一版已保存；保存期间检测到的新修改仍保留在编辑器中。"
+          : "条目已加密保存到本地。",
+      !listRefreshed || draftChangedWhileSaving ? "warning" : "success",
     );
     return true;
   } catch (error) {
@@ -2591,8 +2772,14 @@ async function saveCurrentEntry(button?: HTMLButtonElement): Promise<boolean> {
     if (committed) {
       clearEntryDraft();
       await loadVaultOverview(epoch).catch(() => undefined);
-      await loadEntries(true, epoch);
-      showToast("条目已保存，但详情刷新失败。请重新打开条目确认内容。", "warning", 4800);
+      const listRefreshed = await loadEntries(true, epoch, false, false);
+      showToast(
+        listRefreshed
+          ? "条目已保存，但详情刷新失败。请重新打开条目确认内容。"
+          : "条目已保存，但详情和列表刷新失败。请重试读取条目列表。",
+        "warning",
+        5200,
+      );
       return true;
     }
     presentEntrySaveFailure(error, "editor");
@@ -2605,6 +2792,11 @@ function presentEntrySaveFailure(error: unknown, context: "editor" | "generator"
   const fieldId = failure.field ? entryFieldId(failure.field, context) : null;
   if (fieldId) setFieldError(fieldId, failure.message.replace(/^无法保存：/u, ""), true);
   showToast(failure.message, "error", 4800);
+}
+
+function isEntryRevisionConflict(error: unknown): boolean {
+  return error === ENTRY_REVISION_CONFLICT
+    || (error instanceof Error && error.message === ENTRY_REVISION_CONFLICT);
 }
 
 function entryFieldId(field: EntryField, context: "editor" | "generator"): string | null {
@@ -2695,12 +2887,16 @@ function clearEntryDraft(): void {
 async function deleteCurrentEntry(): Promise<void> {
   if (blockEntryActionWhileMutating()) return;
   const id = state.entryMeta.id;
-  const title = state.draft?.title || "此条目";
-  if (!id) return;
+  const expectedRevision = state.entryMeta.revision;
+  const title = state.entries.find((entry) => entry.id === id)?.title || state.draft?.title || "此条目";
+  if (!id || expectedRevision === undefined) return;
+  const discardUnsavedDraft = hasUnsavedDraft();
   const confirmed = await showConfirm(
     `删除“${title}”？`,
-    "该条目将从当前保险库删除，但可能仍存在于你以前创建的加密备份中。此操作无法在应用内撤销。",
-    "删除条目",
+    discardUnsavedDraft
+      ? "当前条目有未保存的修改。继续将丢弃这些修改并删除已保存的条目；本机自动快照或以前导出的备份中可能仍有旧版本。此操作无法在应用内撤销。"
+      : "该条目将从当前保险库删除，但仍可能存在于本机自动快照或以前导出的加密备份中。此操作无法在应用内撤销。",
+    discardUnsavedDraft ? "放弃修改并删除" : "删除条目",
     true,
   );
   if (!confirmed || !state.status.unlocked || state.entryMeta.id !== id) return;
@@ -2708,7 +2904,7 @@ async function deleteCurrentEntry(): Promise<void> {
   state.entryMutation = "deleting";
   setEntryEditorFrozen(true);
   try {
-    await invokeCommand<void>("delete_entry", { id });
+    await invokeCommand<void>("delete_entry", { id, expectedRevision });
     if (
       epoch !== state.epoch
       || !state.status.unlocked
@@ -2719,13 +2915,29 @@ async function deleteCurrentEntry(): Promise<void> {
     state.status.itemCount = Math.max(0, state.status.itemCount - 1);
     state.report = null;
     await loadVaultOverview(epoch).catch(() => undefined);
-    await loadEntries(true);
-    showToast("条目已删除。旧备份不会被自动修改。", "success");
-  } catch {
+    const listRefreshed = await loadEntries(true, epoch, false, false);
+    showToast(
+      listRefreshed
+        ? "条目已删除。既有快照和导出文件不会被自动修改。"
+        : "条目已删除，但列表刷新失败。请点击“重试读取”。",
+      listRefreshed ? "success" : "warning",
+    );
+  } catch (error) {
     if (epoch !== state.epoch || !state.status.unlocked) return;
     if (state.entryMutation === "deleting") state.entryMutation = null;
     setEntryEditorFrozen(false);
-    showToast("无法删除条目，请重试。", "error");
+    if (isEntryRevisionConflict(error)) {
+      const listRefreshed = await loadEntries(true, epoch, false, false);
+      showToast(
+        listRefreshed
+          ? "该条目已有新版本，未执行删除。请重新打开条目，核对最新内容后再操作。"
+          : "该条目已有新版本，未执行删除；列表也未能刷新。请重试读取后核对。",
+        "warning",
+        5600,
+      );
+    } else {
+      showToast("无法删除条目，请重试。", "error");
+    }
   } finally {
     if (epoch === state.epoch && state.entryMutation === "deleting") {
       state.entryMutation = null;
@@ -2739,30 +2951,48 @@ async function toggleFavorite(entry: EntrySummary): Promise<void> {
   const epoch = state.epoch;
   const id = entry.id;
   const favorite = !entry.favorite;
+  const expectedRevision = entry.revision;
   state.entryMutation = "favoriting";
   setEntryEditorFrozen(true);
   try {
-    const revision = await invokeCommand<number>("set_favorite", { id, favorite });
+    const revision = await invokeCommand<number>("set_favorite", { id, favorite, expectedRevision });
     if (epoch !== state.epoch || !state.status.unlocked || state.entryMutation !== "favoriting") return;
     const currentSummary = state.entries.find((item) => item.id === id);
-    if (currentSummary) currentSummary.favorite = favorite;
-    if (state.draft?.id === id) {
+    if (currentSummary) {
+      currentSummary.favorite = favorite;
+      currentSummary.revision = revision;
+    }
+    if (state.draft?.id === id && state.entryMeta.revision === expectedRevision) {
       state.draft.favorite = favorite;
       updateSnapshotFavorite(favorite);
       setCurrentEntryRevision(id, revision);
+    } else if (state.draft?.id === id && !hasUnsavedDraft()) {
+      clearEntryDraft();
     }
-    await Promise.all([
+    const [, listRefreshed] = await Promise.all([
       loadVaultOverview(epoch).catch(() => undefined),
-      loadEntries(false, epoch),
+      loadEntries(false, epoch, false, false),
     ]);
     if (epoch !== state.epoch || !state.status.unlocked || state.entryMutation !== "favoriting") return;
     state.entryMutation = null;
     renderMainShell();
-  } catch {
+    if (!listRefreshed) showToast("收藏状态已保存，但列表刷新失败。请点击“重试读取”。", "warning", 5200);
+  } catch (error) {
     if (epoch !== state.epoch || !state.status.unlocked) return;
     if (state.entryMutation === "favoriting") state.entryMutation = null;
     setEntryEditorFrozen(false);
-    showToast("无法更新收藏状态。", "error");
+    if (isEntryRevisionConflict(error)) {
+      const listRefreshed = await loadEntries(true, epoch, false, false);
+      showToast(
+        listRefreshed
+          ? "该条目已有新版本，收藏状态未修改。请重新打开条目后再操作。"
+          : "该条目已有新版本，收藏状态未修改；列表也未能刷新。请重试读取后核对。",
+        "warning",
+        5600,
+      );
+    } else {
+      showToast("无法更新收藏状态。", "error");
+    }
   } finally {
     if (epoch === state.epoch && state.entryMutation === "favoriting") {
       state.entryMutation = null;
@@ -2782,10 +3012,12 @@ async function toggleCurrentFavorite(): Promise<void> {
   }
   const epoch = state.epoch;
   const id = state.draft.id;
+  const expectedRevision = state.entryMeta.revision;
+  if (expectedRevision === undefined) return;
   state.entryMutation = "favoriting";
   setEntryEditorFrozen(true);
   try {
-    const revision = await invokeCommand<number>("set_favorite", { id, favorite });
+    const revision = await invokeCommand<number>("set_favorite", { id, favorite, expectedRevision });
     if (
       epoch !== state.epoch
       || !state.status.unlocked
@@ -2796,8 +3028,12 @@ async function toggleCurrentFavorite(): Promise<void> {
     updateSnapshotFavorite(favorite);
     setCurrentEntryRevision(id, revision);
     const summary = state.entries.find((entry) => entry.id === id);
-    if (summary) summary.favorite = favorite;
+    if (summary) {
+      summary.favorite = favorite;
+      summary.revision = revision;
+    }
     await loadVaultOverview(epoch).catch(() => undefined);
+    const listRefreshed = await loadEntries(false, epoch, false, false);
     if (
       epoch !== state.epoch
       || !state.status.unlocked
@@ -2806,11 +3042,23 @@ async function toggleCurrentFavorite(): Promise<void> {
     ) return;
     state.entryMutation = null;
     renderMainShell();
-  } catch {
+    if (!listRefreshed) showToast("收藏状态已保存，但列表刷新失败。请点击“重试读取”。", "warning", 5200);
+  } catch (error) {
     if (epoch !== state.epoch || !state.status.unlocked) return;
     if (state.entryMutation === "favoriting") state.entryMutation = null;
     setEntryEditorFrozen(false);
-    showToast("无法更新收藏状态。", "error");
+    if (isEntryRevisionConflict(error)) {
+      const listRefreshed = await loadEntries(true, epoch, false, false);
+      showToast(
+        listRefreshed
+          ? "该条目已有新版本，收藏状态未修改。请重新打开条目后再操作。"
+          : "该条目已有新版本，收藏状态未修改；列表也未能刷新。请重试读取后核对。",
+        "warning",
+        5600,
+      );
+    } else {
+      showToast("无法更新收藏状态。", "error");
+    }
   } finally {
     if (epoch === state.epoch && state.entryMutation === "favoriting") {
       state.entryMutation = null;
@@ -3343,20 +3591,40 @@ async function applyGeneratedPassword(button: HTMLButtonElement): Promise<void> 
     favorite: false,
   };
   const epoch = state.epoch;
+  let committed = false;
   state.generatorApplying = true;
   setBusy(button, true, "正在加密保存…");
   updateGeneratorOutput();
   try {
     const summary = await invokeCommand<EntrySummary>("save_entry", { input });
+    committed = true;
     if (epoch !== state.epoch || !state.status.unlocked) return;
     closeGenerator(true);
     state.view = "all";
     state.status.itemCount += 1;
     await loadVaultOverview(epoch).catch(() => undefined);
-    await loadEntries(true);
-    await selectEntry(summary.id);
-    showToast("密码和应用信息已一起加密保存。", "success");
+    const listRefreshed = await loadEntries(true, epoch, false, false);
+    const detailOpened = await selectEntry(summary.id);
+    showToast(
+      !listRefreshed
+        ? "密码和应用信息已保存，但列表刷新失败。请重试读取后核对条目。"
+        : detailOpened
+          ? "密码和应用信息已一起加密保存。"
+          : "密码和应用信息已保存；请从条目列表打开新条目核对。",
+      listRefreshed && detailOpened ? "success" : "warning",
+    );
   } catch (error) {
+    if (committed) {
+      if (epoch !== state.epoch || !state.status.unlocked) return;
+      if (state.generatorOpen) closeGenerator(true);
+      state.view = "all";
+      state.entries = [];
+      state.listLoading = false;
+      state.listError = true;
+      renderMainShell();
+      showToast("密码和应用信息已保存，但界面刷新失败。请点击“重试读取”后核对条目，避免重复创建。", "warning", 7200);
+      return;
+    }
     state.generatorApplying = false;
     setBusy(button, false);
     updateGeneratorOutput();
@@ -3462,7 +3730,11 @@ async function restoreBackup(): Promise<void> {
     const confirmed = await showRestorePreview(selection, preview);
     if (!confirmed || operationEpoch !== state.epoch) return;
 
-    const closeApplyProgress = showRestoreProgress("正在安全替换保险库…");
+    const closeApplyProgress = showRestoreProgress(
+      "正在安全替换保险库…",
+      "已确认的备份正在提交。此阶段不能保证取消；完成后请核对保险库内容。",
+      wasUnlocked,
+    );
     try {
       await invokeCommand<VaultStatus>("apply_selected_backup", { token: selection.token });
     } finally {
@@ -3477,9 +3749,16 @@ async function restoreBackup(): Promise<void> {
       "success",
       7200,
     );
-  } catch {
+  } catch (error) {
     if (operationEpoch !== state.epoch) return;
-    showToast("无法验证或恢复此备份。文件可能损坏、已过期，或主密码不正确。", "error", 4800);
+    const restoreMessage = typeof error === "string" ? error : error instanceof Error ? error.message : "";
+    showToast(
+      restoreMessage === RESTORE_TARGET_CHANGED
+        ? "预览后本地保险库已变化，恢复未执行。请核对当前数据，重新选择并预览备份。"
+        : "无法验证或恢复此备份。文件可能损坏、已过期，或主密码不正确。",
+      restoreMessage === RESTORE_TARGET_CHANGED ? "warning" : "error",
+      restoreMessage === RESTORE_TARGET_CHANGED ? 6200 : 4800,
+    );
     if (!wasUnlocked) renderGate();
   } finally {
     masterPassword = "";
@@ -3505,7 +3784,7 @@ async function manualLock(): Promise<void> {
     || state.securityOperation !== null
     || state.entryMutation !== null
   ) {
-    await performLock("保险库界面已锁定；当前操作不会再回写此会话。", true);
+    await performLock("保险库界面已锁定。请重新解锁后核对进行中操作的结果。", true);
     return;
   }
   if (hasUnsavedDraft()) {
@@ -3555,7 +3834,9 @@ function clearSensitiveState(clearMetadata: boolean): void {
   state.query = "";
   state.report = null;
   state.reportLoading = false;
+  state.reportError = false;
   state.listLoading = false;
+  state.listError = false;
   if (clearMetadata) {
     state.entries = [];
     state.status.itemCount = 0;
@@ -4194,10 +4475,12 @@ function showWebDavJoinPreview(preview: WebDavRemotePreview, localItemCount: num
         : "首次加入（TOFU）：此设备没有旧检查点，无法独立证明服务器给出的是最新版本。请与另一台可信设备核对同步 ID 和序列。"),
     );
 
-    let mode: WebDavJoinMode = localItemCount > 0 ? "merge" : "remote";
+    let mode: WebDavJoinMode = preview.localHasHistory ? "merge" : "remote";
     const choices = makeElement("fieldset", "webdav-join-choices");
-    if (localItemCount > 0) {
-      const legend = makeElement("legend", "", `本机已有 ${localItemCount.toLocaleString("zh-CN")} 个条目`);
+    if (preview.localHasHistory) {
+      const legend = makeElement("legend", "", localItemCount > 0
+        ? `本机已有 ${localItemCount.toLocaleString("zh-CN")} 个条目及删除历史`
+        : "本机已有删除历史");
       choices.append(legend);
       const addChoice = (value: WebDavJoinMode, label: string, description: string, checked: boolean) => {
         const choice = makeElement("label", "webdav-join-choice");
@@ -4215,7 +4498,7 @@ function showWebDavJoinPreview(preview: WebDavRemotePreview, localItemCount: num
         choices.append(choice);
       };
       addChoice("merge", "合并（推荐）", "保留双方修改；同一条目冲突时创建带标记的副本。", true);
-      addChoice("remote", "以远端替换本机", "忽略本机当前内容；下一步还会再次危险确认。", false);
+      addChoice("remote", "以远端替换本机", "忽略本机条目及删除历史；下一步还会再次危险确认。", false);
     } else {
       choices.append(makeElement("p", "webdav-empty-join", "本机保险库为空，将使用远端快照作为首次内容。"));
     }
@@ -4250,7 +4533,7 @@ function showWebDavJoinPreview(preview: WebDavRemotePreview, localItemCount: num
 
 function showRestoreProgress(
   label: string,
-  description = "请稍候。完成前不会开放当前数据；关闭应用会中断当前界面流程。",
+  description = "请稍候。操作可能已进入不可取消的阶段；完成后请核对保险库状态。",
   allowImmediateLock = true,
 ): () => void {
   const region = document.querySelector<HTMLElement>("#modal-region");
@@ -4270,12 +4553,12 @@ function showRestoreProgress(
   const body = makeElement("p", "", description);
   body.id = ids.description;
   dialog.append(spinner, heading, body);
-  if (allowImmediateLock) {
+  if (allowImmediateLock && state.status.unlocked) {
     const actions = makeElement("div", "confirm-actions restore-progress-actions");
     actions.append(makeButton(
-      "立即锁定并取消",
+      "立即锁定界面",
       "button button-ghost",
-      () => performLock("保险库已锁定，当前操作已取消。", true),
+      () => performLock("保险库界面已锁定。请重新解锁后核对操作结果。", true),
       "lock",
     ));
     dialog.append(actions);
@@ -4380,9 +4663,7 @@ function showRestorePreview(selection: RestoreSelection, preview: RestorePreview
 function handleGlobalShortcut(event: KeyboardEvent): void {
   if (event.key === "Escape" && compactNavigationMedia.matches && state.mobileNavOpen) {
     event.preventDefault();
-    state.mobileNavOpen = false;
-    renderMainShell();
-    window.setTimeout(() => document.querySelector<HTMLButtonElement>(".mobile-menu")?.focus(), 0);
+    setMobileNavOpen(false, true);
     return;
   }
   if (!state.status.unlocked || !(event.ctrlKey || event.metaKey) || event.altKey) return;
@@ -4430,12 +4711,10 @@ window.addEventListener("beforeunload", () => {
 });
 compactNavigationMedia.addEventListener("change", () => {
   if (!state.status.unlocked) return;
-  state.mobileNavOpen = false;
-  renderMainShell();
+  setMobileNavOpen(false);
 });
 compactSettingsMedia.addEventListener("change", () => {
-  if (!state.status.unlocked || state.view !== "settings") return;
-  renderMainShell();
+  reflowSettingsLayout();
 });
 
 void bootstrap();

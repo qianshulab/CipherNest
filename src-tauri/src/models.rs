@@ -41,6 +41,7 @@ pub struct EntryInput {
 #[serde(rename_all = "camelCase")]
 pub struct EntrySummary {
     pub id: String,
+    pub revision: u64,
     pub title: String,
     pub favorite: bool,
     pub created_at: u64,
@@ -112,6 +113,17 @@ pub struct VaultOverview {
     pub favorite_count: usize,
     pub security_issue_count: usize,
     pub last_backup_at: Option<u64>,
+    pub auto_backup: AutoBackupStatus,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoBackupStatus {
+    pub count: usize,
+    pub latest_at: Option<u64>,
+    pub current_covered: bool,
+    pub inspection_failed: bool,
+    pub warning: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -195,6 +207,8 @@ pub struct WebDavJoinInput {
     pub preview_token: String,
     #[zeroize(skip)]
     pub mode: WebDavJoinMode,
+    #[serde(default)]
+    pub confirm_replace: bool,
 }
 
 #[derive(Serialize, Zeroize, ZeroizeOnDrop)]
@@ -209,6 +223,7 @@ pub struct WebDavCreateResult {
 #[serde(rename_all = "camelCase")]
 pub struct WebDavRemotePreview {
     pub preview_token: String,
+    pub local_has_history: bool,
     pub item_count: usize,
     pub updated_at: u64,
     pub sequence: u64,

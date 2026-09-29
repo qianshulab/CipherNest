@@ -10,6 +10,13 @@ export interface VaultOverview {
   favoriteCount: number;
   securityIssueCount: number;
   lastBackupAt?: number;
+  autoBackup: {
+    count: number;
+    latestAt?: number;
+    currentCovered: boolean;
+    inspectionFailed: boolean;
+    warning?: string;
+  };
 }
 
 export interface RestoreSelection {
@@ -54,6 +61,7 @@ export interface WebDavRemotePreview {
   sequence: number;
   syncIdShort: string;
   checkpointTrusted: false;
+  localHasHistory: boolean;
 }
 
 export type WebDavJoinMode = "remote" | "merge";
@@ -79,6 +87,7 @@ export interface EntrySummary {
   id: string;
   title: string;
   favorite: boolean;
+  revision: number;
   createdAt: number;
   updatedAt: number;
   passwordUpdatedAt: number;

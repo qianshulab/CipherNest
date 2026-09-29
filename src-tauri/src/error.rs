@@ -26,6 +26,12 @@ pub enum VaultError {
     InvalidVault,
     #[error("备份恢复会话已失效，请重新选择备份文件。")]
     PendingRestoreUnavailable,
+    #[error("预览后本地保险库已发生变化。为避免覆盖新数据，请重新选择并预览备份。")]
+    RestoreTargetChanged,
+    #[error(
+        "检测到未完成的保险库恢复，无法自动确认磁盘状态。请保留应用数据目录并检查备份后再继续。"
+    )]
+    RestoreRecoveryFailed,
     #[error("同步预览已失效或远端内容已经变化，请重新检查远端保险库。")]
     PendingSyncPreviewUnavailable,
     #[error("请先验证备份密码，再确认恢复。")]

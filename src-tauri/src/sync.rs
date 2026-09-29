@@ -351,6 +351,9 @@ impl WebDavClient {
             .send()
             .await
             .map_err(classify_transport_error)?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Err(SyncError::NotACollection);
+        }
         if response.status() != StatusCode::MULTI_STATUS {
             return Err(status_error(response.status()));
         }
@@ -370,26 +373,28 @@ impl WebDavClient {
         Ok(())
     }
 
-    /// Performs harmless create/update/delete probes in the exact configured
-    /// collection.  A server that ignores either condition or emits only weak
-    /// ETags is rejected.
+    /// Checks conditional PUT and strong ETag behavior in the configured
+    /// collection, including two writes competing for the same ETag. Probe
+    /// cleanup uses an ordinary DELETE: synchronization never conditionally
+    /// deletes a remote object.
     pub async fn verify_safe_conditions(&self) -> SyncResult<()> {
         self.ensure_existing_collection().await?;
         let probe_name = format!("ciphernest-condition-probe-{}.tmp", Uuid::new_v4());
         let first = random_probe_bytes()?;
         let second = random_probe_bytes()?;
+        let third = random_probe_bytes()?;
+        if first == second || first == third || second == third {
+            return Err(SyncError::Transport);
+        }
 
-        let create = self
+        let create_status = self
             .put_resource(&probe_name, &first, Some((IF_NONE_MATCH, "*")))
             .await;
-        let status = match create {
-            Ok(status) if is_write_success(status) => status,
-            Ok(status) => return Err(status_error(status)),
-            Err(error) => return Err(error),
-        };
-        let _ = status;
-
         let result = async {
+            let status = create_status?;
+            if !is_write_success(status) {
+                return Err(status_error(status));
+            }
             let fetched = self
                 .get_resource(&probe_name, MAX_HEAD_BYTES)
                 .await?
@@ -423,39 +428,57 @@ impl WebDavClient {
             let unchanged = self.get_resource(&probe_name, MAX_HEAD_BYTES).await?;
             verify_rejected_probe_writes(unchanged.as_ref(), &first, &first_etag)?;
 
-            let update = self
-                .put_resource(&probe_name, &second, Some((IF_MATCH, first_etag.as_str())))
-                .await?;
-            if !is_write_success(update) {
-                return Err(status_error(update));
-            }
+            let (second_result, third_result) = tokio::join!(
+                self.put_resource(&probe_name, &second, Some((IF_MATCH, first_etag.as_str()))),
+                self.put_resource(&probe_name, &third, Some((IF_MATCH, first_etag.as_str()))),
+            );
+            let second_status = second_result?;
+            let third_status = third_result?;
             let fetched = self
                 .get_resource(&probe_name, MAX_HEAD_BYTES)
                 .await?
                 .ok_or(SyncError::UnsafeServer)?;
-            if fetched.bytes != second {
-                return Err(SyncError::UnsafeServer);
-            }
-            let second_etag = require_strong_etag(fetched.etag.as_deref())?;
-            if second_etag == first_etag {
-                // A strong entity tag is unusable for compare-and-swap if it
-                // remains stable after the representation changes.
-                return Err(SyncError::UnsafeServer);
-            }
-            let deleted = self
-                .delete_resource(&probe_name, Some(second_etag.as_str()))
-                .await?;
-            if !is_write_success(deleted) {
-                return Err(status_error(deleted));
-            }
+            verify_competing_probe_writes(
+                second_status,
+                third_status,
+                Some(&fetched),
+                &second,
+                &third,
+                &first_etag,
+            )?;
             Ok(())
         }
         .await;
 
-        if result.is_err() {
-            let _ = self.delete_resource(&probe_name, None).await;
+        // The name contains a fresh UUID and the payload contains only random
+        // bytes. Never delete an object whose contents are not one of our own
+        // probe values, even if the server returned an unexpected status.
+        let cleanup = self
+            .remove_condition_probe(&probe_name, &[&first, &second, &third])
+            .await;
+        match (result, cleanup) {
+            (Err(error), _) => Err(error),
+            (Ok(()), Ok(true)) => Ok(()),
+            (Ok(()), Ok(false)) => Err(SyncError::UnsafeServer),
+            (Ok(()), Err(error)) => Err(error),
         }
-        result
+    }
+
+    async fn remove_condition_probe(&self, name: &str, own_values: &[&[u8]]) -> SyncResult<bool> {
+        let Some(resource) = self.get_resource(name, MAX_HEAD_BYTES).await? else {
+            return Ok(false);
+        };
+        if !own_values.contains(&resource.bytes.as_slice()) {
+            return Err(SyncError::UnsafeServer);
+        }
+        let deleted = self.delete_resource(name).await?;
+        if !is_write_success(deleted) {
+            return Err(status_error(deleted));
+        }
+        if self.get_resource(name, MAX_HEAD_BYTES).await?.is_some() {
+            return Err(SyncError::UnsafeServer);
+        }
+        Ok(true)
     }
 
     pub async fn create_remote(
@@ -1026,13 +1049,8 @@ impl WebDavClient {
             .map_err(classify_transport_error)
     }
 
-    async fn delete_resource(&self, name: &str, etag: Option<&str>) -> SyncResult<StatusCode> {
-        let mut request = self.request(Method::DELETE, self.resource_url(name)?);
-        if let Some(etag) = etag {
-            let value = HeaderValue::from_str(etag).map_err(|_| SyncError::InvalidData)?;
-            request = request.header(IF_MATCH, value);
-        }
-        request
+    async fn delete_resource(&self, name: &str) -> SyncResult<StatusCode> {
+        self.request(Method::DELETE, self.resource_url(name)?)
             .send()
             .await
             .map(|response| response.status())
@@ -1054,6 +1072,43 @@ fn verify_rejected_probe_writes(
     if fetched.bytes.as_slice() != expected_bytes
         || require_strong_etag(fetched.etag.as_deref())? != expected_etag
     {
+        return Err(SyncError::UnsafeServer);
+    }
+    Ok(())
+}
+
+fn verify_competing_probe_writes(
+    left_status: StatusCode,
+    right_status: StatusCode,
+    fetched: Option<&RemoteResource>,
+    left_bytes: &[u8],
+    right_bytes: &[u8],
+    previous_etag: &str,
+) -> SyncResult<()> {
+    // Some WebDAV servers lock the resource while a PUT is in progress. The
+    // losing request may then return 423 rather than 412; both are safe only
+    // if the winner is the representation subsequently read from the server.
+    let expected = match (left_status, right_status) {
+        (left, right)
+            if is_write_success(left)
+                && matches!(right, StatusCode::PRECONDITION_FAILED | StatusCode::LOCKED) =>
+        {
+            left_bytes
+        }
+        (left, right)
+            if matches!(left, StatusCode::PRECONDITION_FAILED | StatusCode::LOCKED)
+                && is_write_success(right) =>
+        {
+            right_bytes
+        }
+        _ => return Err(SyncError::UnsafeServer),
+    };
+    let fetched = fetched.ok_or(SyncError::UnsafeServer)?;
+    if fetched.bytes.as_slice() != expected {
+        return Err(SyncError::UnsafeServer);
+    }
+    let next_etag = require_strong_etag(fetched.etag.as_deref())?;
+    if next_etag == previous_etag {
         return Err(SyncError::UnsafeServer);
     }
     Ok(())
@@ -2302,6 +2357,216 @@ fn set_private_file_permissions(_file: &File) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        io::{BufRead, BufReader},
+        net::{TcpListener, TcpStream},
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
+        },
+        thread,
+    };
+
+    #[derive(Default)]
+    struct MockDavState {
+        resource: Option<Vec<u8>>,
+        version: u64,
+        accept_stale_match: bool,
+        conditional_delete_seen: bool,
+        collection_exists: bool,
+    }
+
+    struct MockDavServer {
+        address: std::net::SocketAddr,
+        state: Arc<Mutex<MockDavState>>,
+        stop: Arc<AtomicBool>,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+
+    impl MockDavServer {
+        fn new(accept_stale_match: bool) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let state = Arc::new(Mutex::new(MockDavState {
+                accept_stale_match,
+                collection_exists: true,
+                ..Default::default()
+            }));
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread_state = Arc::clone(&state);
+            let thread_stop = Arc::clone(&stop);
+            let thread = thread::spawn(move || {
+                for incoming in listener.incoming() {
+                    if thread_stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let Ok(stream) = incoming else { break };
+                    let request_state = Arc::clone(&thread_state);
+                    thread::spawn(move || handle_mock_dav_request(stream, request_state));
+                }
+            });
+            Self {
+                address,
+                state,
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        fn client(&self) -> WebDavClient {
+            // Only this protocol test bypasses HTTPS; WebDavClient::new keeps
+            // production endpoint and certificate validation unchanged.
+            WebDavClient {
+                client: reqwest::Client::builder()
+                    .no_proxy()
+                    .http1_only()
+                    .timeout(Duration::from_secs(5))
+                    .build()
+                    .unwrap(),
+                endpoint: Url::parse(&format!("http://{}/vault/", self.address)).unwrap(),
+                username: "test".into(),
+                app_password: Zeroizing::new("test-password".into()),
+            }
+        }
+    }
+
+    impl Drop for MockDavServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            let _ = TcpStream::connect(self.address);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn handle_mock_dav_request(mut stream: TcpStream, state: Arc<Mutex<MockDavState>>) {
+        let Ok(read_stream) = stream.try_clone() else {
+            return;
+        };
+        let mut reader = BufReader::new(read_stream);
+        let mut request_line = String::new();
+        if reader.read_line(&mut request_line).is_err() {
+            return;
+        }
+        let mut parts = request_line.split_ascii_whitespace();
+        let method = parts.next().unwrap_or_default();
+        let path = parts.next().unwrap_or_default();
+        let mut content_length = 0;
+        let mut if_match = None;
+        let mut if_none_match = None;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).is_err() || line == "\r\n" || line.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                let value = value.trim().to_owned();
+                match name.to_ascii_lowercase().as_str() {
+                    "content-length" => content_length = value.parse().unwrap_or(0),
+                    "if-match" => if_match = Some(value),
+                    "if-none-match" => if_none_match = Some(value),
+                    _ => {}
+                }
+            }
+        }
+        let mut body = vec![0; content_length];
+        if reader.read_exact(&mut body).is_err() {
+            return;
+        }
+        let collection_exists = state.lock().unwrap().collection_exists;
+        let (status, response_body, etag, content_type) = if method == "PROPFIND"
+            && path == "/vault/"
+            && collection_exists
+        {
+            (
+                "207 Multi-Status",
+                br#"<d:multistatus xmlns:d="DAV:"><d:response><d:href>/vault/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>"#.to_vec(),
+                None,
+                "application/xml",
+            )
+        } else if path.starts_with("/vault/ciphernest-condition-probe-") {
+            let mut state = state.lock().unwrap();
+            match method {
+                "GET" => match &state.resource {
+                    Some(bytes) => (
+                        "200 OK",
+                        bytes.clone(),
+                        Some(format!("\"v{}\"", state.version)),
+                        "application/octet-stream",
+                    ),
+                    None => ("404 Not Found", vec![], None, "application/octet-stream"),
+                },
+                "PUT" => {
+                    let current_etag = format!("\"v{}\"", state.version);
+                    let allowed = if if_none_match.as_deref() == Some("*") {
+                        state.resource.is_none()
+                    } else if let Some(ref matched) = if_match {
+                        state.resource.is_some()
+                            && (matched == &current_etag
+                                || (state.accept_stale_match && matched == "\"v1\""))
+                    } else {
+                        false
+                    };
+                    if allowed {
+                        let created = state.resource.is_none();
+                        state.resource = Some(body);
+                        state.version += 1;
+                        (
+                            if created {
+                                "201 Created"
+                            } else {
+                                "204 No Content"
+                            },
+                            vec![],
+                            None,
+                            "application/octet-stream",
+                        )
+                    } else {
+                        (
+                            "412 Precondition Failed",
+                            vec![],
+                            None,
+                            "application/octet-stream",
+                        )
+                    }
+                }
+                "DELETE" => {
+                    if if_match.is_some() {
+                        state.conditional_delete_seen = true;
+                        (
+                            "405 Method Not Allowed",
+                            vec![],
+                            None,
+                            "application/octet-stream",
+                        )
+                    } else {
+                        state.resource = None;
+                        ("204 No Content", vec![], None, "application/octet-stream")
+                    }
+                }
+                _ => (
+                    "405 Method Not Allowed",
+                    vec![],
+                    None,
+                    "application/octet-stream",
+                ),
+            }
+        } else {
+            ("404 Not Found", vec![], None, "application/octet-stream")
+        };
+        let mut headers = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n",
+            response_body.len()
+        );
+        if let Some(etag) = etag {
+            headers.push_str(&format!("ETag: {etag}\r\n"));
+        }
+        headers.push_str("\r\n");
+        let _ = stream.write_all(headers.as_bytes());
+        let _ = stream.write_all(&response_body);
+        let _ = stream.flush();
+    }
 
     fn entry(id: &str, title: &str, password: &str, revision: u64) -> VaultEntry {
         VaultEntry {
@@ -2406,6 +2671,107 @@ mod tests {
             verify_rejected_probe_writes(Some(&weak_etag), &expected, "\"probe-v1\""),
             Err(SyncError::UnsafeServer)
         ));
+    }
+
+    #[test]
+    fn competing_conditional_writes_require_one_winner_and_unchanged_loser() {
+        let left = [11_u8; 32];
+        let right = [12_u8; 32];
+        let winner_left = RemoteResource {
+            bytes: left.to_vec(),
+            etag: Some("\"probe-v2\"".into()),
+        };
+        let winner_right = RemoteResource {
+            bytes: right.to_vec(),
+            etag: Some("\"probe-v2\"".into()),
+        };
+        assert!(verify_competing_probe_writes(
+            StatusCode::CREATED,
+            StatusCode::PRECONDITION_FAILED,
+            Some(&winner_left),
+            &left,
+            &right,
+            "\"probe-v1\"",
+        )
+        .is_ok());
+        assert!(verify_competing_probe_writes(
+            StatusCode::LOCKED,
+            StatusCode::NO_CONTENT,
+            Some(&winner_right),
+            &left,
+            &right,
+            "\"probe-v1\"",
+        )
+        .is_ok());
+
+        for (left_status, right_status, fetched) in [
+            (StatusCode::OK, StatusCode::OK, Some(&winner_right)),
+            (
+                StatusCode::PRECONDITION_FAILED,
+                StatusCode::PRECONDITION_FAILED,
+                Some(&winner_left),
+            ),
+            (
+                StatusCode::OK,
+                StatusCode::PRECONDITION_FAILED,
+                Some(&winner_right),
+            ),
+            (StatusCode::OK, StatusCode::PRECONDITION_FAILED, None),
+        ] {
+            assert!(matches!(
+                verify_competing_probe_writes(
+                    left_status,
+                    right_status,
+                    fetched,
+                    &left,
+                    &right,
+                    "\"probe-v1\"",
+                ),
+                Err(SyncError::UnsafeServer)
+            ));
+        }
+
+        let stale_etag = RemoteResource {
+            bytes: left.to_vec(),
+            etag: Some("\"probe-v1\"".into()),
+        };
+        assert!(matches!(
+            verify_competing_probe_writes(
+                StatusCode::OK,
+                StatusCode::PRECONDITION_FAILED,
+                Some(&stale_etag),
+                &left,
+                &right,
+                "\"probe-v1\"",
+            ),
+            Err(SyncError::UnsafeServer)
+        ));
+    }
+
+    #[test]
+    fn webdav_probe_accepts_plain_delete_but_rejects_non_atomic_etag_updates() {
+        let safe = MockDavServer::new(false);
+        tauri::async_runtime::block_on(safe.client().verify_safe_conditions()).unwrap();
+        let safe_state = safe.state.lock().unwrap();
+        assert!(safe_state.resource.is_none());
+        assert!(!safe_state.conditional_delete_seen);
+        drop(safe_state);
+
+        let unsafe_server = MockDavServer::new(true);
+        let result =
+            tauri::async_runtime::block_on(unsafe_server.client().verify_safe_conditions());
+        assert!(matches!(result, Err(SyncError::UnsafeServer)));
+        let unsafe_state = unsafe_server.state.lock().unwrap();
+        assert!(unsafe_state.resource.is_none());
+        assert!(!unsafe_state.conditional_delete_seen);
+    }
+
+    #[test]
+    fn missing_webdav_collection_has_a_directory_error() {
+        let server = MockDavServer::new(false);
+        server.state.lock().unwrap().collection_exists = false;
+        let result = tauri::async_runtime::block_on(server.client().ensure_existing_collection());
+        assert!(matches!(result, Err(SyncError::NotACollection)));
     }
 
     #[test]
