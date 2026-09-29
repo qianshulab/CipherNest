@@ -94,6 +94,10 @@ pub enum SyncError {
     UnexpectedStatus(u16),
     #[error("WebDAV 网络操作失败。")]
     Transport,
+    #[error("WebDAV 网络请求超时。请检查网络及服务器端口。")]
+    Timeout,
+    #[error("无法建立 WebDAV HTTPS 连接。请检查服务器是否可达、端口是否启用 HTTPS，以及证书是否可信且与域名匹配。")]
+    SecureConnection,
     #[error("同步对象超过大小限制。")]
     TooLarge,
     #[error("同步数据包含无效字段。")]
@@ -346,7 +350,7 @@ impl WebDavClient {
             .body(PROPFIND_BODY)
             .send()
             .await
-            .map_err(|_| SyncError::Transport)?;
+            .map_err(classify_transport_error)?;
         if response.status() != StatusCode::MULTI_STATUS {
             return Err(status_error(response.status()));
         }
@@ -982,7 +986,7 @@ impl WebDavClient {
             .header(ACCEPT, "application/octet-stream")
             .send()
             .await
-            .map_err(|_| SyncError::Transport)?;
+            .map_err(classify_transport_error)?;
         if response.status() == StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -1019,7 +1023,7 @@ impl WebDavClient {
             .send()
             .await
             .map(|response| response.status())
-            .map_err(|_| SyncError::Transport)
+            .map_err(classify_transport_error)
     }
 
     async fn delete_resource(&self, name: &str, etag: Option<&str>) -> SyncResult<StatusCode> {
@@ -1032,7 +1036,7 @@ impl WebDavClient {
             .send()
             .await
             .map(|response| response.status())
-            .map_err(|_| SyncError::Transport)
+            .map_err(classify_transport_error)
     }
 }
 
@@ -2071,6 +2075,18 @@ fn dav_href_matches_endpoint(href: &str, endpoint: &Url) -> bool {
         && candidate.fragment().is_none()
 }
 
+fn classify_transport_error(error: reqwest::Error) -> SyncError {
+    // Reqwest errors can contain the requested URL. Only expose fixed,
+    // credential-free categories to the UI; never forward the error text.
+    if error.is_timeout() {
+        SyncError::Timeout
+    } else if error.is_connect() {
+        SyncError::SecureConnection
+    } else {
+        SyncError::Transport
+    }
+}
+
 async fn read_limited(mut response: reqwest::Response, limit: usize) -> SyncResult<Vec<u8>> {
     if response
         .content_length()
@@ -2079,7 +2095,7 @@ async fn read_limited(mut response: reqwest::Response, limit: usize) -> SyncResu
         return Err(SyncError::TooLarge);
     }
     let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|_| SyncError::Transport)? {
+    while let Some(chunk) = response.chunk().await.map_err(classify_transport_error)? {
         if bytes.len().saturating_add(chunk.len()) > limit {
             return Err(SyncError::TooLarge);
         }
