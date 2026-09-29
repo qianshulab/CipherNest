@@ -199,7 +199,12 @@ jobs:
           fi
 
           gh release upload "$tag" "${assets[@]}" --clobber
-          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" \
+          release_id="$(gh release view "$tag" --json databaseId --jq .databaseId)"
+          if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
+            echo "Unable to resolve the draft release ID for $tag." >&2
+            exit 1
+          fi
+          gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
             > release-assets/uploaded-release.json
           node scripts/release-tools.mjs verify-uploaded \
             --assets release-assets \

@@ -119,7 +119,7 @@ CipherNest 0.3.3 是**尚未经过独立安全审计的 beta 软件**。维护�
 - macOS 包仅使用 ad-hoc 签名，仍未配置可信的 Developer ID/notarization；Windows/Linux 也未配置可信发布签名，且没有签名更新器。
 - 内置 WebDAV 条件请求探测不等于完整互操作测试；当前尚未用至少一个真实服务端完成三平台端到端验证，也未对同步协议做独立审计。
 - Tauri、系统 WebView、TLS/HTTP/XML 依赖、WebDAV 服务和构建环境的漏洞仍可能影响应用；严格 CSP 不能消除原生 IPC 或依赖漏洞。
-- 2026-09-29 的 RustSec 扫描发现升级前锁定的 `rustls 0.23.43` 命中 [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285.html)（TLS 1.3 握手消息加密层级检查不严）。将 `rustls` 升至已修复的 `0.23.45` 后，复扫当前 `Cargo.lock` 报告 `vulnerability: 0`、`unmaintained: 6`、`unsound: 1`。`unsound` 项仍是 `glib 0.18.5` 的 `VariantStrIter`；停止维护警告涉及 GTK3 等传递依赖。`glib` 位于 Linux 的 Tauri/WebKitGTK/GTK3 依赖链，应用代码没有直接调用受影响 API，但这不能消除风险。扫描结果只反映当日公告库；Linux 正式发布前仍需在目标环境复核上游升级路径并重新审计。
+2026-09-29 的依赖检查发现 `rustls 0.23.43` 命中 [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285.html)，已升级至修复版 `0.23.45`。Linux 的 Tauri/GTK3 传递依赖仍包含 `glib 0.18.5`，命中 [GHSA-wrw7-89jp-8q8g](https://github.com/advisories/GHSA-wrw7-89jp-8q8g)（中危，`VariantStrIter` 未定义行为）。应用代码没有直接调用该 API，但不能据此排除框架内部的可达性。修复版 `glib 0.20.0` 与当前 GTK3 依赖链不兼容，需随上游 Tauri/Wry/GTK 更新；在兼容升级前持续跟踪告警并复核 Linux 构建。依赖扫描仍有停止维护的 GTK3 相关警告。
 
 ## 安全使用建议
 
