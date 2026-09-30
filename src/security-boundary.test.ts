@@ -258,7 +258,8 @@ describe("renderer security boundary", () => {
     expect(sensitiveInput).toContain("setOptionalActionAvailable(copy, Boolean(field.input.value))");
     expect(sensitiveInput).toContain("revealManagedSensitiveInput(managedField)");
     const row = sourceBetween("function renderEntryRow", "function renderEntryDetail");
-    expect(row).toContain('select.setAttribute("aria-label", entry.title)');
+    expect(row).toContain('select.setAttribute("aria-label", `${entry.title}');
+    expect(row).toContain("securityFlagSummary(entry.securityFlags)");
     expect(row).not.toMatch(/entry\.(?:username|purpose|tags)/);
     const list = sourceBetween("function renderEntryList", "function renderListSkeleton");
     expect(list).toContain('search.type = "password"');

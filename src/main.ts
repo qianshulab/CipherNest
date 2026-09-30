@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import brandLogoUrl from "./assets/ciphernest-logo-ui-v1.png";
 import { describeEntrySaveFailure, describeUnlockFailure, type EntryField } from "./entry-errors";
+import { captureViewPosition, restoreViewPosition } from "./view-state";
 import "./styles.css";
 
 import type {
@@ -99,6 +100,8 @@ interface AppState {
   sort: EntrySort;
   query: string;
   entries: EntrySummary[];
+  visibleEntryCount: number;
+  entryListKey: string;
   listLoading: boolean;
   listError: boolean;
   selectedId: string | null;
@@ -179,6 +182,8 @@ const state: AppState = {
   sort: "updated_desc",
   query: "",
   entries: [],
+  visibleEntryCount: 200,
+  entryListKey: "",
   listLoading: false,
   listError: false,
   selectedId: null,
@@ -207,6 +212,7 @@ const app = document.querySelector<HTMLElement>("#app")!;
 if (!app) throw new Error("缺少应用挂载节点");
 const compactNavigationMedia = window.matchMedia("(max-width: 860px)");
 const compactSettingsMedia = window.matchMedia("(max-width: 1100px)");
+const ENTRY_PAGE_SIZE = 200;
 
 const iconPaths: Record<IconName, string[]> = {
   alert: ["M12 9v4", "M12 17h.01", "M10.3 3.6 2.4 17.2a2 2 0 0 0 1.8 2.8h15.6a2 2 0 0 0 1.8-2.8L13.7 3.6a2 2 0 0 0-3.4 0Z"],
@@ -871,14 +877,12 @@ function renderMainShell(): void {
         master: app.querySelector<HTMLElement>(".settings-master-card"),
       }
     : null;
-  const focusedSettingsElement = reusableSettingsCards?.security?.contains(document.activeElement)
-    || reusableSettingsCards?.master?.contains(document.activeElement)
-    ? document.activeElement as HTMLElement
-    : null;
+  const position = captureViewPosition(app);
   hideAllManagedSensitiveInputs();
   hideNotes();
   clearNode(app);
   const shell = makeElement("div", "app-shell");
+  shell.dataset.view = state.view;
   const topbar = renderTopbar();
   shell.append(topbar);
 
@@ -909,7 +913,12 @@ function renderMainShell(): void {
     state.entryMutation !== null || state.syncOperation !== null || state.securityOperation !== null,
   );
   updateClipboardStatus();
-  if (focusedSettingsElement?.isConnected) focusedSettingsElement.focus({ preventScroll: true });
+  if (!hasOpenModal()) restoreViewPosition(app, position, state.view);
+}
+
+function needsBackupAttention(): boolean {
+  const backup = state.overview.autoBackup;
+  return backup.inspectionFailed || !backup.currentCovered || Boolean(backup.warning);
 }
 
 function renderTopbar(): HTMLElement {
@@ -918,6 +927,7 @@ function renderTopbar(): HTMLElement {
   const menu = iconButton("打开导航", "menu", () => {
     setMobileNavOpen(!state.mobileNavOpen, true);
   }, "icon-button mobile-menu");
+  menu.dataset.focusKey = "topbar-menu";
   menu.setAttribute("aria-controls", "vault-sidebar");
   menu.setAttribute("aria-expanded", String(state.mobileNavOpen));
   const mark = makeElement("div", "brand-mark brand-mark-small brand-logo");
@@ -927,15 +937,25 @@ function renderTopbar(): HTMLElement {
   const stateBadge = makeElement("div", "vault-state");
   stateBadge.append(makeElement("span", "status-dot"), makeElement("span", "", "已解锁"));
   left.append(menu, mark, name, stateBadge);
+  if (needsBackupAttention()) {
+    const backupAlert = makeButton("自动备份需检查", "backup-attention", () => switchView("settings"), "alert");
+    backupAlert.dataset.focusKey = "backup-attention";
+    backupAlert.setAttribute("aria-label", "自动备份需检查，打开设置查看详情");
+    backupAlert.title = "当前保险库的自动备份状态需检查。打开设置查看详情。";
+    left.append(backupAlert);
+  }
 
   const actions = makeElement("div", "topbar-actions");
   const generate = makeButton("生成密码", "button button-ghost topbar-button", () => openGenerator("standalone"), "key");
+  generate.dataset.focusKey = "topbar-generator";
   generate.title = shortcutTitle("G");
   generate.dataset.securityMutation = "true";
   const add = makeButton("新建条目", "button button-primary topbar-button", createNewEntry, "plus");
+  add.dataset.focusKey = "topbar-add";
   add.title = shortcutTitle("N");
   add.dataset.securityMutation = "true";
   const lock = iconButton("立即锁定", "lock", manualLock, "icon-button lock-button");
+  lock.dataset.focusKey = "topbar-lock";
   lock.title = `立即锁定 (${shortcutLabel("L")})`;
   actions.append(generate, add, lock);
   topbar.append(left, actions);
@@ -1015,6 +1035,7 @@ function navItem(
 ): HTMLButtonElement {
   const button = makeElement("button", `nav-item${state.view === view ? " is-active" : ""}`);
   button.type = "button";
+  button.dataset.focusKey = `nav-${view}`;
   if (state.view === view) button.setAttribute("aria-current", "page");
   button.append(icon(iconName, 18), makeElement("span", "nav-label", label));
   if (alertCount) {
@@ -1110,6 +1131,9 @@ function renderEntryList(): HTMLElement {
   const titleRow = makeElement("div", "list-title-row");
   const title = makeElement("h1", "panel-title", state.view === "favorites" ? "收藏" : "全部条目");
   const count = makeElement("span", "count-chip", String(state.entries.length));
+  count.setAttribute("role", "status");
+  count.setAttribute("aria-live", "polite");
+  count.setAttribute("aria-label", `共 ${state.entries.length.toLocaleString("zh-CN")} 个匹配条目`);
   titleRow.append(title, count);
   header.append(titleRow);
 
@@ -1141,7 +1165,7 @@ function renderEntryList(): HTMLElement {
     state.query = search.value;
     setOptionalActionAvailable(clearSearch, Boolean(search.value));
     if (listDebounce) window.clearTimeout(listDebounce);
-    listDebounce = window.setTimeout(() => void loadEntries(true, undefined, true), 220);
+    listDebounce = window.setTimeout(() => void loadEntries(true), 220);
   });
   searchActions.append(searchReveal, clearSearch);
   searchWrap.append(search, searchActions);
@@ -1150,6 +1174,7 @@ function renderEntryList(): HTMLElement {
   const toolbar = makeElement("div", "list-toolbar");
   const selectWrap = makeElement("div", "select-wrap compact-select");
   const sort = makeElement("select", "select") as HTMLSelectElement;
+  sort.dataset.focusKey = "entry-sort";
   sort.setAttribute("aria-label", "条目排序");
   const options: Array<[EntrySort, string]> = [
     ["updated_desc", "最近更新"],
@@ -1167,13 +1192,15 @@ function renderEntryList(): HTMLElement {
     void loadEntries(true);
   });
   selectWrap.append(sort, icon("chevron", 15));
-  toolbar.append(selectWrap, makeButton("新建", "button button-small button-secondary", createNewEntry, "plus"));
+  const newEntry = makeButton("新建", "button button-small button-secondary", createNewEntry, "plus");
+  newEntry.dataset.focusKey = "entry-new";
+  toolbar.append(selectWrap, newEntry);
   header.append(toolbar);
   panel.append(header);
 
   const list = makeElement("div", "entry-list");
+  list.dataset.scrollKey = "entry-list";
   list.setAttribute("role", "list");
-  list.setAttribute("aria-live", "polite");
   list.setAttribute("aria-busy", String(state.listLoading));
   if (state.listLoading) {
     const loadingStatus = makeElement("span", "sr-only", "正在读取条目列表…");
@@ -1195,7 +1222,30 @@ function renderEntryList(): HTMLElement {
   } else if (!state.entries.length) {
     list.append(renderListEmpty());
   } else {
-    for (const entry of state.entries) list.append(renderEntryRow(entry));
+    for (const entry of state.entries.slice(0, state.visibleEntryCount)) list.append(renderEntryRow(entry));
+    if (state.entries.length > state.visibleEntryCount) {
+      const progress = makeElement("div", "list-pagination");
+      progress.setAttribute("role", "listitem");
+      progress.append(makeElement(
+        "span",
+        "list-progress",
+        `已显示 ${state.visibleEntryCount.toLocaleString("zh-CN")} / ${state.entries.length.toLocaleString("zh-CN")} 项`,
+      ));
+      const more = makeButton("加载更多条目", "button button-secondary button-small", () => {
+        const firstNew = state.entries[state.visibleEntryCount];
+        state.visibleEntryCount = Math.min(state.entries.length, state.visibleEntryCount + ENTRY_PAGE_SIZE);
+        renderMainShell();
+        if (firstNew) {
+          const key = `entry-${firstNew.id}-select`;
+          Array.from(document.querySelectorAll<HTMLElement>("[data-focus-key]"))
+            .find((element) => element.dataset.focusKey === key)
+            ?.focus();
+        }
+      });
+      more.dataset.focusKey = "entry-load-more";
+      progress.append(more);
+      list.append(progress);
+    }
   }
   panel.append(list);
   return panel;
@@ -1237,7 +1287,8 @@ function renderEntryRow(entry: EntrySummary): HTMLElement {
   row.setAttribute("role", "listitem");
   const select = makeElement("button", "entry-row-main");
   select.type = "button";
-  select.setAttribute("aria-label", entry.title);
+  select.dataset.focusKey = `entry-${entry.id}-select`;
+  select.setAttribute("aria-label", `${entry.title}${entry.securityFlags.length ? `，${securityFlagSummary(entry.securityFlags)}` : ""}`);
   if (state.selectedId === entry.id) select.setAttribute("aria-current", "true");
   const avatar = makeElement("div", "entry-avatar", firstCharacter(entry.title));
   avatar.setAttribute("aria-hidden", "true");
@@ -1262,7 +1313,8 @@ function renderEntryRow(entry: EntrySummary): HTMLElement {
   if (!Number.isNaN(updatedDate.getTime())) updated.dateTime = updatedDate.toISOString();
   meta.append(updated);
   body.append(first, subtitle, meta);
-  const star = iconButton(entry.favorite ? "取消收藏" : "收藏", "favorite", async () => toggleFavorite(entry), `entry-star${entry.favorite ? " is-active" : ""}`);
+  const star = iconButton(entry.favorite ? `取消收藏“${entry.title}”` : `收藏“${entry.title}”`, "favorite", async () => toggleFavorite(entry), `entry-star${entry.favorite ? " is-active" : ""}`);
+  star.dataset.focusKey = `entry-${entry.id}-favorite`;
   star.setAttribute("aria-pressed", String(entry.favorite));
   select.append(avatar, body);
   select.addEventListener("click", () => void selectEntry(entry.id));
@@ -1272,6 +1324,7 @@ function renderEntryRow(entry: EntrySummary): HTMLElement {
 
 function renderEntryDetail(): HTMLElement {
   const panel = makeElement("section", "entry-detail-panel");
+  panel.dataset.scrollKey = "entry-detail";
   panel.setAttribute("aria-label", "条目详情");
   if (state.detailLoading) {
     const loading = makeElement("div", "detail-loading");
@@ -1623,6 +1676,7 @@ function appendMetadata(list: HTMLDListElement, label: string, value?: string | 
 
 function renderSecurityPage(): HTMLElement {
   const page = makeElement("div", "workspace-page security-page");
+  page.dataset.scrollKey = "workspace-page";
   const header = pageHeader("SECURITY REPORT", "安全检查", "检查弱密码、重复使用和长期未更换的密码。所有分析均在本机完成。");
   const refresh = makeButton("重新检查", "button button-secondary", async () => {
     state.reportLoading = true;
@@ -1732,6 +1786,7 @@ async function openIssue(entryId: string): Promise<void> {
 
 function renderSettingsPage(): HTMLElement {
   const page = makeElement("div", "workspace-page settings-page");
+  page.dataset.scrollKey = "workspace-page";
   page.append(pageHeader("LOCAL PREFERENCES", "设置", "安全偏好仅保存在当前设备。"));
 
   const layout = makeElement("div", "settings-layout");
@@ -2535,6 +2590,7 @@ async function loadEntries(
     sort: state.sort,
   };
   const query = state.query.trim();
+  const listKey = JSON.stringify([args.filter, state.sort, query]);
   if (query) args.query = query;
   try {
     const entries = await invokeCommand<EntrySummary[]>("list_entries", args);
@@ -2542,11 +2598,18 @@ async function loadEntries(
       return false;
     }
     state.entries = entries;
+    const listChanged = state.entryListKey !== listKey;
+    if (listChanged) state.visibleEntryCount = ENTRY_PAGE_SIZE;
+    state.entryListKey = listKey;
     state.status.itemCount = Math.max(state.status.itemCount, entries.length);
     state.listLoading = false;
     state.listError = false;
     if (render) {
       renderMainShell();
+      if (listChanged) {
+        const list = document.querySelector<HTMLElement>(".entry-list");
+        if (list) list.scrollTop = 0;
+      }
       if (restoreSearchFocus) focusSearchAtEnd();
     }
     return true;
@@ -2753,15 +2816,18 @@ async function saveCurrentEntry(button?: HTMLButtonElement): Promise<boolean> {
     state.report = null;
     state.entryMutation = null;
     renderMainShell();
+    const backupNeedsAttention = needsBackupAttention();
     showToast(
       !listRefreshed
         ? draftChangedWhileSaving
           ? "上一版已保存，新的编辑仍保留；条目列表刷新失败，请重试读取。"
           : "条目已加密保存，但列表刷新失败，请点击“重试读取”。"
+        : backupNeedsAttention
+          ? "条目已保存，但无法确认当前版本的自动备份。请打开设置检查备份状态并导出加密备份。"
         : draftChangedWhileSaving
           ? "上一版已保存；保存期间检测到的新修改仍保留在编辑器中。"
           : "条目已加密保存到本地。",
-      !listRefreshed || draftChangedWhileSaving ? "warning" : "success",
+      !listRefreshed || draftChangedWhileSaving || backupNeedsAttention ? "warning" : "success",
     );
     return true;
   } catch (error) {
@@ -3832,6 +3898,8 @@ function clearSensitiveState(clearMetadata: boolean): void {
   autoLockTimeout = null;
   clearEntryDraft();
   state.query = "";
+  state.visibleEntryCount = ENTRY_PAGE_SIZE;
+  state.entryListKey = "";
   state.report = null;
   state.reportLoading = false;
   state.reportError = false;
