@@ -4,7 +4,7 @@ use std::{
     io::Read,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     thread,
@@ -15,7 +15,7 @@ use std::{
 use std::fs;
 
 use sha2::{Digest, Sha256};
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_dialog::DialogExt;
 use tokio::sync::watch;
@@ -37,6 +37,7 @@ use crate::{
     },
     sync::{self, SyncContent, SyncError, WebDavClient},
     vault::{now_ms, sync_contents_equal, ExistingSyncContext, VaultStore},
+    webdav_backup::{self, BackupConfig, WebDavBackupClient, WebDavBackupItem, WebDavBackupStatus},
 };
 
 #[derive(Clone)]
@@ -159,6 +160,9 @@ pub struct AppState {
     pending_sync_preview: Arc<Mutex<Option<PendingSyncPreview>>>,
     sync_operation_active: Arc<AtomicBool>,
     sync_cancel_epoch: watch::Sender<u64>,
+    backup_schedule_sequence: Arc<AtomicU64>,
+    backup_configuration_epoch: Arc<AtomicU64>,
+    backup_upload_queue: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AppState {
@@ -171,6 +175,9 @@ impl AppState {
             pending_sync_preview: Arc::new(Mutex::new(None)),
             sync_operation_active: Arc::new(AtomicBool::new(false)),
             sync_cancel_epoch,
+            backup_schedule_sequence: Arc::new(AtomicU64::new(0)),
+            backup_configuration_epoch: Arc::new(AtomicU64::new(0)),
+            backup_upload_queue: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -178,6 +185,82 @@ impl AppState {
         self.sync_cancel_epoch
             .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
     }
+}
+
+fn schedule_auto_webdav_backup(app: &AppHandle, state: &State<'_, AppState>) {
+    // Refresh the UI during the debounce window, when the current generation
+    // is already durable locally but still pending remotely.
+    let _ = app.emit("ciphernest://webdav-backup-status", ());
+    let ticket = state
+        .backup_schedule_sequence
+        .fetch_add(1, Ordering::AcqRel)
+        + 1;
+    let sequence = Arc::clone(&state.backup_schedule_sequence);
+    let upload_queue = Arc::clone(&state.backup_upload_queue);
+    let store = Arc::clone(&state.store);
+    let cancellation = state.sync_cancel_epoch.clone();
+    let authorized_epoch = *cancellation.borrow();
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        if sequence.load(Ordering::Acquire) != ticket || *cancellation.borrow() != authorized_epoch
+        {
+            return;
+        }
+        let _queue_guard = upload_queue.lock().await;
+        if sequence.load(Ordering::Acquire) != ticket || *cancellation.borrow() != authorized_epoch
+        {
+            return;
+        }
+        let context = match run_store(Arc::clone(&store), VaultStore::remote_backup_context).await {
+            Ok(context) => context,
+            Err(_) => return,
+        };
+        if !context.config.automatic
+            || context
+                .config
+                .last_uploaded_generation
+                .is_some_and(|generation| generation >= context.generation)
+        {
+            return;
+        }
+        let outcome = match WebDavBackupClient::new(
+            &context.config.endpoint,
+            context.config.username.clone(),
+            context.config.app_password.clone(),
+        ) {
+            Ok(client) => client
+                .upload(
+                    &context.bytes,
+                    &context.vault_id,
+                    context.generation,
+                    context.updated_at,
+                )
+                .await
+                .map(|_| ()),
+            Err(error) => Err(error),
+        };
+        if *cancellation.borrow() != authorized_epoch {
+            return;
+        }
+        match outcome {
+            Ok(()) => {
+                let uploaded_at = now_ms();
+                let _ = run_store(Arc::clone(&store), move |store| {
+                    store.mark_remote_backup_uploaded(&context, uploaded_at)
+                })
+                .await;
+            }
+            Err(error) => {
+                let warning = format!("自动备份失败：{error}");
+                let _ = run_store(Arc::clone(&store), move |store| {
+                    store.mark_remote_backup_warning(&context, warning)
+                })
+                .await;
+            }
+        }
+        let _ = app.emit("ciphernest://webdav-backup-status", ());
+    });
 }
 
 pub(crate) fn lock_for_lifecycle(app: &AppHandle) {
@@ -222,16 +305,19 @@ pub async fn create_vault(
 
 #[tauri::command]
 pub async fn unlock_vault(
+    app: AppHandle,
     state: State<'_, AppState>,
     master_password: String,
 ) -> VaultResult<VaultStatus> {
     clear_pending_sync_preview_state(&state.pending_sync_preview)?;
     let store = Arc::clone(&state.store);
-    run_store(store, move |store| {
+    let status = run_store(store, move |store| {
         let password = Zeroizing::new(master_password);
         store.unlock(password.as_str())
     })
-    .await
+    .await?;
+    schedule_auto_webdav_backup(&app, &state);
+    Ok(status)
 }
 
 #[tauri::command]
@@ -282,15 +368,19 @@ pub async fn get_entry(state: State<'_, AppState>, id: String) -> VaultResult<Va
 
 #[tauri::command]
 pub async fn save_entry(
+    app: AppHandle,
     state: State<'_, AppState>,
     input: EntryInput,
 ) -> VaultResult<EntrySummary> {
     let store = Arc::clone(&state.store);
-    run_store(store, move |store| store.save_entry(input)).await
+    let saved = run_store(store, move |store| store.save_entry(input)).await?;
+    schedule_auto_webdav_backup(&app, &state);
+    Ok(saved)
 }
 
 #[tauri::command]
 pub async fn delete_entry(
+    app: AppHandle,
     state: State<'_, AppState>,
     id: String,
     expected_revision: u64,
@@ -299,21 +389,26 @@ pub async fn delete_entry(
     run_store(store, move |store| {
         store.delete_entry(&id, expected_revision)
     })
-    .await
+    .await?;
+    schedule_auto_webdav_backup(&app, &state);
+    Ok(())
 }
 
 #[tauri::command]
 pub async fn set_favorite(
+    app: AppHandle,
     state: State<'_, AppState>,
     id: String,
     favorite: bool,
     expected_revision: u64,
 ) -> VaultResult<u64> {
     let store = Arc::clone(&state.store);
-    run_store(store, move |store| {
+    let revision = run_store(store, move |store| {
         store.set_favorite(&id, favorite, expected_revision)
     })
-    .await
+    .await?;
+    schedule_auto_webdav_backup(&app, &state);
+    Ok(revision)
 }
 
 #[tauri::command]
@@ -331,11 +426,14 @@ pub async fn get_settings(state: State<'_, AppState>) -> VaultResult<VaultSettin
 
 #[tauri::command]
 pub async fn update_settings(
+    app: AppHandle,
     state: State<'_, AppState>,
     settings: VaultSettings,
 ) -> VaultResult<()> {
     let store = Arc::clone(&state.store);
-    run_store(store, move |store| store.update_settings(settings)).await
+    run_store(store, move |store| store.update_settings(settings)).await?;
+    schedule_auto_webdav_backup(&app, &state);
+    Ok(())
 }
 
 #[tauri::command]
@@ -448,6 +546,7 @@ pub async fn inspect_webdav_sync(
 
 #[tauri::command]
 pub async fn join_webdav_sync(
+    app: AppHandle,
     state: State<'_, AppState>,
     mut request: WebDavJoinInput,
 ) -> VaultResult<WebDavSyncOutcome> {
@@ -514,6 +613,7 @@ pub async fn join_webdav_sync(
                 )
             })
             .await?;
+            schedule_auto_webdav_backup(&app, &state);
             Ok(WebDavSyncOutcome {
                 kind: WebDavSyncOutcomeKind::Downloaded,
                 conflicts: 0,
@@ -552,6 +652,7 @@ pub async fn join_webdav_sync(
                 )
             })
             .await?;
+            schedule_auto_webdav_backup(&app, &state);
             Ok(WebDavSyncOutcome {
                 kind: WebDavSyncOutcomeKind::Merged,
                 conflicts: conflict_count,
@@ -563,7 +664,10 @@ pub async fn join_webdav_sync(
 }
 
 #[tauri::command]
-pub async fn sync_webdav_now(state: State<'_, AppState>) -> VaultResult<WebDavSyncOutcome> {
+pub async fn sync_webdav_now(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> VaultResult<WebDavSyncOutcome> {
     let _operation = SyncOperationGuard::acquire(&state.sync_operation_active)?;
     let authorized_epoch = *state.sync_cancel_epoch.borrow();
     let mut context =
@@ -615,6 +719,7 @@ pub async fn sync_webdav_now(state: State<'_, AppState>) -> VaultResult<WebDavSy
             )?;
             let sequence = cursor.snapshot().sequence();
             let status = commit_existing_sync_context(&state, context, Some(content)).await?;
+            schedule_auto_webdav_backup(&app, &state);
             return Ok(WebDavSyncOutcome {
                 kind: WebDavSyncOutcomeKind::Downloaded,
                 conflicts: 0,
@@ -684,6 +789,7 @@ pub async fn sync_webdav_now(state: State<'_, AppState>) -> VaultResult<WebDavSy
                 let sequence = committed.snapshot().sequence();
                 let status =
                     commit_existing_sync_context(&state, context, Some(merged_content)).await?;
+                schedule_auto_webdav_backup(&app, &state);
                 return Ok(WebDavSyncOutcome {
                     kind: WebDavSyncOutcomeKind::Merged,
                     conflicts: conflict_count,
@@ -744,6 +850,7 @@ pub async fn security_report(state: State<'_, AppState>) -> VaultResult<Security
 
 #[tauri::command]
 pub async fn change_master_password(
+    app: AppHandle,
     state: State<'_, AppState>,
     current_password: String,
     new_password: String,
@@ -757,6 +864,7 @@ pub async fn change_master_password(
     .await?;
     state.cancel_sync_operations();
     clear_pending_sync_preview_state(&state.pending_sync_preview)?;
+    schedule_auto_webdav_backup(&app, &state);
     Ok(result)
 }
 
@@ -838,6 +946,258 @@ pub async fn export_backup(
         .to_string();
     run_store(store, move |store| store.export_to(&target)).await?;
     Ok(Some(display_name))
+}
+
+#[tauri::command]
+pub async fn webdav_backup_status(state: State<'_, AppState>) -> VaultResult<WebDavBackupStatus> {
+    run_store(Arc::clone(&state.store), VaultStore::remote_backup_status).await
+}
+
+#[tauri::command]
+pub async fn webdav_backup_test_config(
+    state: State<'_, AppState>,
+    mut credentials: WebDavCredentialsInput,
+) -> VaultResult<()> {
+    run_store(Arc::clone(&state.store), |store| {
+        store.prepare_sensitive_action().map(|_| ())
+    })
+    .await?;
+    if credentials.app_password.is_empty() {
+        let existing = run_store(Arc::clone(&state.store), VaultStore::remote_backup_config)
+            .await?
+            .ok_or_else(|| VaultError::InvalidInput("请输入 WebDAV 密码。".into()))?;
+        if existing.endpoint != credentials.endpoint || existing.username != credentials.username {
+            return Err(VaultError::InvalidInput(
+                "修改 WebDAV 地址或用户名时需要重新输入密码。".into(),
+            ));
+        }
+        credentials.app_password = existing.app_password.clone();
+    }
+    let client = backup_client_from_input(&credentials)?;
+    client.test_read_write_delete().await
+}
+
+#[tauri::command]
+pub async fn webdav_backup_save_config(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    mut credentials: WebDavCredentialsInput,
+    automatic: bool,
+) -> VaultResult<WebDavBackupStatus> {
+    let configuration_epoch = state.backup_configuration_epoch.load(Ordering::Acquire);
+    let (vault_id, session_id) = run_store(
+        Arc::clone(&state.store),
+        VaultStore::remote_backup_session_identity,
+    )
+    .await?;
+    let existing = match run_store(Arc::clone(&state.store), VaultStore::remote_backup_config).await
+    {
+        Ok(config) => config,
+        Err(VaultError::WebDavBackup(_)) if !credentials.app_password.is_empty() => None,
+        Err(error) => return Err(error),
+    };
+    if credentials.app_password.is_empty() {
+        let saved = existing
+            .as_ref()
+            .ok_or_else(|| VaultError::InvalidInput("请输入 WebDAV 密码。".into()))?;
+        if saved.endpoint != credentials.endpoint || saved.username != credentials.username {
+            return Err(VaultError::InvalidInput(
+                "修改 WebDAV 地址或用户名时需要重新输入密码。".into(),
+            ));
+        }
+        credentials.app_password = saved.app_password.clone();
+    }
+    run_store(Arc::clone(&state.store), |store| {
+        store.prepare_sensitive_action().map(|_| ())
+    })
+    .await?;
+    let client = backup_client_from_input(&credentials)?;
+    client.test_read_write_delete().await?;
+    let same_target = existing.as_ref().is_some_and(|saved| {
+        saved.endpoint == credentials.endpoint
+            && saved.username == credentials.username
+            && saved.app_password == credentials.app_password
+    });
+    let config = BackupConfig {
+        endpoint: std::mem::take(&mut credentials.endpoint),
+        username: std::mem::take(&mut credentials.username),
+        app_password: std::mem::take(&mut credentials.app_password),
+        automatic,
+        last_upload_at: same_target
+            .then(|| existing.as_ref().and_then(|saved| saved.last_upload_at))
+            .flatten(),
+        last_uploaded_generation: same_target
+            .then(|| {
+                existing
+                    .as_ref()
+                    .and_then(|saved| saved.last_uploaded_generation)
+            })
+            .flatten(),
+        warning: None,
+    };
+    let queue_guard = state.backup_upload_queue.lock().await;
+    if state.backup_configuration_epoch.load(Ordering::Acquire) != configuration_epoch {
+        return Err(VaultError::InvalidInput(
+            "备份配置在测试期间已变更，请重新提交。".into(),
+        ));
+    }
+    let status = run_store(Arc::clone(&state.store), move |store| {
+        store.save_remote_backup_config(&vault_id, &session_id, &config)
+    })
+    .await?;
+    state
+        .backup_configuration_epoch
+        .fetch_add(1, Ordering::AcqRel);
+    drop(queue_guard);
+    if status.automatic {
+        schedule_auto_webdav_backup(&app, &state);
+    }
+    Ok(status)
+}
+
+#[tauri::command]
+pub async fn webdav_backup_disable(app: AppHandle, state: State<'_, AppState>) -> VaultResult<()> {
+    // Invalidate debounced jobs first, then wait for any already-started PUT
+    // and readback to finish before reporting that backup is disabled.
+    state
+        .backup_schedule_sequence
+        .fetch_add(1, Ordering::AcqRel);
+    state
+        .backup_configuration_epoch
+        .fetch_add(1, Ordering::AcqRel);
+    let _queue_guard = state.backup_upload_queue.lock().await;
+    run_store(Arc::clone(&state.store), VaultStore::disable_remote_backup).await?;
+    let _ = app.emit("ciphernest://webdav-backup-status", ());
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn webdav_backup_upload(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> VaultResult<WebDavBackupItem> {
+    // An explicit upload supersedes a pending debounced automatic upload.
+    state
+        .backup_schedule_sequence
+        .fetch_add(1, Ordering::AcqRel);
+    let _queue_guard = state.backup_upload_queue.lock().await;
+    let context = run_store(Arc::clone(&state.store), VaultStore::remote_backup_context).await?;
+    let client = WebDavBackupClient::new(
+        &context.config.endpoint,
+        context.config.username.clone(),
+        context.config.app_password.clone(),
+    )?;
+    let item = client
+        .upload(
+            &context.bytes,
+            &context.vault_id,
+            context.generation,
+            context.updated_at,
+        )
+        .await?;
+    let uploaded_at = now_ms();
+    run_store(Arc::clone(&state.store), move |store| {
+        store.mark_remote_backup_uploaded(&context, uploaded_at)
+    })
+    .await
+    .map_err(|error| {
+        VaultError::WebDavBackup(format!(
+            "备份已上传并回读校验，但本机状态记录失败；远端可能已有该备份：{error}"
+        ))
+    })?;
+    let _ = app.emit("ciphernest://webdav-backup-status", ());
+    Ok(item)
+}
+
+#[tauri::command]
+pub async fn webdav_backup_list(state: State<'_, AppState>) -> VaultResult<Vec<WebDavBackupItem>> {
+    let config = run_store(Arc::clone(&state.store), VaultStore::remote_backup_config)
+        .await?
+        .ok_or(VaultError::BackupNotConfigured)?;
+    let client = WebDavBackupClient::new(
+        &config.endpoint,
+        config.username.clone(),
+        config.app_password.clone(),
+    )?;
+    client.list().await
+}
+
+#[tauri::command]
+pub async fn webdav_backup_list_with_credentials(
+    credentials: WebDavCredentialsInput,
+) -> VaultResult<Vec<WebDavBackupItem>> {
+    let client = backup_client_from_input(&credentials)?;
+    client.list().await
+}
+
+#[tauri::command]
+pub async fn webdav_backup_prepare_restore(
+    state: State<'_, AppState>,
+    file_name: String,
+) -> VaultResult<RestoreSelection> {
+    let config = run_store(Arc::clone(&state.store), VaultStore::remote_backup_config)
+        .await?
+        .ok_or(VaultError::BackupNotConfigured)?;
+    let client = WebDavBackupClient::new(
+        &config.endpoint,
+        config.username.clone(),
+        config.app_password.clone(),
+    )?;
+    prepare_remote_restore(&state, client, file_name).await
+}
+
+#[tauri::command]
+pub async fn webdav_backup_prepare_restore_with_credentials(
+    state: State<'_, AppState>,
+    credentials: WebDavCredentialsInput,
+    file_name: String,
+) -> VaultResult<RestoreSelection> {
+    let client = backup_client_from_input(&credentials)?;
+    prepare_remote_restore(&state, client, file_name).await
+}
+
+fn backup_client_from_input(
+    credentials: &WebDavCredentialsInput,
+) -> VaultResult<WebDavBackupClient> {
+    WebDavBackupClient::new(
+        &credentials.endpoint,
+        credentials.username.clone(),
+        credentials.app_password.clone(),
+    )
+}
+
+async fn prepare_remote_restore(
+    state: &State<'_, AppState>,
+    client: WebDavBackupClient,
+    file_name: String,
+) -> VaultResult<RestoreSelection> {
+    let authorized_epoch = *state.sync_cancel_epoch.borrow();
+    clear_pending_restore_state(&state.pending_restore)?;
+    clear_pending_sync_preview_state(&state.pending_sync_preview)?;
+    if !webdav_backup::valid_backup_name(&file_name) {
+        return Err(VaultError::InvalidInput("远端备份文件名无效。".into()));
+    }
+    let bytes = Zeroizing::new(client.download(&file_name).await?);
+    require_sync_epoch(&state.sync_cancel_epoch, authorized_epoch)?;
+    let file_size = bytes.len() as u64;
+    let envelope = parse_envelope_bytes(&bytes)?;
+    let token = Uuid::new_v4().to_string();
+    replace_pending_restore(
+        &state.pending_restore,
+        PendingRestore {
+            token: Zeroizing::new(token.clone()),
+            selected_at: Instant::now(),
+            file_name: file_name.clone(),
+            envelope,
+            verified: None,
+            target_fingerprint: None,
+        },
+    )?;
+    Ok(RestoreSelection {
+        token,
+        file_name,
+        file_size,
+    })
 }
 
 #[tauri::command]

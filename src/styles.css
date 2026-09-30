@@ -728,7 +728,7 @@ p {
   align-self: start;
   align-self: safe center;
   width: min(438px, 100%);
-  margin: 12px auto;
+  margin: 8px auto;
   border: 1px solid var(--border);
   border-radius: 16px;
   padding: 30px;
@@ -2143,6 +2143,137 @@ p {
   flex-wrap: wrap;
   gap: 9px;
   padding: 15px 18px 18px;
+}
+
+.webdav-backup-settings {
+  margin: 0 18px 18px;
+  border-top: 1px solid var(--border-soft);
+  padding-top: 16px;
+}
+
+.webdav-backup-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text);
+}
+
+.webdav-backup-heading svg {
+  color: var(--orange);
+}
+
+.webdav-backup-heading h3 {
+  margin: 0;
+  font-size: 12px;
+}
+
+.webdav-backup-summary,
+.webdav-backup-details {
+  margin: 9px 0 0;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.webdav-backup-storage-note {
+  margin: 7px 0 0;
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 1.55;
+}
+
+.webdav-backup-details {
+  display: grid;
+  gap: 3px;
+  color: var(--text-muted);
+}
+
+.webdav-backup-settings > .inline-notice {
+  margin-top: 13px;
+}
+
+.webdav-backup-actions {
+  padding: 14px 0 0;
+}
+
+.webdav-backup-settings .inline-notice .webdav-backup-actions {
+  grid-column: 2;
+  padding: 9px 0 0;
+}
+
+.webdav-backup-automatic {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin-top: 14px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.webdav-backup-automatic input {
+  margin-top: 2px;
+  accent-color: var(--orange);
+}
+
+.webdav-backup-feedback {
+  min-height: 17px;
+  margin: 0;
+}
+
+.webdav-backup-list {
+  display: grid;
+  max-height: min(380px, 42vh);
+  gap: 8px;
+  overflow-y: auto;
+  margin-top: 12px;
+  padding-right: 4px;
+}
+
+.webdav-backup-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  padding: 10px;
+  background: rgba(10, 12, 15, 0.3);
+}
+
+.webdav-backup-item-copy {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+  overflow-wrap: anywhere;
+}
+
+.webdav-backup-item-copy strong {
+  color: var(--text);
+  font-size: 11px;
+}
+
+.webdav-backup-item-copy span,
+.webdav-backup-item-copy small,
+.webdav-backup-empty {
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.webdav-backup-item .button {
+  flex-shrink: 0;
+}
+
+@media (max-width: 560px) {
+  .webdav-backup-item {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .webdav-backup-item .button {
+    align-self: flex-start;
+  }
 }
 
 .compact-form {
