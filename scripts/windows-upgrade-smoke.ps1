@@ -4,12 +4,12 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$expectedOldHash = '0AFC150841DC813D128F41B8ACF45C73C9BBB3D0D153C4D46F2023AFE8913A26'
+$expectedOldHash = '36DF6A9B68203CB0E442294C68902D8EB6226C484AD1277C273621578A7E96E7'
 $oldPath = (Resolve-Path -LiteralPath $OldInstaller).Path
 $newPath = (Resolve-Path -LiteralPath $NewInstaller).Path
 $actualOldHash = (Get-FileHash -LiteralPath $oldPath -Algorithm SHA256).Hash
 if ($actualOldHash -ne $expectedOldHash) {
-    throw "The 0.3.4 installer hash does not match the pinned release asset."
+    throw "The 0.3.5 installer hash does not match the pinned release asset."
 }
 
 $installRoot = Join-Path $env:RUNNER_TEMP 'CipherNestUpgradeSmoke'
@@ -29,7 +29,7 @@ function Install-CipherNest([string] $installer) {
 Install-CipherNest $oldPath
 $installedExecutable = Join-Path $installRoot 'ciphernest.exe'
 if (-not (Test-Path -LiteralPath $installedExecutable -PathType Leaf)) {
-    throw 'The 0.3.4 executable was not installed in the expected directory.'
+    throw 'The 0.3.5 executable was not installed in the expected directory.'
 }
 $oldExecutableHash = (Get-FileHash -LiteralPath $installedExecutable -Algorithm SHA256).Hash
 
@@ -48,7 +48,7 @@ foreach ($path in $sentinels) {
 
 Install-CipherNest $newPath
 if (-not (Test-Path -LiteralPath $installedExecutable -PathType Leaf)) {
-    throw 'The 0.3.5 executable is missing after overwrite installation.'
+    throw 'The 0.3.6 executable is missing after overwrite installation.'
 }
 $newExecutableHash = (Get-FileHash -LiteralPath $installedExecutable -Algorithm SHA256).Hash
 if ($newExecutableHash -eq $oldExecutableHash) {
@@ -63,4 +63,4 @@ foreach ($path in $sentinels) {
     }
 }
 
-Write-Output 'Windows 0.3.4 to 0.3.5 overwrite installation preserved the vault, sync sidecar, and backup bytes.'
+Write-Output 'Windows 0.3.5 to 0.3.6 overwrite installation preserved the vault, sync sidecar, and backup bytes.'

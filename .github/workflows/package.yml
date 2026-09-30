@@ -151,18 +151,18 @@ jobs:
           name: CipherNest-Windows-x86_64
           path: new-installer
 
-      - name: Download pinned 0.3.4 installer
+      - name: Download pinned 0.3.5 installer
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: pwsh
-        run: gh release download v0.3.4 --pattern 'CipherNest-0.3.4-Windows-x86_64-setup.exe' --dir old-installer
+        run: gh release download v0.3.5 --pattern 'CipherNest-0.3.5-Windows-x86_64-setup.exe' --dir old-installer
 
       - name: Check application data through overwrite installation
         shell: pwsh
         run: >-
           ./scripts/windows-upgrade-smoke.ps1
-          -OldInstaller 'old-installer/CipherNest-0.3.4-Windows-x86_64-setup.exe'
-          -NewInstaller 'new-installer/CipherNest-0.3.5-Windows-x86_64-setup.exe'
+          -OldInstaller 'old-installer/CipherNest-0.3.5-Windows-x86_64-setup.exe'
+          -NewInstaller 'new-installer/CipherNest-0.3.6-Windows-x86_64-setup.exe'
 
   release:
     name: Publish tagged beta release
