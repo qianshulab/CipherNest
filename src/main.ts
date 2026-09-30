@@ -3997,7 +3997,10 @@ async function applyGeneratedPassword(button: HTMLButtonElement): Promise<void> 
     if (committed) {
       if (epoch !== state.epoch || !state.status.unlocked) return;
       if (state.generatorOpen) closeGenerator(true);
-      if (!stayInSettings) state.view = "all";
+      if (!stayInSettings) {
+        state.view = "all";
+        state.conflictsOnly = false;
+      }
       await loadVaultOverview(epoch).catch(() => undefined);
       await refreshSyncStatusAfterMutation(epoch);
       if (!stayInSettings) {
