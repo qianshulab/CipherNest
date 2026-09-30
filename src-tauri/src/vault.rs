@@ -27,6 +27,7 @@ use crate::{
         VaultStatus, WebDavSyncStatus, MAX_VAULT_ENTRIES, MAX_VAULT_TOMBSTONES,
     },
     sync::{self, LocalSyncState, SyncContent, SyncError},
+    webdav_backup::{self, BackupConfig, WebDavBackupStatus},
 };
 
 const AUTO_BACKUP_LIMIT: usize = 10;
@@ -72,6 +73,15 @@ pub(crate) struct ExistingSyncContext {
     pub state_digest: [u8; 32],
 }
 
+pub(crate) struct RemoteBackupContext {
+    pub config: BackupConfig,
+    pub bytes: Vec<u8>,
+    pub vault_id: String,
+    pub generation: u64,
+    pub updated_at: u64,
+    pub session_id: String,
+}
+
 pub struct VaultStore {
     vault_path: PathBuf,
     legacy_device_slots_path: PathBuf,
@@ -80,6 +90,10 @@ pub struct VaultStore {
     sync_transition_path: PathBuf,
     sync_restore_hold_path: PathBuf,
     sync_restore_next_hold_path: PathBuf,
+    backup_config_path: PathBuf,
+    backup_transition_path: PathBuf,
+    backup_restore_hold_path: PathBuf,
+    backup_restore_next_hold_path: PathBuf,
     restore_intent_path: PathBuf,
     unlocked: Option<UnlockedVault>,
     last_activity: Instant,
@@ -98,6 +112,11 @@ impl VaultStore {
         let sync_transition_path = sidecar_path_for(&vault_path, ".sync.next");
         let sync_restore_hold_path = sidecar_path_for(&vault_path, ".sync.restore-hold");
         let sync_restore_next_hold_path = sidecar_path_for(&vault_path, ".sync.next.restore-hold");
+        let backup_config_path = sidecar_path_for(&vault_path, ".webdav-backup");
+        let backup_transition_path = sidecar_path_for(&vault_path, ".webdav-backup.next");
+        let backup_restore_hold_path = sidecar_path_for(&vault_path, ".webdav-backup.restore-hold");
+        let backup_restore_next_hold_path =
+            sidecar_path_for(&vault_path, ".webdav-backup.next.restore-hold");
         let restore_intent_path = sidecar_path_for(&vault_path, ".restore-intent");
         Self {
             vault_path,
@@ -107,6 +126,10 @@ impl VaultStore {
             sync_transition_path,
             sync_restore_hold_path,
             sync_restore_next_hold_path,
+            backup_config_path,
+            backup_transition_path,
+            backup_restore_hold_path,
+            backup_restore_next_hold_path,
             restore_intent_path,
             unlocked: None,
             last_activity: Instant::now(),
@@ -136,7 +159,9 @@ impl VaultStore {
                 exists: self.vault_path.is_file()
                     || self.restore_intent_path.exists()
                     || self.sync_restore_hold_path.exists()
-                    || self.sync_restore_next_hold_path.exists(),
+                    || self.sync_restore_next_hold_path.exists()
+                    || self.backup_restore_hold_path.exists()
+                    || self.backup_restore_next_hold_path.exists(),
                 unlocked: self.unlocked.is_some(),
                 item_count,
                 auto_lock_minutes,
@@ -170,6 +195,7 @@ impl VaultStore {
         // vault. Make it inactive when possible; the fresh random root key also
         // makes any undeletable old sidecar cryptographically unusable.
         self.deactivate_sync_sidecars_best_effort();
+        self.deactivate_backup_sidecars_best_effort();
         write_envelope_atomic(&self.vault_path, &envelope)?;
         self.unlocked = Some(UnlockedVault {
             root_key,
@@ -886,7 +912,12 @@ impl VaultStore {
         self.last_activity = Instant::now();
         self.failed_unlocks = 0;
         self.retry_after = None;
-        let _ = self.recover_interrupted_restore();
+        if let Err(error) = self.recover_interrupted_restore() {
+            // The replacement is already committed. Never let this session
+            // mutate it while the restore intent still names its exact digest.
+            self.lock();
+            return Err(error);
+        }
         self.complete_current_auto_backup(previous_backup.as_deref());
         Ok(())
     }
@@ -898,6 +929,187 @@ impl VaultStore {
             .as_ref()
             .map(|vault| vault.data.settings.clipboard_clear_seconds)
             .ok_or(VaultError::Locked)
+    }
+
+    pub(crate) fn remote_backup_status(&mut self) -> VaultResult<WebDavBackupStatus> {
+        self.require_unlocked()?;
+        let mut status = self
+            .load_backup_config()?
+            .as_ref()
+            .map(WebDavBackupStatus::from_config)
+            .unwrap_or_else(WebDavBackupStatus::absent);
+        if status.automatic {
+            let generation = self
+                .unlocked
+                .as_ref()
+                .ok_or(VaultError::Locked)?
+                .data
+                .generation;
+            status.pending = status
+                .last_uploaded_generation
+                .is_none_or(|uploaded| generation > uploaded);
+        }
+        Ok(status)
+    }
+
+    pub(crate) fn save_remote_backup_config(
+        &mut self,
+        expected_vault_id: &str,
+        expected_session_id: &str,
+        config: &BackupConfig,
+    ) -> VaultResult<WebDavBackupStatus> {
+        self.require_unlocked()?;
+        let vault = self.unlocked.as_ref().ok_or(VaultError::Locked)?;
+        if vault.data.vault_id != expected_vault_id || vault.session_id != expected_session_id {
+            return Err(VaultError::Locked);
+        }
+        let current_generation = vault.data.generation;
+        webdav_backup::write_config(
+            &self.backup_config_path,
+            &vault.data.vault_id,
+            &vault.root_key,
+            config,
+        )?;
+        webdav_backup::remove_config(&self.backup_transition_path)?;
+        self.touch();
+        let mut status = WebDavBackupStatus::from_config(config);
+        status.pending = config.automatic
+            && config
+                .last_uploaded_generation
+                .is_none_or(|uploaded| current_generation > uploaded);
+        Ok(status)
+    }
+
+    pub(crate) fn disable_remote_backup(&mut self) -> VaultResult<()> {
+        self.require_unlocked()?;
+        webdav_backup::remove_config(&self.backup_config_path)?;
+        webdav_backup::remove_config(&self.backup_transition_path)?;
+        self.touch();
+        Ok(())
+    }
+
+    pub(crate) fn remote_backup_context(&mut self) -> VaultResult<RemoteBackupContext> {
+        self.require_unlocked()?;
+        let config = self
+            .load_backup_config()?
+            .ok_or(VaultError::BackupNotConfigured)?;
+        let envelope = self.current_envelope()?;
+        let bytes = serde_json::to_vec(&envelope).map_err(|_| VaultError::InvalidVault)?;
+        if bytes.is_empty() || bytes.len() as u64 > MAX_VAULT_BYTES {
+            return Err(VaultError::InvalidVault);
+        }
+        let vault = self.unlocked.as_ref().ok_or(VaultError::Locked)?;
+        Ok(RemoteBackupContext {
+            config,
+            bytes,
+            vault_id: vault.data.vault_id.clone(),
+            generation: vault.data.generation,
+            updated_at: vault.data.updated_at,
+            session_id: vault.session_id.clone(),
+        })
+    }
+
+    pub(crate) fn mark_remote_backup_uploaded(
+        &mut self,
+        source: &RemoteBackupContext,
+        uploaded_at: u64,
+    ) -> VaultResult<()> {
+        self.require_unlocked()?;
+        let vault = self.unlocked.as_ref().ok_or(VaultError::Locked)?;
+        if vault.session_id != source.session_id || vault.data.vault_id != source.vault_id {
+            return Ok(());
+        }
+        let Some(mut config) = self.load_backup_config()? else {
+            return Ok(());
+        };
+        if config.endpoint != source.config.endpoint
+            || config.username != source.config.username
+            || config.app_password != source.config.app_password
+        {
+            return Ok(());
+        }
+        if config
+            .last_uploaded_generation
+            .is_none_or(|last| source.generation >= last)
+        {
+            config.last_uploaded_generation = Some(source.generation);
+            config.last_upload_at = Some(uploaded_at);
+            config.warning = None;
+            self.save_remote_backup_config(&source.vault_id, &source.session_id, &config)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn mark_remote_backup_warning(
+        &mut self,
+        source: &RemoteBackupContext,
+        warning: String,
+    ) -> VaultResult<()> {
+        self.require_unlocked()?;
+        let vault = self.unlocked.as_ref().ok_or(VaultError::Locked)?;
+        if vault.session_id != source.session_id || vault.data.vault_id != source.vault_id {
+            return Ok(());
+        }
+        let Some(mut config) = self.load_backup_config()? else {
+            return Ok(());
+        };
+        if config.endpoint == source.config.endpoint
+            && config.username == source.config.username
+            && config.app_password == source.config.app_password
+        {
+            config.warning = Some(warning.chars().take(240).collect());
+            self.save_remote_backup_config(&source.vault_id, &source.session_id, &config)?;
+        }
+        Ok(())
+    }
+
+    fn load_backup_config(&self) -> VaultResult<Option<BackupConfig>> {
+        let vault = self.unlocked.as_ref().ok_or(VaultError::Locked)?;
+        let active = self.backup_config_path.exists().then(|| {
+            webdav_backup::read_config(
+                &self.backup_config_path,
+                &vault.data.vault_id,
+                &vault.root_key,
+            )
+        });
+        if let Some(Ok(config)) = active {
+            let _ = webdav_backup::remove_config(&self.backup_transition_path);
+            return Ok(Some(config));
+        }
+        if self.backup_transition_path.exists() {
+            if let Ok(config) = webdav_backup::read_config(
+                &self.backup_transition_path,
+                &vault.data.vault_id,
+                &vault.root_key,
+            ) {
+                webdav_backup::write_config(
+                    &self.backup_config_path,
+                    &vault.data.vault_id,
+                    &vault.root_key,
+                    &config,
+                )?;
+                let _ = webdav_backup::remove_config(&self.backup_transition_path);
+                return Ok(Some(config));
+            }
+        }
+        if self.backup_config_path.exists() {
+            Err(VaultError::WebDavBackup(
+                "本机备份配置损坏或无法解密，请重新配置。".into(),
+            ))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub(crate) fn remote_backup_config(&mut self) -> VaultResult<Option<BackupConfig>> {
+        self.require_unlocked()?;
+        self.load_backup_config()
+    }
+
+    pub(crate) fn remote_backup_session_identity(&mut self) -> VaultResult<(String, String)> {
+        self.require_unlocked()?;
+        let vault = self.unlocked.as_ref().ok_or(VaultError::Locked)?;
+        Ok((vault.data.vault_id.clone(), vault.session_id.clone()))
     }
 
     pub fn export_to(&mut self, target: &Path) -> VaultResult<()> {
@@ -941,6 +1153,11 @@ impl VaultStore {
     }
 
     fn require_unlocked(&mut self) -> VaultResult<()> {
+        // A completed restore must finish its sidecar transaction before any
+        // later mutation changes the target digest recorded in the intent.
+        if self.restore_intent_path.exists() {
+            self.recover_interrupted_restore()?;
+        }
         self.enforce_auto_lock();
         if self.unlocked.is_none() {
             Err(VaultError::Locked)
@@ -981,6 +1198,11 @@ impl VaultStore {
             Err(VaultError::Sync(_)) if self.sync_artifacts_present() => (None, true),
             Err(error) => return Err(error),
         };
+        let (backup_config, invalid_backup_config) = match self.load_backup_config() {
+            Ok(config) => (config, false),
+            Err(VaultError::WebDavBackup(_)) if self.backup_artifacts_present() => (None, true),
+            Err(error) => return Err(error),
+        };
         next_data.password_only_unlock = true;
         bump_generation(&mut next_data, now_ms());
         let (next_envelope, next_root_key) = create_envelope(new_password, &next_data)?;
@@ -1009,17 +1231,33 @@ impl VaultStore {
         } else {
             let _ = sync::remove_local_sync_state(&self.sync_transition_path);
         }
+        if let Some(config) = backup_config.as_ref() {
+            // This file is already encrypted under the next root key. Before
+            // replacing the vault, the old active file remains authoritative;
+            // after replacement a crash can recover the staged copy.
+            webdav_backup::write_config(
+                &self.backup_transition_path,
+                &next_data.vault_id,
+                &next_root_key,
+                config,
+            )?;
+        } else {
+            let _ = webdav_backup::remove_config(&self.backup_transition_path);
+        }
         let previous_backup = self.backup_current()?;
 
         // Any reported write failure makes the unlock caller discard its in-memory session.
         // The next master-password unlock validates the actual disk state and retries when the
         // password-only marker is still absent. The legacy device slot was removed above.
         write_envelope_atomic(&self.vault_path, &next_envelope)?;
-        let vault = self.unlocked.as_mut().ok_or(VaultError::Locked)?;
-        vault.root_key = next_root_key;
-        vault.data = next_data;
-        vault.envelope = next_envelope;
-        vault.session_id = Uuid::new_v4().to_string();
+        {
+            let vault = self.unlocked.as_mut().ok_or(VaultError::Locked)?;
+            vault.root_key = next_root_key;
+            vault.data = next_data;
+            vault.envelope = next_envelope;
+            vault.session_id = Uuid::new_v4().to_string();
+        }
+        let vault = self.unlocked.as_ref().ok_or(VaultError::Locked)?;
 
         let (sync_config_preserved, warning) = if invalid_sync_state {
             let deactivated = self.deactivate_sync_sidecars_best_effort();
@@ -1051,14 +1289,35 @@ impl VaultStore {
         } else {
             (true, None)
         };
-        self.complete_current_auto_backup(Some(&previous_backup));
-        let warning = match (warning, self.auto_backup_warning.as_ref()) {
-            (Some(sync_warning), Some(backup_warning)) => {
-                Some(format!("{sync_warning} {backup_warning}"))
+        let backup_warning = if invalid_backup_config {
+            self.deactivate_backup_sidecars_best_effort();
+            Some("主密码已经更改；损坏的 WebDAV 备份配置已停用，请重新配置。".to_string())
+        } else if let Some(config) = backup_config.as_ref() {
+            match webdav_backup::write_config(
+                &self.backup_config_path,
+                &vault.data.vault_id,
+                &vault.root_key,
+                config,
+            ) {
+                Ok(()) => {
+                    let _ = webdav_backup::remove_config(&self.backup_transition_path);
+                    None
+                }
+                Err(_) => Some(
+                    "主密码已经更改；WebDAV 备份配置保存在加密恢复副本中，下次读取时会恢复。"
+                        .to_string(),
+                ),
             }
-            (None, Some(backup_warning)) => Some(backup_warning.clone()),
-            (sync_warning, None) => sync_warning,
+        } else {
+            None
         };
+        self.complete_current_auto_backup(Some(&previous_backup));
+        let warning_parts: Vec<String> =
+            [warning, backup_warning, self.auto_backup_warning.clone()]
+                .into_iter()
+                .flatten()
+                .collect();
+        let warning = (!warning_parts.is_empty()).then(|| warning_parts.join(" "));
         self.cleanup_legacy_device_auth_record();
         self.touch();
         Ok(MasterPasswordChangeResult {
@@ -1241,6 +1500,70 @@ impl VaultStore {
         .any(|path| path.exists())
     }
 
+    fn backup_artifacts_present(&self) -> bool {
+        [
+            &self.backup_config_path,
+            &self.backup_transition_path,
+            &self.backup_restore_hold_path,
+            &self.backup_restore_next_hold_path,
+        ]
+        .into_iter()
+        .any(|path| path.exists())
+    }
+
+    fn deactivate_backup_sidecars_best_effort(&self) -> bool {
+        let mut all_inactive = true;
+        for path in [
+            &self.backup_config_path,
+            &self.backup_transition_path,
+            &self.backup_restore_hold_path,
+            &self.backup_restore_next_hold_path,
+        ] {
+            if !path.exists() || webdav_backup::remove_config(path).is_ok() {
+                continue;
+            }
+            let mut inactive_name = OsString::from(path.as_os_str());
+            inactive_name.push(format!(".disabled-{}", Uuid::new_v4()));
+            if fs::rename(path, PathBuf::from(inactive_name)).is_err() {
+                all_inactive = false;
+            }
+        }
+        all_inactive
+    }
+
+    fn hold_backup_sidecars_for_restore(&self) -> VaultResult<()> {
+        if self.backup_restore_hold_path.exists() || self.backup_restore_next_hold_path.exists() {
+            return Err(VaultError::SaveFailed);
+        }
+        if self.backup_config_path.exists() {
+            fs::rename(&self.backup_config_path, &self.backup_restore_hold_path)
+                .map_err(|_| VaultError::SaveFailed)?;
+        }
+        if self.backup_transition_path.exists()
+            && fs::rename(
+                &self.backup_transition_path,
+                &self.backup_restore_next_hold_path,
+            )
+            .is_err()
+        {
+            self.rollback_held_backup_sidecars();
+            return Err(VaultError::SaveFailed);
+        }
+        Ok(())
+    }
+
+    fn rollback_held_backup_sidecars(&self) {
+        if !self.backup_config_path.exists() && self.backup_restore_hold_path.exists() {
+            let _ = fs::rename(&self.backup_restore_hold_path, &self.backup_config_path);
+        }
+        if !self.backup_transition_path.exists() && self.backup_restore_next_hold_path.exists() {
+            let _ = fs::rename(
+                &self.backup_restore_next_hold_path,
+                &self.backup_transition_path,
+            );
+        }
+    }
+
     /// Makes every known synchronization artifact inactive without ever
     /// reporting the already-completed root-key rotation as a failure.
     fn deactivate_sync_sidecars_best_effort(&self) -> bool {
@@ -1282,6 +1605,10 @@ impl VaultStore {
             self.rollback_held_sync_sidecars();
             return Err(VaultError::SaveFailed);
         }
+        if let Err(error) = self.hold_backup_sidecars_for_restore() {
+            self.rollback_held_sync_sidecars();
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -1295,6 +1622,7 @@ impl VaultStore {
                 &self.sync_transition_path,
             );
         }
+        self.rollback_held_backup_sidecars();
     }
 
     fn begin_restore_intent(&self, envelope: &VaultEnvelope) -> VaultResult<RestoreIntent> {
@@ -1339,7 +1667,11 @@ impl VaultStore {
 
     fn try_recover_interrupted_restore(&self) -> VaultResult<()> {
         if !self.restore_intent_path.exists() {
-            if self.sync_restore_hold_path.exists() || self.sync_restore_next_hold_path.exists() {
+            if self.sync_restore_hold_path.exists()
+                || self.sync_restore_next_hold_path.exists()
+                || self.backup_restore_hold_path.exists()
+                || self.backup_restore_next_hold_path.exists()
+            {
                 return Err(SyncError::LocalStateIo.into());
             }
             return Ok(());
@@ -1359,19 +1691,32 @@ impl VaultStore {
         let quarantine_path = self.restore_quarantine_path(&intent.quarantine_id)?;
         let current_digest = self.restore_target_fingerprint()?;
         if current_digest == Some(intent.target_digest) {
-            if self.sync_state_path.exists() || self.sync_transition_path.exists() {
+            if self.sync_state_path.exists()
+                || self.sync_transition_path.exists()
+                || self.backup_config_path.exists()
+                || self.backup_transition_path.exists()
+            {
                 return Err(SyncError::LocalStateIo.into());
             }
             sync::remove_local_sync_state(&self.sync_restore_hold_path)?;
             sync::remove_local_sync_state(&self.sync_restore_next_hold_path)?;
+            webdav_backup::remove_config(&self.backup_restore_hold_path)?;
+            webdav_backup::remove_config(&self.backup_restore_next_hold_path)?;
         } else if current_digest == intent.source_digest {
             if (self.sync_state_path.exists() && self.sync_restore_hold_path.exists())
                 || (self.sync_transition_path.exists() && self.sync_restore_next_hold_path.exists())
+                || (self.backup_config_path.exists() && self.backup_restore_hold_path.exists())
+                || (self.backup_transition_path.exists()
+                    && self.backup_restore_next_hold_path.exists())
             {
                 return Err(SyncError::LocalStateIo.into());
             }
             self.rollback_held_sync_sidecars();
-            if self.sync_restore_hold_path.exists() || self.sync_restore_next_hold_path.exists() {
+            if self.sync_restore_hold_path.exists()
+                || self.sync_restore_next_hold_path.exists()
+                || self.backup_restore_hold_path.exists()
+                || self.backup_restore_next_hold_path.exists()
+            {
                 return Err(SyncError::LocalStateIo.into());
             }
         } else if current_digest.is_none() && intent.source_digest.is_some() {
@@ -1380,7 +1725,11 @@ impl VaultStore {
             }
             fs::rename(&quarantine_path, &self.vault_path).map_err(|_| VaultError::SaveFailed)?;
             self.rollback_held_sync_sidecars();
-            if self.sync_restore_hold_path.exists() || self.sync_restore_next_hold_path.exists() {
+            if self.sync_restore_hold_path.exists()
+                || self.sync_restore_next_hold_path.exists()
+                || self.backup_restore_hold_path.exists()
+                || self.backup_restore_next_hold_path.exists()
+            {
                 return Err(SyncError::LocalStateIo.into());
             }
         } else {
@@ -1404,6 +1753,7 @@ impl VaultStore {
     }
 
     fn persist(&mut self, data: VaultData) -> VaultResult<()> {
+        self.require_unlocked()?;
         validate_loaded_data(&data)?;
         let next_envelope = {
             let unlocked = self.unlocked.as_ref().ok_or(VaultError::Locked)?;
@@ -3370,6 +3720,97 @@ mod tests {
     }
 
     #[test]
+    fn remote_backup_config_survives_restart_and_root_key_rotation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vault.cnvault");
+        let mut store = VaultStore::new(path.clone());
+        let old_password = "old backup master passphrase long enough";
+        let new_password = "new backup master passphrase long enough";
+        store.create(old_password).unwrap();
+        let (vault_id, session_id) = store.remote_backup_session_identity().unwrap();
+        let config = BackupConfig {
+            endpoint: "https://dav.example.test/backups/".into(),
+            username: "backup-user".into(),
+            app_password: "private-backup-credential".into(),
+            automatic: true,
+            last_upload_at: Some(100),
+            last_uploaded_generation: Some(1),
+            warning: None,
+        };
+        store
+            .save_remote_backup_config(&vault_id, &session_id, &config)
+            .unwrap();
+        assert!(!store.remote_backup_status().unwrap().pending);
+        store
+            .save_entry(sample_entry_input(None, None, "not yet remotely backed up"))
+            .unwrap();
+        assert!(store.remote_backup_status().unwrap().pending);
+        let raw = fs::read(&store.backup_config_path).unwrap();
+        assert!(!raw
+            .windows(config.app_password.len())
+            .any(|window| window == config.app_password.as_bytes()));
+        store.lock();
+        let mut reopened = VaultStore::new(path);
+        reopened.unlock(old_password).unwrap();
+        assert!(reopened.remote_backup_status().unwrap().configured);
+        assert_eq!(
+            reopened
+                .remote_backup_config()
+                .unwrap()
+                .unwrap()
+                .app_password,
+            config.app_password
+        );
+        reopened
+            .change_master_password(old_password, new_password)
+            .unwrap();
+        assert!(!reopened.backup_transition_path.exists());
+        reopened.lock();
+        reopened.unlock(new_password).unwrap();
+        let restored = reopened.remote_backup_config().unwrap().unwrap();
+        assert_eq!(restored.app_password, config.app_password);
+        assert_eq!(restored.last_uploaded_generation, Some(1));
+    }
+
+    #[test]
+    fn verified_restore_deactivates_remote_backup_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vault.cnvault");
+        let mut store = VaultStore::new(path.clone());
+        let password = "restore backup master passphrase long enough";
+        store.create(password).unwrap();
+        let envelope = read_envelope(&path).unwrap();
+        let (root_key, data) = decrypt_envelope(password, &envelope).unwrap();
+        let (vault_id, session_id) = store.remote_backup_session_identity().unwrap();
+        store
+            .save_remote_backup_config(
+                &vault_id,
+                &session_id,
+                &BackupConfig {
+                    endpoint: "https://dav.example.test/backups/".into(),
+                    username: "backup-user".into(),
+                    app_password: "private-backup-credential".into(),
+                    automatic: true,
+                    last_upload_at: None,
+                    last_uploaded_generation: None,
+                    warning: None,
+                },
+            )
+            .unwrap();
+        store
+            .save_entry(sample_entry_input(None, None, "newer than restore point"))
+            .unwrap();
+        store
+            .replace_with_verified_backup(envelope, root_key, data)
+            .unwrap();
+        assert!(!store.backup_config_path.exists());
+        assert!(!store.backup_transition_path.exists());
+        assert!(!store.backup_restore_hold_path.exists());
+        assert!(!store.backup_restore_next_hold_path.exists());
+        assert!(!store.remote_backup_status().unwrap().configured);
+    }
+
+    #[test]
     fn verified_restore_disables_the_previous_sync_configuration() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("vault.cnvault");
@@ -3488,6 +3929,7 @@ mod tests {
         store.create(password).unwrap();
         let vault = store.unlocked.as_ref().unwrap();
         let old_data = vault.data.clone();
+        let old_envelope = vault.envelope.clone();
         let root_key = Zeroizing::new(*vault.root_key);
         let state = test_sync_state(&old_data, old_data.generation);
         sync::write_local_sync_state(
@@ -3497,9 +3939,25 @@ mod tests {
             &state,
         )
         .unwrap();
+        let (vault_id, session_id) = store.remote_backup_session_identity().unwrap();
+        store
+            .save_remote_backup_config(
+                &vault_id,
+                &session_id,
+                &BackupConfig {
+                    endpoint: "https://dav.example.test/backups/".into(),
+                    username: "backup-user".into(),
+                    app_password: "private-backup-credential".into(),
+                    automatic: true,
+                    last_upload_at: None,
+                    last_uploaded_generation: None,
+                    warning: None,
+                },
+            )
+            .unwrap();
         let mut restored_data = old_data.clone();
         bump_generation(&mut restored_data, now_ms());
-        let target = update_payload(&vault.envelope, &root_key, &restored_data).unwrap();
+        let target = update_payload(&old_envelope, &root_key, &restored_data).unwrap();
         store.begin_restore_intent(&target).unwrap();
         store.hold_sync_sidecars_for_restore().unwrap();
         drop(store);
@@ -3508,8 +3966,10 @@ mod tests {
         assert!(reopened.status().0.exists);
         reopened.unlock(password).unwrap();
         assert!(reopened.webdav_sync_status().unwrap().configured);
+        assert!(reopened.remote_backup_status().unwrap().configured);
         assert!(!reopened.restore_intent_path.exists());
         assert!(!reopened.sync_restore_hold_path.exists());
+        assert!(!reopened.backup_restore_hold_path.exists());
 
         reopened.begin_restore_intent(&target).unwrap();
         reopened.hold_sync_sidecars_for_restore().unwrap();
@@ -3518,8 +3978,59 @@ mod tests {
         let mut after_commit = VaultStore::new(path);
         after_commit.unlock(password).unwrap();
         assert!(!after_commit.webdav_sync_status().unwrap().configured);
+        assert!(!after_commit.remote_backup_status().unwrap().configured);
         assert!(!after_commit.restore_intent_path.exists());
         assert!(!after_commit.sync_restore_hold_path.exists());
+        assert!(!after_commit.backup_restore_hold_path.exists());
+    }
+
+    #[test]
+    fn unfinished_restore_cleanup_blocks_new_edits_without_changing_committed_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vault.cnvault");
+        let password = "restore cleanup failure passphrase";
+        let mut store = VaultStore::new(path.clone());
+        store.create(password).unwrap();
+        let (vault_id, session_id) = store.remote_backup_session_identity().unwrap();
+        store
+            .save_remote_backup_config(
+                &vault_id,
+                &session_id,
+                &BackupConfig {
+                    endpoint: "https://dav.example.test/backups/".into(),
+                    username: "backup-user".into(),
+                    app_password: "private-backup-credential".into(),
+                    automatic: true,
+                    last_upload_at: None,
+                    last_uploaded_generation: None,
+                    warning: None,
+                },
+            )
+            .unwrap();
+        let vault = store.unlocked.as_ref().unwrap();
+        let mut restored_data = vault.data.clone();
+        bump_generation(&mut restored_data, now_ms());
+        let target = update_payload(&vault.envelope, &vault.root_key, &restored_data).unwrap();
+        store.begin_restore_intent(&target).unwrap();
+        store.hold_sync_sidecars_for_restore().unwrap();
+        fs::remove_file(&store.backup_restore_hold_path).unwrap();
+        fs::create_dir(&store.backup_restore_hold_path).unwrap();
+        write_envelope_atomic(&path, &target).unwrap();
+        let committed_digest = fingerprint_file(&path).unwrap();
+
+        assert!(matches!(
+            store.save_entry(sample_entry_input(None, None, "must not replace target")),
+            Err(VaultError::RestoreRecoveryFailed)
+        ));
+        assert_eq!(fingerprint_file(&path).unwrap(), committed_digest);
+        assert!(store.restore_intent_path.exists());
+        assert!(!store.backup_config_path.exists());
+
+        fs::remove_dir(&store.backup_restore_hold_path).unwrap();
+        store.lock();
+        store.unlock(password).unwrap();
+        assert!(!store.restore_intent_path.exists());
+        assert!(!store.remote_backup_status().unwrap().configured);
     }
 
     #[test]

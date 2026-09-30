@@ -66,7 +66,7 @@ describe("renderer security boundary", () => {
 
   it("serializes sensitive settings, password changes, restores, and sync", () => {
     expect(rendererSource).toContain(
-      'type SecurityOperation = "changePassword" | "restore" | "settings" | null',
+      'type SecurityOperation = "changePassword" | "restore" | "settings" | "backup" | null',
     );
     const controlHelper = sourceBetween(
       "function setSecurityMutationControlsDisabled",

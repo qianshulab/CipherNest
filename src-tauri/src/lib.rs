@@ -5,6 +5,7 @@ mod generator;
 mod models;
 mod sync;
 mod vault;
+mod webdav_backup;
 
 use std::path::PathBuf;
 
@@ -54,6 +55,15 @@ pub fn run() {
             commands::security_report,
             commands::change_master_password,
             commands::export_backup,
+            commands::webdav_backup_status,
+            commands::webdav_backup_test_config,
+            commands::webdav_backup_save_config,
+            commands::webdav_backup_disable,
+            commands::webdav_backup_upload,
+            commands::webdav_backup_list,
+            commands::webdav_backup_list_with_credentials,
+            commands::webdav_backup_prepare_restore,
+            commands::webdav_backup_prepare_restore_with_credentials,
             commands::select_backup_for_restore,
             commands::inspect_selected_backup,
             commands::apply_selected_backup,

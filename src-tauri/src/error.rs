@@ -52,6 +52,10 @@ pub enum VaultError {
     SyncLocalChanged,
     #[error("{0}")]
     Sync(String),
+    #[error("尚未在此设备配置 WebDAV 备份。")]
+    BackupNotConfigured,
+    #[error("WebDAV 备份：{0}")]
+    WebDavBackup(String),
     #[error("内部状态暂时不可用。")]
     StateUnavailable,
 }
