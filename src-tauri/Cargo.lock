@@ -595,7 +595,7 @@ dependencies = [
 
 [[package]]
 name = "ciphernest"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "argon2",
  "atomicwrites",
@@ -605,6 +605,7 @@ dependencies = [
  "hkdf",
  "quick-xml",
  "reqwest 0.12.28",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",

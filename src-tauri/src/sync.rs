@@ -6,6 +6,7 @@
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
+    error::Error as StdError,
     fs::{self, File},
     io::{self, Read, Write},
     path::Path,
@@ -103,6 +104,8 @@ pub enum SyncError {
     Timeout,
     #[error("无法建立 WebDAV HTTPS 连接。请检查服务器是否可达、端口是否启用 HTTPS，以及证书是否可信且与域名匹配。")]
     SecureConnection,
+    #[error("WebDAV HTTPS 证书链无法验证。请检查服务器是否发送完整证书链，以及签发机构是否受信任。")]
+    UntrustedCertificate,
     #[error("同步对象超过大小限制。")]
     TooLarge,
     #[error("同步数据包含无效字段。")]
@@ -2141,10 +2144,39 @@ fn classify_transport_error(error: reqwest::Error) -> SyncError {
     if error.is_timeout() {
         SyncError::Timeout
     } else if error.is_connect() {
-        SyncError::SecureConnection
+        if has_unknown_issuer(&error) {
+            SyncError::UntrustedCertificate
+        } else {
+            SyncError::SecureConnection
+        }
     } else {
         SyncError::Transport
     }
+}
+
+fn has_unknown_issuer(error: &(dyn StdError + 'static)) -> bool {
+    let mut current = Some(error);
+    for _ in 0..16 {
+        let Some(source) = current else { break };
+        if matches!(
+            source.downcast_ref::<rustls::Error>(),
+            Some(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer
+            ))
+        ) {
+            return true;
+        }
+        // hyper-rustls wraps handshake failures in nested io::Error values.
+        current = if let Some(inner) = source
+            .downcast_ref::<io::Error>()
+            .and_then(io::Error::get_ref)
+        {
+            Some(inner as &(dyn StdError + 'static))
+        } else {
+            source.source()
+        };
+    }
+    false
 }
 
 async fn read_limited(mut response: reqwest::Response, limit: usize) -> SyncResult<Vec<u8>> {
@@ -2637,6 +2669,17 @@ mod tests {
             "password".into()
         )
         .is_err());
+    }
+
+    #[test]
+    fn nested_tls_unknown_issuer_has_a_specific_safe_category() {
+        let tls_error = rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer);
+        let nested = io::Error::other(io::Error::new(io::ErrorKind::InvalidData, tls_error));
+        assert!(has_unknown_issuer(&nested));
+        assert!(!has_unknown_issuer(&io::Error::other("connection refused")));
+        assert!(!has_unknown_issuer(&io::Error::other(
+            rustls::Error::General("another TLS failure".into())
+        )));
     }
 
     #[test]

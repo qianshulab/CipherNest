@@ -2424,6 +2424,7 @@ function describeWebDavNetworkFailure(error: unknown, fallback: string): string 
   const guidance = new Map<string, string>([
     ["WebDAV 网络请求超时。请检查网络及服务器端口。", "WebDAV 请求超时。请检查服务器地址、网络和 HTTPS 端口后重试。"],
     ["无法建立 WebDAV HTTPS 连接。请检查服务器是否可达、端口是否启用 HTTPS，以及证书是否可信且与域名匹配。", "无法建立 HTTPS 连接。请确认端口启用了 HTTPS，且证书受本机信任并与访问域名或 IP 匹配。"],
+    ["WebDAV HTTPS 证书链无法验证。请检查服务器是否发送完整证书链，以及签发机构是否受信任。", "WebDAV 服务的证书链无法验证。请确认该 HTTPS 服务发送了站点证书及所需中间证书，并检查签发机构是否受本机信任。"],
     ["WebDAV 服务器返回了不支持的状态码 401。", "WebDAV 身份验证失败（401）。请检查用户名和应用专用密码。"],
     ["WebDAV 服务器返回了不支持的状态码 403。", "WebDAV 拒绝访问（403）。请检查账号对该目录的读取、创建、修改和删除权限。"],
     ["WebDAV 服务器返回了不支持的状态码 404。", "WebDAV 目录不存在（404）。请先在服务器创建目录，并核对完整地址。"],

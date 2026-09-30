@@ -5,7 +5,7 @@
 <p align="center"><strong>本地优先的加密密码库</strong><br>安全保存密码 · 加密备份 · 按需同步</p>
 
 <p align="center">
-  <a href="https://github.com/qianshulab/CipherNest/releases/tag/v0.3.5"><img src="https://img.shields.io/badge/release-v0.3.5%20beta-ff791c?style=flat-square&amp;labelColor=1b2029" alt="下载 v0.3.5 beta"></a>
+  <a href="https://github.com/qianshulab/CipherNest/releases/tag/v0.3.6"><img src="https://img.shields.io/badge/release-v0.3.6%20beta-ff791c?style=flat-square&amp;labelColor=1b2029" alt="下载 v0.3.6 beta"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-ff791c?style=flat-square&amp;labelColor=1b2029" alt="MIT 许可证"></a>
 </p>
 

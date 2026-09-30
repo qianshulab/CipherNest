@@ -10,7 +10,7 @@ body:
     id: version
     attributes:
       label: CipherNest 版本
-      placeholder: 例如 0.3.5 beta 或提交哈希
+      placeholder: 例如 0.3.6 beta 或提交哈希
     validations:
       required: true
   - type: dropdown
