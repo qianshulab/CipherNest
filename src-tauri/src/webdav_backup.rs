@@ -123,7 +123,7 @@ impl WebDavBackupClient {
         let endpoint = validate_webdav_endpoint(endpoint)
             .map_err(|_| backup_error("请输入以 / 结尾的有效 HTTPS WebDAV 文件夹地址。"))?;
         validate_credentials(&username, &app_password)?;
-        let mut builder = reqwest::Client::builder()
+        let builder = reqwest::Client::builder()
             .https_only(true)
             .min_tls_version(TlsVersion::TLS_1_2)
             .redirect(reqwest::redirect::Policy::none())
@@ -131,12 +131,10 @@ impl WebDavBackupClient {
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(60))
             .user_agent("CipherNest-WebDAV-Backup/1");
+        // Schannel uses the Windows certificate chain engine, including
+        // system trust and intermediate-certificate discovery.
         #[cfg(target_os = "windows")]
-        {
-            // Schannel uses the Windows certificate chain engine, including
-            // system trust and intermediate-certificate discovery.
-            builder = builder.use_native_tls();
-        }
+        let builder = builder.use_native_tls();
         let client = builder
             .build()
             .map_err(|_| backup_error("无法初始化 HTTPS 客户端。"))?;
