@@ -104,7 +104,7 @@ pub enum SyncError {
     Timeout,
     #[error("无法建立 WebDAV HTTPS 连接。请检查服务器是否可达、端口是否启用 HTTPS，以及证书是否可信且与域名匹配。")]
     SecureConnection,
-    #[error("WebDAV HTTPS 证书链无法验证。请检查服务器是否发送完整证书链，以及签发机构是否受信任。")]
+    #[error("WebDAV HTTPS 证书链不受信任。请检查服务器证书链。")]
     UntrustedCertificate,
     #[error("同步对象超过大小限制。")]
     TooLarge,
