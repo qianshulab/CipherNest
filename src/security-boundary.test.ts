@@ -256,6 +256,9 @@ describe("renderer security boundary", () => {
     expect(restore).toContain('invokeCommand<void>("lock_vault")');
     expect(restore).toContain('invokeCommand<VaultStatus>("vault_status")');
     expect(restore).toContain("if (!lockedStatus || lockedStatus.unlocked)");
+    const lock = sourceBetween("async function performLock", "function clearSensitiveState");
+    expect(lock).toContain('invokeCommand<VaultStatus>("vault_status")');
+    expect(lock).toContain("if (!lockedStatus || lockedStatus.unlocked)");
     const retryHint = sourceBetween("interface WebDavRetryHint", "interface ManagedSensitiveInput");
     expect(retryHint).toContain("endpoint: string");
     expect(retryHint).toContain("username: string");

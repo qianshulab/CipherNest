@@ -4235,7 +4235,13 @@ async function performLock(message: string, notify: boolean): Promise<void> {
   try {
     await invokeCommand<void>("lock_vault");
   } catch {
-    // The UI remains fail-closed. A later unlock attempt rechecks backend state.
+    // The backend may have locked before a later cleanup step returned an error.
+  }
+  const lockedStatus = await invokeCommand<VaultStatus>("vault_status").catch(() => null);
+  if (!lockedStatus || lockedStatus.unlocked) {
+    renderFatal();
+    showToast("无法确认保险库已锁定。请关闭应用，保留备份并检查数据目录。", "error", 9000);
+    return;
   }
   if (notify) showToast(message, "info");
 }
