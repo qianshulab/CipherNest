@@ -185,7 +185,8 @@ describe("renderer security boundary", () => {
     expect(operations).toContain("state.syncOperation !== null");
     expect(operations).toContain("setSecurityMutationControlsDisabled(true)");
     expect(operations).toContain("operationEpoch !== state.epoch");
-    expect(operations).toContain("本机数据未被静默覆盖");
+    expect(operations).toContain("请求可能已修改远端");
+    expect(operations).toContain("state.syncRemoteOutcomeUnknown = true");
   });
 
   it("clears WebDAV secrets from forms and requires recovery-code acknowledgement", () => {
@@ -212,6 +213,56 @@ describe("renderer security boundary", () => {
     expect(operations).toContain('createResult.recoveryCode = ""');
     expect(operations).toContain('revealResult.recoveryCode = ""');
     expect(operations).toContain('preview.previewToken = ""');
+  });
+
+  it("never presents a stale local sync checkpoint after a committed content mutation", () => {
+    const mutations = [
+      sourceBetween("async function saveCurrentEntry", "function presentEntrySaveFailure"),
+      sourceBetween("async function deleteCurrentEntry", "async function toggleFavorite"),
+      sourceBetween("async function toggleFavorite", "async function toggleCurrentFavorite"),
+      sourceBetween("async function toggleCurrentFavorite", "function setCurrentEntryRevision"),
+      sourceBetween("async function applyGeneratedPassword", "function closeGenerator"),
+    ];
+    for (const mutation of mutations) {
+      expect(mutation).toContain("recordLocalSyncMutation()");
+      expect(mutation).toContain("refreshSyncStatusAfterMutation(epoch)");
+    }
+    const statusCard = sourceBetween("function renderWebDavSyncSettingsCard", "function appendSensitiveSyncMetadata");
+    expect(statusCard).toContain("state.syncStatusUncertain");
+    expect(statusCard).toContain("state.syncRemoteOutcomeUnknown");
+    expect(statusCard).toContain("无法确认本机同步状态");
+    expect(statusCard).toContain("上次同步请求的远端结果未能确认");
+    const localRefresh = sourceBetween("async function refreshSyncStatusAfterMutation", "function makeElement");
+    expect(localRefresh).not.toContain("syncRemoteOutcomeUnknown = false");
+  });
+
+  it("returns newly created items to the full list from a conflict-only view", () => {
+    const create = sourceBetween("async function createNewEntry", "function emptyEntryInput");
+    const generator = sourceBetween("async function applyGeneratedPassword", "function closeGenerator");
+    expect(create).toContain("state.conflictsOnly = false");
+    expect(generator).toContain("state.conflictsOnly = false");
+  });
+
+  it("keeps ambiguous restore and WebDAV outcomes visible without exposing retry secrets", () => {
+    const fatal = sourceBetween("function renderFatal", "async function bootstrap");
+    expect(fatal).not.toContain("数据未被修改");
+    const bootstrap = sourceBetween("async function bootstrap", "function renderGate");
+    expect(bootstrap).toContain('invokeCommand<void>("lock_vault")');
+    const restore = sourceBetween("async function restoreBackup", "async function manualLock");
+    expect(restore).toContain("const refreshed = await bootstrap()");
+    expect(restore).toContain("if (refreshed)");
+    expect(restore).toContain('restorePhase === "apply"');
+    expect(restore).toContain("clearSensitiveState(true)");
+    expect(restore).toContain('invokeCommand<void>("lock_vault")');
+    expect(restore).toContain('invokeCommand<VaultStatus>("vault_status")');
+    expect(restore).toContain("if (!lockedStatus || lockedStatus.unlocked)");
+    const retryHint = sourceBetween("interface WebDavRetryHint", "interface ManagedSensitiveInput");
+    expect(retryHint).toContain("endpoint: string");
+    expect(retryHint).toContain("username: string");
+    expect(retryHint).not.toMatch(/appPassword|recoveryCode/);
+    const create = sourceBetween("async function createWebDavSyncSpace", "async function joinWebDavSyncSpace");
+    expect(create).toContain("若服务器已出现新空间但本机没有取得恢复码");
+    expect(create).toContain("loadWebDavSyncStatusSafely");
   });
 
   it("previews first-device trust and protects remote replacement with a second confirmation", () => {

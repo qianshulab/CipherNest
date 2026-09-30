@@ -55,8 +55,13 @@ const MAX_CHAIN_WALL_TIME: Duration = Duration::from_secs(90);
 const MAX_ENDPOINT_BYTES: usize = 2048;
 const MAX_USERNAME_CHARS: usize = 512;
 const MAX_PASSWORD_BYTES: usize = 4096;
-const CONFLICT_TAG: &str = "同步冲突";
+pub(crate) const CONFLICT_TAG: &str = "同步冲突";
 const CONFLICT_SUFFIX: &str = "（同步冲突）";
+
+pub(crate) fn is_conflict_entry(entry: &VaultEntry) -> bool {
+    entry.tags.iter().any(|tag| tag == CONFLICT_TAG)
+        || (entry.tags.len() == 20 && entry.title.ends_with(CONFLICT_SUFFIX))
+}
 const PROPFIND_BODY: &[u8] = br#"<?xml version="1.0" encoding="utf-8" ?>
 <d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>"#;
 
@@ -2978,6 +2983,18 @@ mod tests {
                 && item.title.ends_with(CONFLICT_SUFFIX)
                 && item.tags.iter().any(|tag| tag == CONFLICT_TAG)
         }));
+    }
+
+    #[test]
+    fn a_conflict_with_twenty_tags_keeps_every_tag_and_remains_reviewable() {
+        let id = Uuid::new_v4().to_string();
+        let mut source = entry(&id, "Account", "remote-password", 1);
+        source.tags = (0..20).map(|index| format!("tag-{index}")).collect();
+        let mut occupied = BTreeSet::from([id]);
+        let copy = conflict_copy(&source, 10, &mut occupied).unwrap();
+        assert_eq!(copy.tags, source.tags);
+        assert!(copy.title.ends_with(CONFLICT_SUFFIX));
+        assert!(is_conflict_entry(&copy));
     }
 
     #[test]

@@ -1194,6 +1194,21 @@ p {
   padding: 6px;
 }
 
+.entry-pinned-selection {
+  margin: 5px 0 10px;
+  border: 1px solid rgba(242, 184, 75, 0.3);
+  border-radius: var(--radius-sm);
+  padding: 5px;
+  background: var(--yellow-soft);
+}
+
+.entry-pinned-label {
+  display: block;
+  padding: 4px 7px 7px;
+  color: var(--yellow);
+  font-size: 10px;
+}
+
 .list-pagination {
   display: flex;
   align-items: center;
@@ -2179,6 +2194,28 @@ p {
   margin: 0;
 }
 
+.sync-retry-notice,
+.sync-conflicts-notice {
+  margin-top: 14px;
+}
+
+.sync-retry-copy {
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+}
+
+.sync-retry-copy p,
+.sync-conflicts-notice p {
+  overflow-wrap: anywhere;
+}
+
+.sync-retry-copy .button,
+.sync-conflicts-notice .button {
+  justify-self: start;
+  margin-top: 2px;
+}
+
 .sync-actions {
   display: flex;
   flex-wrap: wrap;
@@ -2383,6 +2420,21 @@ p {
 
 .statusbar-group svg {
   color: var(--green);
+}
+
+.statusbar-sync-link {
+  min-width: 0;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.statusbar-sync-link:hover {
+  color: var(--yellow);
 }
 
 .status-separator {

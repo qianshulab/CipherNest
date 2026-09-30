@@ -5,7 +5,7 @@
 <p align="center"><strong>本地优先的加密密码库</strong><br>安全保存密码 · 加密备份 · 按需同步</p>
 
 <p align="center">
-  <a href="https://github.com/qianshulab/CipherNest/releases/tag/v0.3.4"><img src="https://img.shields.io/badge/release-v0.3.4%20beta-ff791c?style=flat-square&amp;labelColor=1b2029" alt="下载 v0.3.4 beta"></a>
+  <a href="https://github.com/qianshulab/CipherNest/releases/tag/v0.3.5"><img src="https://img.shields.io/badge/release-v0.3.5%20beta-ff791c?style=flat-square&amp;labelColor=1b2029" alt="下载 v0.3.5 beta"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-ff791c?style=flat-square&amp;labelColor=1b2029" alt="MIT 许可证"></a>
 </p>
 
@@ -42,7 +42,7 @@ CipherNest 是一款面向 Windows、macOS 和 Linux 的密码管理器。账号
   </tr>
 </table>
 
-保险库支持搜索、筛选、排序、收藏和标签；密码生成器支持自定义长度与字符类别。本地安全检查会提示弱密码、重复密码和长期未更新的密码。敏感字段默认遮罩，并可设置自动锁定、失焦锁定和剪贴板清除时间。
+保险库支持搜索、筛选、排序、收藏和标签；条目较多时，列表分批显示。本地安全检查会提示部分常见口令、明显规律的密码、重复使用和长期未更新的密码；密码生成器支持自定义长度与字符类别。敏感字段默认遮罩，并可设置自动锁定、失焦锁定和剪贴板清除时间。
 
 ## 下载与安装
 
@@ -78,7 +78,7 @@ CipherNest 不提供主密码重置服务。请妥善保存用于解锁保险库
 > [!IMPORTANT]
 > 升级前先导出一份加密备份，退出旧版应用，然后安装新版。安装后使用原主密码解锁，核对条目和同步设置。卸载时若系统提供清除应用数据的选项，请保留应用数据。
 
-`vault.cnvault` 是本地保险库；`backups/` 保存本机自动加密快照。快照只覆盖已保存的数据，保存在同一应用数据目录中，不能代替异盘或离线备份。手动导出的 `.cnvault` 文件可保存到用户选择的位置；已有目标文件不会被覆盖。备份策略、冲突保护和恢复步骤见[备份与恢复](docs/BACKUPS.md)。
+`vault.cnvault` 是本地保险库；`backups/` 保存本机自动加密快照。快照只覆盖已保存的数据，保存在同一应用数据目录中，不能代替异盘或离线备份。当前版本的快照无法确认时，应用会持续提示检查备份状态。手动导出的 `.cnvault` 文件可保存到用户选择的位置；已有目标文件不会被覆盖。备份策略、冲突保护和恢复步骤见[备份与恢复](docs/BACKUPS.md)。
 
 配置 WebDAV 后，`vault.cnvault.sync` 保存本机加密同步配置。加密备份**不包含**该同步配置；迁移设备时还需保管同步恢复码和 WebDAV 凭据。
 
@@ -86,7 +86,7 @@ CipherNest 不提供主密码重置服务。请妥善保存用于解锁保险库
 
 ## WebDAV 同步
 
-同步为可选功能，仅在保险库解锁后由用户手动触发。请填写已存在、以 `/` 结尾的 HTTPS WebDAV 目录。服务器证书须受信任，并与访问时使用的域名或 IP 匹配；服务器还须通过应用内的同步能力检查。创建同步空间需要 WebDAV 用户名和密码；在新设备加入时还需要 `CN1.` 同步恢复码。
+同步为可选功能，仅在保险库解锁后由用户手动触发。本机有未同步修改或无法确认同步状态时，界面会提示用户前往设置检查。请填写已存在、以 `/` 结尾的 HTTPS WebDAV 目录。服务器证书须受信任，并与访问时使用的域名或 IP 匹配；服务器还须通过应用内的同步能力检查。创建同步空间需要 WebDAV 用户名和密码；在新设备加入时还需要 `CN1.` 同步恢复码。
 
 同步恢复码应与 WebDAV 密码分开保存。它不能重置主密码，WebDAV 同步也不能替代离线备份。配置步骤、证书要求和常见错误见 [WebDAV 使用说明](docs/WEBDAV.md)；协议细节见 [同步设计](docs/SYNC_DESIGN.md)。
 

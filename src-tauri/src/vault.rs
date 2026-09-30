@@ -273,7 +273,7 @@ impl VaultStore {
         let password_counts = password_counts(&vault.data.entries);
         let normalized_query = query.unwrap_or_default().trim().to_lowercase();
         let filter = filter.unwrap_or("all");
-        if !matches!(filter, "all" | "favorites") {
+        if !matches!(filter, "all" | "favorites" | "conflicts") {
             return Err(VaultError::InvalidInput("筛选条件无效".into()));
         }
 
@@ -281,7 +281,11 @@ impl VaultStore {
             .data
             .entries
             .iter()
-            .filter(|entry| filter != "favorites" || entry.favorite)
+            .filter(|entry| match filter {
+                "favorites" => entry.favorite,
+                "conflicts" => sync::is_conflict_entry(entry),
+                _ => true,
+            })
             .filter(|entry| {
                 normalized_query.is_empty() || searchable_text(entry).contains(&normalized_query)
             })
@@ -323,6 +327,12 @@ impl VaultStore {
                 .filter(|entry| entry.favorite)
                 .count(),
             security_issue_count,
+            sync_conflict_count: vault
+                .data
+                .entries
+                .iter()
+                .filter(|entry| sync::is_conflict_entry(entry))
+                .count(),
             last_backup_at: vault.data.last_backup_at,
             auto_backup,
         })
@@ -2131,6 +2141,18 @@ fn is_weak_password(password: &str) -> bool {
         return true;
     }
     let length = password.chars().count();
+    // Character-set estimates overstate predictable passwords. Restrict these
+    // pattern checks to strings dominated by the pattern so a short accidental
+    // run inside an otherwise long password does not trigger a warning.
+    let lower = Zeroizing::new(password.to_ascii_lowercase());
+    if ["password", "qwerty", "letmein", "admin"]
+        .iter()
+        .any(|stem| lower.starts_with(stem) && length <= stem.len() + 8)
+        || has_dominant_repeated_pattern(password)
+        || has_dominant_sequence(password)
+    {
+        return true;
+    }
     let mut pool: f64 = 0.0;
     if password
         .chars()
@@ -2157,6 +2179,53 @@ fn is_weak_password(password: &str) -> bool {
         pool += 64.0;
     }
     length < 12 || pool <= 1.0 || length as f64 * pool.log2() < 60.0
+}
+
+fn has_dominant_repeated_pattern(password: &str) -> bool {
+    let chars = Zeroizing::new(password.chars().collect::<Vec<char>>());
+    for period in 1..=8.min(chars.len() / 3) {
+        let mut run = period;
+        for index in period..chars.len() {
+            run = if chars[index].eq_ignore_ascii_case(&chars[index - period]) {
+                run + 1
+            } else {
+                period
+            };
+            if run >= period * 3 && run >= 8 && run + 4 >= chars.len() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn has_dominant_sequence(password: &str) -> bool {
+    let bytes = password.as_bytes();
+    let mut ascending = 1_usize;
+    let mut descending = 1_usize;
+    for pair in bytes.windows(2) {
+        let (left, right) = (pair[0].to_ascii_lowercase(), pair[1].to_ascii_lowercase());
+        let digits = left.is_ascii_digit() && right.is_ascii_digit();
+        let letters = left.is_ascii_lowercase() && right.is_ascii_lowercase();
+        ascending = if (digits && (left - b'0' + 1) % 10 == right - b'0')
+            || (letters && left.checked_add(1) == Some(right))
+        {
+            ascending + 1
+        } else {
+            1
+        };
+        descending = if (digits && (left - b'0' + 9) % 10 == right - b'0')
+            || (letters && left.checked_sub(1) == Some(right))
+        {
+            descending + 1
+        } else {
+            1
+        };
+        if (ascending >= 8 || descending >= 8) && (ascending.max(descending) + 4 >= bytes.len()) {
+            return true;
+        }
+    }
+    false
 }
 
 fn sync_content_from(data: &VaultData) -> SyncContent {
@@ -2313,7 +2382,71 @@ mod tests {
     fn weak_password_detection_is_conservative() {
         assert!(is_weak_password("password123"));
         assert!(is_weak_password("tiny"));
+        for predictable in [
+            "Aaaaaaaaaaaa1!",
+            "Ab1!Ab1!Ab1!Ab1!",
+            "123456789012Aa!",
+            "jihgfedcba!A",
+            "Password123456!",
+            "qwerty-2026!X",
+        ] {
+            assert!(is_weak_password(predictable), "missed {predictable}");
+        }
         assert!(!is_weak_password("Tb@7.Bx9-vQ2!mZ4#rLp"));
+        assert!(!is_weak_password("aB3$defghijklmnoP8!"));
+        assert!(!is_weak_password("Xxxxxxx.Tb@7.Bx9-vQ2!mZ4#rLp"));
+    }
+
+    #[test]
+    fn conflict_review_includes_full_tag_copies_and_clears_after_resolution() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = VaultStore::new(directory.path().join("vault.cnvault"));
+        store
+            .create("conflict review passphrase long enough")
+            .unwrap();
+
+        let mut conflict = sample_entry_input(None, None, "Version A");
+        conflict.tags.push(sync::CONFLICT_TAG.into());
+        let saved = store.save_entry(conflict).unwrap();
+        let mut full_tags = sample_entry_input(None, None, "Full tags（同步冲突）");
+        full_tags.tags = (0..20).map(|index| format!("tag-{index}")).collect();
+        let saved_full = store.save_entry(full_tags).unwrap();
+        store
+            .save_entry(sample_entry_input(
+                None,
+                None,
+                "同步冲突 is only in the title",
+            ))
+            .unwrap();
+        store
+            .save_entry(sample_entry_input(None, None, "Plain title（同步冲突）"))
+            .unwrap();
+        assert_eq!(store.overview().unwrap().sync_conflict_count, 2);
+        let filtered = store.list_entries(None, Some("conflicts"), None).unwrap();
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.iter().any(|entry| entry.id == saved.id));
+        assert!(filtered.iter().any(|entry| entry.id == saved_full.id));
+
+        store
+            .save_entry(sample_entry_input(
+                Some(saved.id),
+                Some(saved.revision),
+                "Resolved",
+            ))
+            .unwrap();
+        assert_eq!(store.overview().unwrap().sync_conflict_count, 1);
+        store
+            .save_entry(sample_entry_input(
+                Some(saved_full.id),
+                Some(saved_full.revision),
+                "Resolved full tags",
+            ))
+            .unwrap();
+        assert_eq!(store.overview().unwrap().sync_conflict_count, 0);
+        assert!(store
+            .list_entries(None, Some("conflicts"), None)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
