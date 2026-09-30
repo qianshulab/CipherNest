@@ -236,8 +236,11 @@ pub async fn unlock_vault(
 
 #[tauri::command]
 pub async fn lock_vault(app: AppHandle, state: State<'_, AppState>) -> VaultResult<()> {
-    clear_pending_restore_state(&state.pending_restore)?;
-    clear_pending_sync_preview_state(&state.pending_sync_preview)?;
+    // A damaged pending preview must never prevent the unlocked root key from
+    // being removed. Keep the pending-restore clear before the store lock so a
+    // concurrent restore either commits first or sees its token invalidated.
+    let restore_clear = clear_pending_restore_state(&state.pending_restore);
+    let preview_clear = clear_pending_sync_preview_state(&state.pending_sync_preview);
     state.cancel_sync_operations();
     let store = Arc::clone(&state.store);
     run_store(store, |store| {
@@ -245,7 +248,10 @@ pub async fn lock_vault(app: AppHandle, state: State<'_, AppState>) -> VaultResu
         Ok(())
     })
     .await?;
-    clear_clipboard_if_owned(app, Arc::clone(&state.clipboard), None).await
+    let clipboard_clear = clear_clipboard_if_owned(app, Arc::clone(&state.clipboard), None).await;
+    restore_clear?;
+    preview_clear?;
+    clipboard_clear
 }
 
 #[tauri::command]

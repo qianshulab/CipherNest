@@ -9,6 +9,7 @@ export interface VaultOverview {
   totalEntries: number;
   favoriteCount: number;
   securityIssueCount: number;
+  syncConflictCount: number;
   lastBackupAt?: number;
   autoBackup: {
     count: number;

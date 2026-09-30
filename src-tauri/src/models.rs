@@ -112,6 +112,7 @@ pub struct VaultOverview {
     pub total_entries: usize,
     pub favorite_count: usize,
     pub security_issue_count: usize,
+    pub sync_conflict_count: usize,
     pub last_backup_at: Option<u64>,
     pub auto_backup: AutoBackupStatus,
 }
