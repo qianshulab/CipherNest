@@ -1301,36 +1301,72 @@ fn replay(space_id: &str, mut events: Vec<VerifiedEvent>) -> SyncResult<RemoteVi
             }
         }
     }
-    // Keep every conflict copy that a causal prefix of this history could
-    // display. A later edit to the original may supersede both competing
-    // heads; it must not silently remove an untouched review copy.
-    let mut historical_heads: BTreeMap<String, Vec<VersionedRecord>> = BTreeMap::new();
-    for event in causal_events {
-        for (index, mutation) in event.payload.mutations.iter().enumerate() {
-            let heads = historical_heads
-                .entry(mutation.value.id().to_owned())
-                .or_default();
-            heads.retain(|head| !mutation.parents.contains(&head.op_id));
-            heads.push(VersionedRecord {
-                op_id: format!("{}:{index}", event.hash),
-                value: mutation.value.clone(),
-                parents: mutation.parents.clone(),
-            });
-            if heads.len() > MAX_DEVICES * 2 {
-                return Err(SyncError::TooLarge);
-            }
-            let maximal: Vec<_> = heads.iter().collect();
-            let winner = pick_winner(&maximal)?;
-            for loser in maximal {
-                if loser.op_id != winner.op_id
-                    && matches!(loser.value, RecordValue::Entry(_))
-                    && !record_equal(&loser.value, &winner.value)
-                {
-                    implicit.insert(loser.op_id.clone());
+    // Preserve copies when an edit explicitly joins competing heads. Looking
+    // at arbitrary prefixes would also copy an older version on one branch
+    // (A-old) before its own follow-up (A-new) arrives in replay order.
+    add_implicit_versions(space_id, &implicit, &op_index, &mut ops)?;
+    {
+        let by_op: HashMap<&str, &VersionedRecord> = ops
+            .values()
+            .flat_map(|versions| versions.iter())
+            .map(|version| (version.op_id.as_str(), version))
+            .collect();
+        for event in causal_events {
+            for mutation in &event.payload.mutations {
+                if mutation.parents.len() < 2 {
+                    continue;
                 }
-            }
-            if implicit.len() > MAX_VAULT_ENTRIES {
-                return Err(SyncError::TooLarge);
+                let parent_ids: HashSet<&str> =
+                    mutation.parents.iter().map(String::as_str).collect();
+                let mut superseded = HashSet::new();
+                let mut visited = HashSet::new();
+                for parent in &mutation.parents {
+                    let version = by_op
+                        .get(parent.as_str())
+                        .ok_or(SyncError::RollbackOrFork)?;
+                    let mut ancestors = version
+                        .parents
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>();
+                    while let Some(ancestor) = ancestors.pop() {
+                        if !visited.insert(ancestor) {
+                            continue;
+                        }
+                        if parent_ids.contains(ancestor) {
+                            superseded.insert(ancestor);
+                        }
+                        let version = by_op.get(ancestor).ok_or(SyncError::RollbackOrFork)?;
+                        ancestors.extend(version.parents.iter().map(String::as_str));
+                    }
+                }
+                let maximal: Vec<_> = mutation
+                    .parents
+                    .iter()
+                    .filter(|parent| !superseded.contains(parent.as_str()))
+                    .map(|parent| {
+                        by_op
+                            .get(parent.as_str())
+                            .copied()
+                            .ok_or(SyncError::RollbackOrFork)
+                    })
+                    .collect::<SyncResult<_>>()?;
+                if maximal.len() < 2 {
+                    continue;
+                }
+                let winner = pick_winner(&maximal)?;
+                for loser in maximal {
+                    if loser.op_id != winner.op_id
+                        && !loser.op_id.starts_with("i:")
+                        && matches!(loser.value, RecordValue::Entry(_))
+                        && !record_equal(&loser.value, &winner.value)
+                    {
+                        implicit.insert(loser.op_id.clone());
+                    }
+                }
+                if implicit.len() > MAX_VAULT_ENTRIES {
+                    return Err(SyncError::TooLarge);
+                }
             }
         }
     }
@@ -1372,6 +1408,9 @@ fn replay(space_id: &str, mut events: Vec<VerifiedEvent>) -> SyncResult<RemoteVi
     let mut record_heads = BTreeMap::new();
     for (id, versions) in &ops {
         let maximal = maximal_versions(versions)?;
+        if maximal.len() > MAX_DEVICES * 2 {
+            return Err(SyncError::TooLarge);
+        }
         let winner = pick_winner(&maximal)?;
         let mut heads: Vec<_> = maximal
             .iter()
@@ -2310,21 +2349,78 @@ mod tests {
         b.prepare_local_changes(&content(vec![entry(&id, "B", 2)], vec![]), 2, 5)
             .unwrap();
         let remote_branch = verify_pending(b.pending.as_ref().unwrap(), &material).unwrap();
-        let merged = replay(
+        let history = vec![genesis, first_update, remote_branch, followup];
+        // Force both causal orders of B and A-new. Hash ordering must not
+        // turn the superseded A-old into a durable conflict copy.
+        for (remote_hash, followup_hash) in [("3", "4"), ("4", "3")] {
+            let replacements = BTreeMap::from([
+                (history[0].hash.clone(), "1".repeat(64)),
+                (history[1].hash.clone(), "2".repeat(64)),
+                (history[2].hash.clone(), remote_hash.repeat(64)),
+                (history[3].hash.clone(), followup_hash.repeat(64)),
+            ]);
+            let mut ordered = history.clone();
+            for event in &mut ordered {
+                event.hash = replacements[&event.hash].clone();
+                if let Some(previous) = &mut event.payload.prev_event_hash {
+                    *previous = replacements[previous].clone();
+                }
+                for observed in event.payload.observed_heads.values_mut() {
+                    *observed = replacements[observed].clone();
+                }
+                for mutation in &mut event.payload.mutations {
+                    for parent in &mut mutation.parents {
+                        let (hash, index) = parent.split_once(':').unwrap();
+                        *parent = format!("{}:{index}", replacements[hash]);
+                    }
+                }
+            }
+            for events in [ordered.clone(), ordered.into_iter().rev().collect()] {
+                let merged = replay(material.space_id(), events).unwrap();
+                assert_eq!(merged.content.entries.len(), 2);
+                assert_eq!(
+                    merged
+                        .content
+                        .entries
+                        .iter()
+                        .map(|value| value.password.as_str())
+                        .collect::<BTreeSet<_>>(),
+                    BTreeSet::from(["password-A-new", "password-B"])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn redundant_ancestor_in_join_parents_does_not_create_a_conflict_copy() {
+        let material = RecoveryMaterial::generate().unwrap();
+        let id = Uuid::new_v4().to_string();
+        let base = content(vec![entry(&id, "base", 1)], vec![]);
+        let (mut state, genesis, _) = first_event(&material, &base);
+        let old = content(vec![entry(&id, "A-old", 2)], vec![]);
+        state.prepare_local_changes(&old, 2, 3).unwrap();
+        let old_event = verify_pending(state.pending.as_ref().unwrap(), &material).unwrap();
+        let new = content(vec![entry(&id, "A-new", 3)], vec![]);
+        assert!(state
+            .stage_followup_after_verified_upload(&new, 3, 4)
+            .unwrap());
+        let new_event = verify_pending(state.pending.as_ref().unwrap(), &material).unwrap();
+        assert!(!state
+            .stage_followup_after_verified_upload(&new, 3, 5)
+            .unwrap());
+        let latest = content(vec![entry(&id, "latest", 4)], vec![]);
+        state.prepare_local_changes(&latest, 4, 6).unwrap();
+        let mut joined = verify_pending(state.pending.as_ref().unwrap(), &material).unwrap();
+        joined.payload.mutations[0]
+            .parents
+            .push(format!("{}:0", old_event.hash));
+        let view = replay(
             material.space_id(),
-            vec![genesis, first_update, remote_branch, followup],
+            vec![genesis, old_event, new_event, joined],
         )
         .unwrap();
-        assert_eq!(merged.content.entries.len(), 2);
-        assert_eq!(
-            merged
-                .content
-                .entries
-                .iter()
-                .map(|value| value.password.as_str())
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from(["password-A-new", "password-B"])
-        );
+        assert_eq!(view.content.entries.len(), 1);
+        assert_eq!(view.content.entries[0].password, "password-latest");
     }
 
     #[test]
