@@ -1,7 +1,7 @@
 {
   "name": "ciphernest-vault",
   "private": true,
-  "version": "0.3.7",
+  "version": "0.3.8",
   "description": "Local-first, encrypted password vault for Windows, macOS and Linux",
   "license": "MIT",
   "repository": "https://github.com/qianshulab/CipherNest",

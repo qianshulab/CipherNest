@@ -47,6 +47,8 @@ pub struct BackupConfig {
     pub automatic: bool,
     pub last_upload_at: Option<u64>,
     pub last_uploaded_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_uploaded_sha256: Option<String>,
     pub warning: Option<String>,
 }
 
@@ -824,6 +826,7 @@ mod tests {
             automatic: true,
             last_upload_at: Some(123),
             last_uploaded_generation: Some(4),
+            last_uploaded_sha256: None,
             warning: None,
         }
     }
@@ -842,6 +845,16 @@ mod tests {
         assert_eq!(read_config(&path, &id, &[7; 32]).unwrap().username, "alice");
         assert!(read_config(&path, &id, &[8; 32]).is_err());
         assert!(read_config(&path, &Uuid::new_v4().to_string(), &[7; 32]).is_err());
+    }
+
+    #[test]
+    fn legacy_config_without_confirmed_digest_remains_readable() {
+        let config = sample_config();
+        let legacy = serde_json::to_value(&config).unwrap();
+        assert!(legacy.get("lastUploadedSha256").is_none());
+        let restored: BackupConfig = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.last_uploaded_generation, Some(4));
+        assert!(restored.last_uploaded_sha256.is_none());
     }
 
     #[test]

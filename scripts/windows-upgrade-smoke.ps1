@@ -4,12 +4,14 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$expectedOldHash = 'A386DB9ABC7DDFFE8EB0E11154E31E0E4E870D3188B02F86E957A1CD2C4C55D8'
+$expectedOldHash = 'A76B7F302F04B2D312B08EAB91E414C2A0AF02A10202B167510A65674B536232'
+$oldVersion = '0.3.7'
+$newVersion = (Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\package.json') -Raw | ConvertFrom-Json).version
 $oldPath = (Resolve-Path -LiteralPath $OldInstaller).Path
 $newPath = (Resolve-Path -LiteralPath $NewInstaller).Path
 $actualOldHash = (Get-FileHash -LiteralPath $oldPath -Algorithm SHA256).Hash
 if ($actualOldHash -ne $expectedOldHash) {
-    throw "The 0.3.6 installer hash does not match the pinned release asset."
+    throw "The $oldVersion installer hash does not match the pinned release asset."
 }
 
 $installRoot = Join-Path $env:RUNNER_TEMP 'CipherNestUpgradeSmoke'
@@ -29,7 +31,7 @@ function Install-CipherNest([string] $installer) {
 Install-CipherNest $oldPath
 $installedExecutable = Join-Path $installRoot 'ciphernest.exe'
 if (-not (Test-Path -LiteralPath $installedExecutable -PathType Leaf)) {
-    throw 'The 0.3.6 executable was not installed in the expected directory.'
+    throw "The $oldVersion executable was not installed in the expected directory."
 }
 $oldExecutableHash = (Get-FileHash -LiteralPath $installedExecutable -Algorithm SHA256).Hash
 
@@ -49,7 +51,7 @@ foreach ($path in $sentinels) {
 
 Install-CipherNest $newPath
 if (-not (Test-Path -LiteralPath $installedExecutable -PathType Leaf)) {
-    throw 'The 0.3.7 executable is missing after overwrite installation.'
+    throw "The $newVersion executable is missing after overwrite installation."
 }
 $newExecutableHash = (Get-FileHash -LiteralPath $installedExecutable -Algorithm SHA256).Hash
 if ($newExecutableHash -eq $oldExecutableHash) {
@@ -64,4 +66,4 @@ foreach ($path in $sentinels) {
     }
 }
 
-Write-Output 'Windows 0.3.6 to 0.3.7 overwrite installation preserved the vault, sync and WebDAV backup sidecars, and backup bytes.'
+Write-Output "Windows $oldVersion to $newVersion overwrite installation preserved the vault, sync and WebDAV backup sidecars, and backup bytes."

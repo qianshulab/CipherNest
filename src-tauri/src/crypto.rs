@@ -70,6 +70,19 @@ pub fn create_envelope(
     data: &VaultData,
 ) -> VaultResult<(VaultEnvelope, Zeroizing<[u8; KEY_BYTES]>)> {
     validate_new_master_password(master_password)?;
+    create_envelope_with_verified_password(master_password, data)
+}
+
+/// Re-encrypt a vault whose existing password has already been authenticated.
+/// Historical passwords may predate today's creation policy; rejecting them
+/// here would make an otherwise valid vault or backup impossible to migrate.
+pub fn create_envelope_with_verified_password(
+    master_password: &str,
+    data: &VaultData,
+) -> VaultResult<(VaultEnvelope, Zeroizing<[u8; KEY_BYTES]>)> {
+    if master_password.len() > 1024 {
+        return Err(VaultError::MasterPasswordTooLong);
+    }
 
     let mut salt = [0_u8; SALT_BYTES];
     fill_random(&mut salt)?;
@@ -100,6 +113,50 @@ pub fn create_envelope(
         },
         root_key,
     ))
+}
+
+/// Refresh only a verified password slot that uses parameters below today's
+/// defaults. The payload, generation, vault root key, and any keys derived
+/// from the root key remain unchanged, so local encrypted sidecars stay valid.
+pub fn upgrade_weak_kdf(
+    master_password: &str,
+    envelope: &VaultEnvelope,
+    root_key: &[u8; KEY_BYTES],
+) -> VaultResult<Option<VaultEnvelope>> {
+    validate_envelope_header(envelope)?;
+    if master_password.len() > 1024 {
+        return Err(VaultError::MasterPasswordTooLong);
+    }
+    if envelope.kdf.memory_kib >= DEFAULT_MEMORY_KIB
+        && envelope.kdf.iterations >= DEFAULT_ITERATIONS
+        && envelope.kdf.parallelism >= DEFAULT_PARALLELISM
+    {
+        return Ok(None);
+    }
+
+    // This is a rare migration path. Recheck both the old password slot and
+    // payload before replacing its only active password slot on disk.
+    let (verified_root, _) = decrypt_envelope(master_password, envelope)?;
+    if verified_root.as_ref() != root_key {
+        return Err(VaultError::InvalidVault);
+    }
+
+    let mut salt = [0_u8; SALT_BYTES];
+    fill_random(&mut salt)?;
+    let kdf = KdfHeader {
+        algorithm: "argon2id".into(),
+        version: 19,
+        memory_kib: envelope.kdf.memory_kib.max(DEFAULT_MEMORY_KIB),
+        iterations: envelope.kdf.iterations.max(DEFAULT_ITERATIONS),
+        parallelism: envelope.kdf.parallelism.max(DEFAULT_PARALLELISM),
+        salt: STANDARD_NO_PAD.encode(salt),
+    };
+    let kek = derive_kek(master_password, &kdf)?;
+    let wrapped_key = encrypt_bytes(root_key, &kek, &key_wrap_aad(&envelope.vault_id, &kdf))?;
+    let mut upgraded = envelope.clone();
+    upgraded.kdf = kdf;
+    upgraded.wrapped_key = wrapped_key;
+    Ok(Some(upgraded))
 }
 
 pub fn decrypt_envelope(
@@ -213,10 +270,66 @@ pub fn validate_new_master_password(password: &str) -> VaultResult<()> {
     if password.len() > 1024 {
         return Err(VaultError::MasterPasswordTooLong);
     }
-    if password.chars().count() < 12 {
+    let normalized = Zeroizing::new(password.nfc().collect::<String>());
+    if normalized.chars().count() < 12 {
         return Err(VaultError::MasterPasswordTooShort);
     }
+    if has_obvious_master_password_pattern(&normalized) {
+        return Err(VaultError::MasterPasswordTooWeak);
+    }
     Ok(())
+}
+
+fn has_obvious_master_password_pattern(password: &str) -> bool {
+    let lower = Zeroizing::new(password.to_ascii_lowercase());
+    let compact = Zeroizing::new(
+        lower
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>(),
+    );
+    const COMMON_BASES: &[&str] = &[
+        "password", "qwerty", "letmein", "admin", "iloveyou", "123456", "abcdef",
+    ];
+    if compact.as_str() == "correcthorsebatterystaple"
+        || COMMON_BASES.iter().any(|base| {
+            compact.strip_prefix(base).is_some_and(|tail| {
+                tail.len() <= 16
+                    && tail
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || byte.is_ascii_punctuation())
+            })
+        })
+    {
+        return true;
+    }
+
+    let chars = Zeroizing::new(compact.chars().collect::<Vec<char>>());
+    if chars.is_empty() {
+        return true;
+    }
+    for period in 1..=4.min(chars.len() / 3) {
+        if chars
+            .iter()
+            .enumerate()
+            .all(|(index, ch)| *ch == chars[index % period])
+        {
+            return true;
+        }
+    }
+
+    let bytes = compact.as_bytes();
+    let all_digits = bytes.iter().all(u8::is_ascii_digit);
+    let all_letters = bytes.iter().all(u8::is_ascii_lowercase);
+    (all_digits || all_letters)
+        && bytes.windows(2).all(|pair| {
+            if all_digits {
+                (pair[0] - b'0' + 1) % 10 == pair[1] - b'0'
+                    || (pair[0] - b'0' + 9) % 10 == pair[1] - b'0'
+            } else {
+                pair[0].checked_add(1) == Some(pair[1]) || pair[0].checked_sub(1) == Some(pair[1])
+            }
+        })
 }
 
 fn encrypt_vault_data(data: &VaultData, root_key: &[u8; KEY_BYTES]) -> VaultResult<CipherBlock> {
@@ -380,6 +493,33 @@ fn fill_random(bytes: &mut [u8]) -> VaultResult<()> {
     getrandom::fill(bytes).map_err(|_| VaultError::SaveFailed)
 }
 
+#[cfg(test)]
+pub(crate) fn rewrap_with_test_kdf(
+    password: &str,
+    envelope: &VaultEnvelope,
+    root_key: &[u8; KEY_BYTES],
+    memory_kib: u32,
+    iterations: u32,
+    parallelism: u32,
+) -> VaultResult<VaultEnvelope> {
+    let mut salt = [0_u8; SALT_BYTES];
+    fill_random(&mut salt)?;
+    let kdf = KdfHeader {
+        algorithm: "argon2id".into(),
+        version: 19,
+        memory_kib,
+        iterations,
+        parallelism,
+        salt: STANDARD_NO_PAD.encode(salt),
+    };
+    let kek = derive_kek(password, &kdf)?;
+    let wrapped_key = encrypt_bytes(root_key, &kek, &key_wrap_aad(&envelope.vault_id, &kdf))?;
+    let mut weaker = envelope.clone();
+    weaker.kdf = kdf;
+    weaker.wrapped_key = wrapped_key;
+    Ok(weaker)
+}
+
 fn ensure_private_directory(path: &Path) -> VaultResult<()> {
     #[cfg(unix)]
     let existed = path.exists();
@@ -433,6 +573,68 @@ mod tests {
             decrypt_envelope("a sufficiently long master passphrase", &envelope).unwrap();
         assert_eq!(decrypted.vault_id, data.vault_id);
         assert!(decrypt_envelope("definitely the wrong password", &envelope).is_err());
+    }
+
+    #[test]
+    fn weak_password_slot_is_upgraded_without_changing_payload_or_root_key() {
+        let password = "an existing vault password";
+        let data = data();
+        let (envelope, root_key) = create_envelope(password, &data).unwrap();
+        let weak = rewrap_with_test_kdf(password, &envelope, &root_key, 19 * 1024, 1, 1).unwrap();
+        let upgraded = upgrade_weak_kdf(password, &weak, &root_key)
+            .unwrap()
+            .expect("historical parameters need an upgrade");
+        assert_eq!(upgraded.kdf.memory_kib, DEFAULT_MEMORY_KIB);
+        assert_eq!(upgraded.kdf.iterations, DEFAULT_ITERATIONS);
+        assert_eq!(upgraded.kdf.parallelism, DEFAULT_PARALLELISM);
+        assert_ne!(upgraded.kdf.salt, weak.kdf.salt);
+        assert_eq!(upgraded.payload, weak.payload);
+        assert_eq!(upgraded.generation, weak.generation);
+        let (unwrapped, decrypted) = decrypt_envelope(password, &upgraded).unwrap();
+        assert_eq!(unwrapped.as_ref(), root_key.as_ref());
+        assert_eq!(decrypted.vault_id, data.vault_id);
+        assert!(decrypt_envelope("definitely the wrong password", &upgraded).is_err());
+        assert!(upgrade_weak_kdf(password, &upgraded, &root_key)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn historical_short_password_can_be_reencrypted_after_authentication() {
+        let password = "oldpass";
+        assert!(matches!(
+            create_envelope(password, &data()),
+            Err(VaultError::MasterPasswordTooShort)
+        ));
+        let (envelope, root_key) =
+            create_envelope_with_verified_password(password, &data()).unwrap();
+        let (verified_root, _) = decrypt_envelope(password, &envelope).unwrap();
+        assert_eq!(verified_root.as_ref(), root_key.as_ref());
+    }
+
+    #[test]
+    fn new_password_policy_rejects_obvious_patterns_but_accepts_long_passphrases() {
+        for weak in [
+            "password1234!",
+            "QWERTY123456",
+            "123456789012",
+            "abcdefghijkl",
+            "aaaaaaaaaaaa",
+            "abababababab",
+            "correct horse battery staple",
+        ] {
+            assert!(matches!(
+                validate_new_master_password(weak),
+                Err(VaultError::MasterPasswordTooWeak)
+            ));
+        }
+        for acceptable in [
+            "five violet cedar lantern river words",
+            "A long independent master passphrase",
+            "passwordless-7M%q!f9p2Rz",
+        ] {
+            assert!(validate_new_master_password(acceptable).is_ok());
+        }
     }
 
     #[test]

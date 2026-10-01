@@ -14,6 +14,8 @@ pub enum VaultError {
     MasterPasswordTooShort,
     #[error("主密码过长。")]
     MasterPasswordTooLong,
+    #[error("主密码包含常见或易预测模式，请改用独有的长随机词组。")]
+    MasterPasswordTooWeak,
     #[error("请求中的字段无效：{0}")]
     InvalidInput(String),
     #[error("找不到该条目。")]

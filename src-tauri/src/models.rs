@@ -151,6 +151,10 @@ pub struct RestorePreview {
 #[serde(rename_all = "camelCase")]
 pub struct WebDavSyncStatus {
     pub configured: bool,
+    pub automatic: bool,
+    pub auto_paused: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_warning: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint_host: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -160,6 +164,8 @@ pub struct WebDavSyncStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_sync_at: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_auto_check_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_sequence: Option<u64>,
     pub pending_local_changes: bool,
 }
@@ -168,10 +174,14 @@ impl WebDavSyncStatus {
     pub fn not_configured() -> Self {
         Self {
             configured: false,
+            automatic: false,
+            auto_paused: false,
+            auto_warning: None,
             endpoint_host: None,
             username: None,
             sync_id_short: None,
             last_sync_at: None,
+            last_auto_check_at: None,
             remote_sequence: None,
             pending_local_changes: false,
         }
