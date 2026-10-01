@@ -46,6 +46,7 @@ const MAX_STATE_BYTES: usize = 96 * 1024 * 1024;
 const MAX_LIST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_EVENTS: usize = 40_000;
 const MAX_TOTAL_OPERATIONS: usize = 200_000;
+const MAX_ANCESTOR_VISITS: usize = 2_000_000;
 const MAX_DEVICES: usize = 64;
 const MAX_REMOTE_NAME: usize = 128;
 const MAX_XML_FIELD: usize = 4096;
@@ -1306,6 +1307,7 @@ fn replay(space_id: &str, mut events: Vec<VerifiedEvent>) -> SyncResult<RemoteVi
     // (A-old) before its own follow-up (A-new) arrives in replay order.
     add_implicit_versions(space_id, &implicit, &op_index, &mut ops)?;
     {
+        let mut ancestor_visits = 0usize;
         let by_op: HashMap<&str, &VersionedRecord> = ops
             .values()
             .flat_map(|versions| versions.iter())
@@ -1330,6 +1332,10 @@ fn replay(space_id: &str, mut events: Vec<VerifiedEvent>) -> SyncResult<RemoteVi
                         .map(String::as_str)
                         .collect::<Vec<_>>();
                     while let Some(ancestor) = ancestors.pop() {
+                        ancestor_visits += 1;
+                        if ancestor_visits > MAX_ANCESTOR_VISITS {
+                            return Err(SyncError::TooLarge);
+                        }
                         if !visited.insert(ancestor) {
                             continue;
                         }
@@ -2822,6 +2828,87 @@ mod tests {
         view.total_bytes = MAX_TOTAL_REMOTE_BYTES;
         assert!(matches!(
             view.ensure_publishable(pending, &material),
+            Err(SyncError::TooLarge)
+        ));
+    }
+
+    #[test]
+    fn redundant_join_ancestry_has_a_replay_and_preflight_work_limit() {
+        let material = RecoveryMaterial::generate().unwrap();
+        let device_id = Uuid::new_v4().to_string();
+        let id = Uuid::new_v4().to_string();
+        let hash_for = |counter: u64| format!("{counter:064x}");
+        let genesis_hash = hash_for(1);
+        let last_counter = 1_600;
+        let mut events = Vec::new();
+        for counter in 1..=last_counter {
+            let previous = (counter > 1).then(|| hash_for(counter - 1));
+            let mut parents = previous
+                .as_ref()
+                .map(|hash| vec![format!("{hash}:0")])
+                .unwrap_or_default();
+            if counter > 2 {
+                parents.push(format!("{genesis_hash}:0"));
+            }
+            events.push(VerifiedEvent {
+                hash: hash_for(counter),
+                payload: EventPayload {
+                    protocol_version: VERSION,
+                    space_id: material.space_id().to_owned(),
+                    genesis: counter == 1,
+                    device_id: device_id.clone(),
+                    counter,
+                    prev_event_hash: previous.clone(),
+                    observed_heads: previous
+                        .map(|hash| BTreeMap::from([(device_id.clone(), hash)]))
+                        .unwrap_or_default(),
+                    created_at: counter,
+                    mutations: vec![Mutation {
+                        parents,
+                        value: RecordValue::Entry(entry(&id, &format!("v{counter}"), counter)),
+                    }],
+                },
+            });
+        }
+        assert!(matches!(
+            replay(material.space_id(), events.clone()),
+            Err(SyncError::TooLarge)
+        ));
+
+        let last_hash = hash_for(last_counter);
+        let next = last_counter + 1;
+        let next_content = content(vec![entry(&id, "next", next)], vec![]);
+        let pending = make_pending(
+            &EventPayload {
+                protocol_version: VERSION,
+                space_id: material.space_id().to_owned(),
+                genesis: false,
+                device_id: device_id.clone(),
+                counter: next,
+                prev_event_hash: Some(last_hash.clone()),
+                observed_heads: BTreeMap::from([(device_id.clone(), last_hash.clone())]),
+                created_at: next,
+                mutations: vec![Mutation {
+                    parents: vec![format!("{last_hash}:0"), format!("{genesis_hash}:0")],
+                    value: RecordValue::Entry(next_content.entries[0].clone()),
+                }],
+            },
+            &material,
+            next,
+            &next_content,
+        )
+        .unwrap();
+        let view = RemoteView {
+            content: next_content,
+            seen: BTreeMap::new(),
+            record_heads: BTreeMap::new(),
+            event_count: events.len(),
+            latest_at: last_counter,
+            total_bytes: 0,
+            events,
+        };
+        assert!(matches!(
+            view.ensure_publishable(&pending, &material),
             Err(SyncError::TooLarge)
         ));
     }
