@@ -2169,6 +2169,27 @@ p {
   padding-top: 16px;
 }
 
+.webdav-backup-settings > summary {
+  cursor: pointer;
+  list-style: none;
+}
+
+.webdav-backup-settings > summary::after {
+  content: "展开";
+  margin-left: auto;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.webdav-backup-settings[open] > summary::after {
+  content: "收起";
+}
+
+.webdav-backup-settings > summary:focus-visible {
+  outline: 2px solid var(--orange);
+  outline-offset: 3px;
+}
+
 .webdav-backup-heading {
   display: flex;
   align-items: center;
@@ -2310,6 +2331,28 @@ p {
 
 .sync-card {
   min-height: 100%;
+}
+
+.sync-legacy {
+  margin: 0 18px 18px;
+  border-top: 1px solid var(--border-soft);
+  padding-top: 14px;
+}
+
+.sync-legacy > summary {
+  cursor: pointer;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.sync-legacy > summary:focus-visible {
+  outline: 2px solid var(--orange);
+  outline-offset: 3px;
+}
+
+.sync-legacy > .sync-card {
+  min-height: 0;
+  margin-top: 12px;
 }
 
 .sync-status {

@@ -7,6 +7,16 @@ export interface BackupFailure {
 
 const TARGET_CHANGED = "预览后本地保险库已发生变化。为避免覆盖新数据，请重新选择并预览备份。";
 const RECOVERY_FAILED = "检测到未完成的保险库恢复，无法自动确认磁盘状态。请保留应用数据目录并检查备份后再继续。";
+const IDENTICAL_TARGET = "请求中的字段无效：所选备份与当前保险库相同，无需恢复";
+const BACKUP_CONNECTION_NEEDS_UNLOCK = "当前设备的 WebDAV 备份连接无法用所选旧备份的密钥保留。请先解锁当前保险库后重试；从 WebDAV 恢复时也可选择保存本次连接。";
+const RESTORE_REJECTED_BEFORE_WRITE = new Set([
+  TARGET_CHANGED,
+  IDENTICAL_TARGET,
+  BACKUP_CONNECTION_NEEDS_UNLOCK,
+  "备份恢复会话已失效，请重新选择备份文件。",
+  "请先验证备份密码，再确认恢复。",
+  "WebDAV 同步正在进行，请等待当前操作完成。",
+]);
 
 const EXPORT_ERRORS = new Map<string, string>([
   ["请求中的字段无效：目标备份文件已存在，请选择其他文件名", "目标文件已存在。请另选文件名，避免覆盖旧备份。"],
@@ -22,6 +32,11 @@ function backendMessage(error: unknown): string {
   return value.replace(/^Error:\s*/u, "").trim();
 }
 
+/** These errors occur before the restore transaction can replace the vault. */
+export function restoreRejectedBeforeWrite(error: unknown): boolean {
+  return RESTORE_REJECTED_BEFORE_WRITE.has(backendMessage(error));
+}
+
 export function describeBackupFailure(phase: BackupPhase, error: unknown): BackupFailure {
   const message = backendMessage(error);
   if (phase === "export") {
@@ -35,6 +50,18 @@ export function describeBackupFailure(phase: BackupPhase, error: unknown): Backu
       message: "预览后本机保险库已变化，恢复已停止。请核对当前数据并重新选择备份。",
       tone: "warning",
     };
+  }
+  if (message === IDENTICAL_TARGET) {
+    return { message: "所选备份与当前保险库完全一致，无需恢复。", tone: "warning" };
+  }
+  if (message === BACKUP_CONNECTION_NEEDS_UNLOCK) {
+    return { message, tone: "warning" };
+  }
+  if (message === "WebDAV 同步正在进行，请等待当前操作完成。") {
+    return { message: "当前同步仍在进行，恢复尚未开始。请等待同步结束后重试。", tone: "warning" };
+  }
+  if (message === "请先验证备份密码，再确认恢复。") {
+    return { message: "备份验证会话尚未完成。请重新选择备份并验证密码。", tone: "warning" };
   }
   if (message === RECOVERY_FAILED) {
     return {

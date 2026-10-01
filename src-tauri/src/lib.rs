@@ -4,6 +4,7 @@ mod error;
 mod generator;
 mod models;
 mod sync;
+mod sync_v2;
 mod vault;
 mod webdav_backup;
 
@@ -56,6 +57,13 @@ pub fn run() {
             commands::sync_webdav_now,
             commands::reveal_webdav_recovery_code,
             commands::disable_webdav_sync,
+            commands::sync_v2_status,
+            commands::sync_v2_create,
+            commands::sync_v2_preview_join,
+            commands::sync_v2_join,
+            commands::sync_v2_now,
+            commands::sync_v2_reveal_recovery_code,
+            commands::sync_v2_disable,
             commands::security_report,
             commands::change_master_password,
             commands::export_backup,

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { describeBackupFailure } from "./backup-errors";
+import { describeBackupFailure, restoreRejectedBeforeWrite } from "./backup-errors";
 
 describe("backup failure guidance", () => {
   it("identifies a pre-existing export target without inviting overwrite", () => {
@@ -20,6 +20,26 @@ describe("backup failure guidance", () => {
       message: "预览后本机保险库已变化，恢复已停止。请核对当前数据并重新选择备份。",
       tone: "warning",
     });
+  });
+
+  it("reports an identical recovery point without claiming an uncertain write", () => {
+    const sameVault = "请求中的字段无效：所选备份与当前保险库相同，无需恢复";
+    expect(restoreRejectedBeforeWrite(sameVault)).toBe(true);
+    expect(describeBackupFailure("apply", sameVault)).toEqual({
+      message: "所选备份与当前保险库完全一致，无需恢复。",
+      tone: "warning",
+    });
+  });
+
+  it("keeps editing available for definite pre-write rejections", () => {
+    const oldKey = "当前设备的 WebDAV 备份连接无法用所选旧备份的密钥保留。请先解锁当前保险库后重试；从 WebDAV 恢复时也可选择保存本次连接。";
+    expect(restoreRejectedBeforeWrite(oldKey)).toBe(true);
+    expect(describeBackupFailure("apply", oldKey).tone).toBe("warning");
+    expect(restoreRejectedBeforeWrite("Error: WebDAV 同步正在进行，请等待当前操作完成。")).toBe(true);
+    expect(restoreRejectedBeforeWrite("备份恢复会话已失效，请重新选择备份文件。")).toBe(true);
+    expect(restoreRejectedBeforeWrite("预览后本地保险库已发生变化。为避免覆盖新数据，请重新选择并预览备份。")).toBe(true);
+    expect(restoreRejectedBeforeWrite("无法安全保存保险库。")).toBe(false);
+    expect(restoreRejectedBeforeWrite("内部状态暂时不可用。")).toBe(false);
   });
 
   it("does not promise an unchanged vault after an uncertain apply failure", () => {

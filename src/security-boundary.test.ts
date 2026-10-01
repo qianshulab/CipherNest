@@ -163,13 +163,14 @@ describe("renderer security boundary", () => {
     expect(statusContract).not.toMatch(/appPassword|recoveryCode|rootKey|deviceId/i);
 
     const card = sourceBetween("function renderWebDavSyncSettingsCard", "function appendSyncMetadata");
-    expect(card).toContain("创建同步空间");
-    expect(card).toContain("加入已有空间");
+    expect(card).toContain("设置第一台设备");
+    expect(card).toContain("连接另一台设备");
     expect(card).toContain("立即同步");
-    expect(card).toContain("保险库锁定时不会发起同步");
-    expect(card).toContain("停止此设备同步只会移除本机配置");
-    expect(card).toContain("本机配置无法验证 · 同步已停止");
-    expect(card).toContain("清除本机同步配置");
+    expect(card).toContain("自动同步在保险库解锁期间运行");
+    expect(card).toContain("停止此设备同步只移除本机配置");
+    expect(card).toContain("本机同步配置需检查");
+    expect(card).toContain("清除本机配置");
+    expect(card).toContain("旧版同步配置（CN1）");
 
     const operations = sourceBetween("function beginSyncOperation", "function pageHeader");
     for (const command of [
@@ -179,6 +180,12 @@ describe("renderer security boundary", () => {
       "sync_webdav_now",
       "reveal_webdav_recovery_code",
       "disable_webdav_sync",
+      "sync_v2_create",
+      "sync_v2_preview_join",
+      "sync_v2_join",
+      "sync_v2_now",
+      "sync_v2_reveal_recovery_code",
+      "sync_v2_disable",
     ]) {
       expect(operations).toContain(`"${command}"`);
     }
@@ -187,6 +194,7 @@ describe("renderer security boundary", () => {
     expect(operations).toContain("operationEpoch !== state.epoch");
     expect(operations).toContain("请求可能已修改远端");
     expect(operations).toContain("state.syncRemoteOutcomeUnknown = true");
+    expect(operations).toContain("state.syncV2RemoteOutcomeUnknown = true");
   });
 
   it("clears WebDAV secrets from forms and requires recovery-code acknowledgement", () => {
@@ -273,7 +281,7 @@ describe("renderer security boundary", () => {
     for (const field of ["preview.itemCount", "preview.updatedAt", "preview.sequence", "preview.syncIdShort"]) {
       expect(preview).toContain(field);
     }
-    expect(preview).toContain("首次加入（TOFU）");
+    expect(preview).toContain("此设备首次连接，没有旧检查点");
     expect(preview).toContain("合并（推荐）");
     expect(preview).toContain("以远端替换本机");
 
@@ -364,7 +372,7 @@ describe("renderer security boundary", () => {
     expect(rendererSource).toContain('window.matchMedia("(max-width: 1100px)")');
     const settings = sourceBetween("function renderSettingsPage", "function renderWebDavSyncSettingsCard");
     expect(settings).toContain("if (compactSettingsMedia.matches)");
-    expect(settings).toContain("layout.append(security, backup, master, sync)");
+    expect(settings).toContain("layout.append(security, sync, backup, master)");
   });
 
   it("keeps modal interactions single-layered and blocks background shortcuts", () => {

@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import brandLogoUrl from "./assets/ciphernest-logo-ui-v1.png";
-import { describeBackupFailure, type BackupPhase } from "./backup-errors";
+import { describeBackupFailure, restoreRejectedBeforeWrite, type BackupPhase } from "./backup-errors";
 import { describeEntrySaveFailure, describeUnlockFailure, type EntryField } from "./entry-errors";
 import { visibleListRows } from "./list-window";
 import { estimateMasterPassword, hasObviousMasterPasswordPattern } from "./master-password";
@@ -129,6 +129,11 @@ interface AppState {
   syncStatusUncertain: boolean;
   syncRemoteOutcomeUnknown: boolean;
   webdavRetry: WebDavRetryHint | null;
+  syncV2Status: WebDavSyncStatus;
+  syncV2StatusError: boolean;
+  syncV2StatusUncertain: boolean;
+  syncV2RemoteOutcomeUnknown: boolean;
+  webdavV2Retry: WebDavRetryHint | null;
   syncOperation: SyncOperation;
   settings: VaultSettings;
   view: VaultView;
@@ -184,7 +189,6 @@ const DEFAULT_GENERATOR_OPTIONS: GeneratorOptions = {
 const CONCEALED_TEXT = "••••••••••••";
 const ENTRY_REVISION_CONFLICT = "该条目已在其他操作中发生变化，请重新加载后再保存。";
 const MASTER_PASSWORD_TOO_WEAK = "主密码包含常见或易预测模式，请改用独有的长随机词组。";
-const RESTORE_TARGET_CHANGED = "预览后本地保险库已发生变化。为避免覆盖新数据，请重新选择并预览备份。";
 
 const EMPTY_STATUS: VaultStatus = {
   exists: false,
@@ -222,6 +226,11 @@ const state: AppState = {
   syncStatusUncertain: false,
   syncRemoteOutcomeUnknown: false,
   webdavRetry: null,
+  syncV2Status: { ...EMPTY_SYNC_STATUS },
+  syncV2StatusError: false,
+  syncV2StatusUncertain: false,
+  syncV2RemoteOutcomeUnknown: false,
+  webdavV2Retry: null,
   syncOperation: null,
   settings: { ...DEFAULT_SETTINGS },
   view: "all",
@@ -301,6 +310,9 @@ let lastActivitySent = 0;
 let listRequestId = 0;
 let backupStatusRequestId = 0;
 let syncStatusRequestId = 0;
+let syncV2StatusRequestId = 0;
+let legacyBackupExpanded = false;
+let legacySyncExpanded = false;
 let remoteContentRefreshActive = false;
 let remoteContentRefreshQueued = false;
 let pendingRemoteContentRender = false;
@@ -356,6 +368,17 @@ async function loadWebDavSyncStatusSafely(
   }
 }
 
+async function loadWebDavSyncV2StatusSafely(
+  fallback: WebDavSyncStatus = EMPTY_SYNC_STATUS,
+): Promise<{ status: WebDavSyncStatus; error: boolean }> {
+  try {
+    const status = await invokeCommand<WebDavSyncStatus>("sync_v2_status");
+    return { status: normalizeWebDavSyncStatus(status), error: false };
+  } catch {
+    return { status: normalizeWebDavSyncStatus(fallback), error: true };
+  }
+}
+
 async function loadWebDavBackupStatusSafely(
   fallback: WebDavBackupStatus = { configured: false },
 ): Promise<{ status: WebDavBackupStatus; error: boolean }> {
@@ -403,6 +426,26 @@ async function refreshWebDavSyncStatus(epoch: number): Promise<void> {
   state.syncStatus = result.status;
   state.syncStatusError = result.error;
   state.syncStatusUncertain = result.error;
+  if (hasOpenModal()) return;
+  if (state.view === "settings" && state.syncOperation === null) {
+    const currentCard = document.querySelector<HTMLElement>(".settings-sync-card");
+    if (currentCard) {
+      const nextCard = renderWebDavSyncSettingsCard();
+      nextCard.classList.add("settings-sync-card");
+      currentCard.replaceWith(nextCard);
+    }
+    document.querySelector<HTMLElement>(".settings-webdav-overview")?.replaceWith(renderWebDavOverview());
+  }
+  document.querySelector<HTMLElement>(".statusbar")?.replaceWith(renderStatusbar());
+}
+
+async function refreshWebDavSyncV2Status(epoch: number): Promise<void> {
+  const requestId = ++syncV2StatusRequestId;
+  const result = await loadWebDavSyncV2StatusSafely(state.syncV2Status);
+  if (requestId !== syncV2StatusRequestId || epoch !== state.epoch || !state.status.unlocked) return;
+  state.syncV2Status = result.status;
+  state.syncV2StatusError = result.error;
+  state.syncV2StatusUncertain = result.error;
   if (hasOpenModal()) return;
   if (state.view === "settings" && state.syncOperation === null) {
     const currentCard = document.querySelector<HTMLElement>(".settings-sync-card");
@@ -501,20 +544,38 @@ async function refreshAfterAutoSyncedContent(): Promise<void> {
 }
 
 function recordLocalSyncMutation(): void {
-  if (!state.syncStatus.configured || state.syncStatusError) return;
-  state.syncStatus = { ...state.syncStatus, pendingLocalChanges: true };
+  if (state.syncStatus.configured && !state.syncStatusError) {
+    state.syncStatus = { ...state.syncStatus, pendingLocalChanges: true };
+  }
+  if (state.syncV2Status.configured && !state.syncV2StatusError) {
+    state.syncV2Status = { ...state.syncV2Status, pendingLocalChanges: true };
+  }
 }
 
 async function refreshSyncStatusAfterMutation(epoch: number): Promise<void> {
-  if (!state.syncStatus.configured || state.syncStatusError) return;
-  const result = await loadWebDavSyncStatusSafely(state.syncStatus);
+  const [result, v2Result] = await Promise.all([
+    state.syncStatus.configured && !state.syncStatusError
+      ? loadWebDavSyncStatusSafely(state.syncStatus)
+      : Promise.resolve(null),
+    state.syncV2Status.configured && !state.syncV2StatusError
+      ? loadWebDavSyncV2StatusSafely(state.syncV2Status)
+      : Promise.resolve(null),
+  ]);
   if (epoch !== state.epoch || !state.status.unlocked) return;
-  if (result.error) {
-    state.syncStatusUncertain = true;
-    return;
+  if (result) {
+    if (result.error) state.syncStatusUncertain = true;
+    else {
+      state.syncStatus = result.status;
+      state.syncStatusUncertain = false;
+    }
   }
-  state.syncStatus = result.status;
-  state.syncStatusUncertain = false;
+  if (v2Result) {
+    if (v2Result.error) state.syncV2StatusUncertain = true;
+    else {
+      state.syncV2Status = v2Result.status;
+      state.syncV2StatusUncertain = false;
+    }
+  }
 }
 
 function makeElement<K extends keyof HTMLElementTagNameMap>(
@@ -871,10 +932,11 @@ async function bootstrap(): Promise<boolean> {
       renderGate();
       return true;
     }
-    const [settings, overview, syncState, backupState] = await Promise.all([
+    const [settings, overview, syncState, syncV2State, backupState] = await Promise.all([
       invokeCommand<VaultSettings>("get_settings"),
       invokeCommand<VaultOverview>("vault_overview"),
       loadWebDavSyncStatusSafely({ ...EMPTY_SYNC_STATUS }),
+      loadWebDavSyncV2StatusSafely({ ...EMPTY_SYNC_STATUS }),
       loadWebDavBackupStatusSafely(),
       loadEntries(false, epoch),
     ]);
@@ -884,9 +946,13 @@ async function bootstrap(): Promise<boolean> {
     state.syncStatus = syncState.status;
     state.syncStatusError = syncState.error;
     state.syncStatusUncertain = false;
+    state.syncV2Status = syncV2State.status;
+    state.syncV2StatusError = syncV2State.error;
+    state.syncV2StatusUncertain = false;
     state.webdavBackupStatus = backupState.status;
     state.webdavBackupStatusError = backupState.error;
     if (!syncState.status.configured) state.syncRemoteOutcomeUnknown = false;
+    if (!syncV2State.status.configured) state.syncV2RemoteOutcomeUnknown = false;
     state.status.itemCount = overview.totalEntries;
     scheduleAutoLock();
     renderMainShell();
@@ -1268,22 +1334,28 @@ function renderSidebar(): HTMLElement {
   local.append(icon("shield", 18));
   const localCopy = makeElement("div");
   localCopy.append(
-    makeElement("strong", "", state.syncStatus.configured || state.webdavBackupStatus.configured ? "本地优先" : "本机保险库"),
+    makeElement("strong", "", state.syncV2Status.configured || state.syncStatus.configured || state.webdavBackupStatus.configured ? "本地优先" : "本机保险库"),
     makeElement(
       "span",
       "",
-      state.syncStatusError
+      state.syncV2StatusError
+        ? "多设备同步配置需检查"
+        : state.syncV2Status.autoPaused
+          ? "多设备自动同步已暂停"
+          : state.syncV2Status.configured
+            ? "WebDAV 多设备自动同步"
+      : state.syncStatusError
         ? "同步配置需在设置中处理"
         : state.syncStatus.autoPaused
           ? "自动同步已暂停 · 请核对"
         : state.webdavBackupStatus.configured && state.webdavBackupStatus.automatic
           ? state.syncStatus.configured
-            ? `自动远端备份 · ${state.syncStatus.automatic ? "自动双向同步" : "手动双向同步"}`
-            : "远端备份自动上传"
+            ? `历史远端备份自动上传 · ${state.syncStatus.automatic ? "旧版自动同步" : "旧版手动同步"}`
+            : "历史远端备份自动上传"
           : state.syncStatus.configured
             ? state.syncStatus.automatic ? "自动双向加密同步" : "手动双向加密同步"
             : state.webdavBackupStatus.configured
-              ? "远端备份需手动上传"
+              ? "历史远端备份需手动上传"
               : "远端功能默认关闭",
     ),
   );
@@ -2222,7 +2294,7 @@ function renderSettingsPage(): HTMLElement {
   security.append(form);
 
   const backup = makeElement("section", "content-card settings-card settings-backup-card");
-  backup.append(settingsCardHeader("archive", "加密备份", "本机快照、文件导出与 WebDAV 单向远端备份。"));
+  backup.append(settingsCardHeader("archive", "加密备份", "本机快照与加密文件导出。"));
   const autoBackup = state.overview.autoBackup;
   const autoStatus = makeElement("div", "inline-notice inline-notice-compact");
   autoStatus.append(icon(autoBackup.inspectionFailed || autoBackup.warning ? "alert" : "shield", 17));
@@ -2252,7 +2324,7 @@ function renderSettingsPage(): HTMLElement {
       : "上次手动导出：尚未导出",
   );
   const backupNotice = makeElement("div", "inline-notice inline-notice-compact");
-  backupNotice.append(icon("alert", 17), makeElement("p", "", "可从本机快照、外部加密文件或 WebDAV 远端副本恢复。本机快照不能防范设备损坏或整盘丢失；请保留独立副本，并定期验证可恢复性。未保存的编辑内容不在备份中。"));
+  backupNotice.append(icon("alert", 17), makeElement("p", "", "本机快照不能防范设备损坏或整盘丢失；请将加密导出文件另存到独立介质，并定期验证可恢复性。未保存的编辑内容不在备份中。"));
   const backupActions = makeElement("div", "settings-actions");
   const exportButton = makeButton("导出加密备份", "button button-secondary", async () => exportBackup(exportButton), "download");
   exportButton.dataset.securityMutation = "true";
@@ -2307,6 +2379,7 @@ function renderSettingsPage(): HTMLElement {
     hideAllManagedSensitiveInputs();
     const operationEpoch = state.epoch;
     const syncWasConfigured = state.syncStatus.configured;
+    const syncV2WasConfigured = state.syncV2Status.configured;
     state.securityOperation = "changePassword";
     setSecurityMutationControlsDisabled(true);
     setBusy(changeButton, true, "正在更改…");
@@ -2324,22 +2397,28 @@ function renderSettingsPage(): HTMLElement {
       const syncState = result.syncConfigPreserved
         ? await loadWebDavSyncStatusSafely(state.syncStatus)
         : { status: { ...EMPTY_SYNC_STATUS }, error: false };
+      const syncV2State = await loadWebDavSyncV2StatusSafely(state.syncV2Status);
       const backupState = await loadWebDavBackupStatusSafely();
       await loadVaultOverview(operationEpoch).catch(() => undefined);
       if (operationEpoch === state.epoch && state.status.unlocked) {
         state.syncStatus = syncState.status;
         state.syncStatusError = syncState.error;
         state.syncStatusUncertain = false;
+        syncV2StatusRequestId += 1;
+        state.syncV2Status = syncV2State.status;
+        state.syncV2StatusError = syncV2State.error;
+        state.syncV2StatusUncertain = false;
         backupStatusRequestId += 1;
         state.webdavBackupStatus = backupState.status;
         state.webdavBackupStatusError = backupState.error;
         if (!syncState.status.configured) state.syncRemoteOutcomeUnknown = false;
+        if (!syncV2State.status.configured) state.syncV2RemoteOutcomeUnknown = false;
         state.securityOperation = null;
         renderMainShell();
         const baseMessage = "主密码已更改并轮换保险库密钥。旧备份仍使用原密码。";
         if (result.warning) {
           showToast(`${baseMessage} ${result.warning}`, "warning", 7600);
-        } else if (!result.syncConfigPreserved && syncWasConfigured) {
+        } else if ((!result.syncConfigPreserved && syncWasConfigured) || (syncV2WasConfigured && !syncV2State.status.configured)) {
           showToast(`${baseMessage} WebDAV 同步配置未能保留，请重新配置。`, "warning", 7600);
         } else {
           showToast(
@@ -2372,7 +2451,7 @@ function renderSettingsPage(): HTMLElement {
   sync.classList.add("settings-sync-card");
 
   if (compactSettingsMedia.matches) {
-    layout.append(security, backup, master, sync);
+    layout.append(security, sync, backup, master);
   } else {
     const primaryColumn = makeElement("div", "settings-column");
     const secondaryColumn = makeElement("div", "settings-column");
@@ -2385,26 +2464,21 @@ function renderSettingsPage(): HTMLElement {
 }
 
 function renderWebDavOverview(): HTMLElement {
-  const syncSummary = state.syncStatusError
+  const syncSummary = state.syncV2StatusError
     ? "配置需检查"
-    : !state.syncStatus.configured
-      ? "未配置"
-      : state.syncStatus.autoPaused
+    : !state.syncV2Status.configured
+      ? "尚未设置"
+      : state.syncV2Status.autoPaused
         ? "自动同步已暂停"
-        : state.syncStatus.automatic ? "自动运行" : "仅手动运行";
-  const backupSummary = state.webdavBackupStatusError
-    ? "配置需检查"
-    : !state.webdavBackupStatus.configured
-      ? "未配置"
-      : state.webdavBackupStatus.automatic ? "自动上传" : "仅手动上传";
+        : "自动运行";
   const webdavOverview = makeElement("div", "inline-notice inline-notice-compact settings-webdav-overview");
   webdavOverview.append(icon("shield", 17));
   const webdavOverviewText = makeElement("p");
   webdavOverviewText.append(
-    makeElement("strong", "", "WebDAV 同步与备份"),
+    makeElement("strong", "", "WebDAV 多设备同步"),
     document.createElement("br"),
     document.createTextNode(
-      `双向同步：${syncSummary}；历史备份：${backupSummary}。同步合并设备间的修改，备份保留可恢复的整库版本。`,
+      `状态：${syncSummary}。多设备同步会传递已保存条目的修改；请继续保留独立的加密备份。`,
     ),
   );
   webdavOverview.append(webdavOverviewText);
@@ -2421,7 +2495,7 @@ function reflowSettingsLayout(): void {
   if (!layout || !security || !backup || !master || !sync) return;
   const focused = layout.contains(document.activeElement) ? document.activeElement as HTMLElement : null;
   if (compactSettingsMedia.matches) {
-    layout.replaceChildren(security, backup, master, sync);
+    layout.replaceChildren(security, sync, backup, master);
   } else {
     const primary = makeElement("div", "settings-column");
     const secondary = makeElement("div", "settings-column");
@@ -2433,10 +2507,14 @@ function reflowSettingsLayout(): void {
 }
 
 function renderWebDavBackupSettings(): HTMLElement {
-  const section = makeElement("section", "webdav-backup-settings");
-  const heading = makeElement("div", "webdav-backup-heading");
-  heading.append(icon("upload", 17), makeElement("h3", "", "WebDAV 单向远端备份"));
+  const section = makeElement("details", "webdav-backup-settings") as HTMLDetailsElement;
+  section.open = legacyBackupExpanded || state.webdavBackupStatusError || Boolean(state.webdavBackupStatus.warning);
+  section.addEventListener("toggle", () => { legacyBackupExpanded = section.open; });
+  const heading = makeElement("summary", "webdav-backup-heading");
+  heading.append(icon("archive", 17), makeElement("h3", "", "历史 WebDAV 备份与恢复"));
   section.append(heading);
+
+  section.append(makeElement("p", "webdav-backup-summary", "此处保留旧版远端备份和整库恢复功能。备份文件可作为历史恢复点；恢复会替换本机保险库，不会合并多台设备的修改。"));
 
   if (state.webdavBackupStatusError) {
     const warning = makeElement("div", "inline-notice inline-notice-warning inline-notice-compact");
@@ -2521,7 +2599,115 @@ function renderWebDavBackupSettings(): HTMLElement {
 
 function renderWebDavSyncSettingsCard(): HTMLElement {
   const card = makeElement("section", "content-card settings-card sync-card");
-  card.append(settingsCardHeader("shield", "多设备加密同步", "双向合并条目。配置同步空间后，可选择仅手动同步或在解锁期间自动检查；保险库锁定时不会发起同步。"));
+  card.append(settingsCardHeader("shield", "WebDAV 多设备同步", "使用现有的 HTTPS WebDAV 目录，在设备间自动同步已保存的条目。"));
+  const content = makeElement("div", "sync-status");
+  const status = state.syncV2Status;
+  const needsAttention = state.syncV2StatusError || Boolean(status.autoPaused || status.autoWarning);
+  const badge = makeElement("div", `sync-badge${needsAttention ? " has-error" : status.configured ? " is-enabled" : ""}`);
+  badge.append(
+    makeElement("span", `status-dot${needsAttention ? " status-dot-error" : status.configured ? "" : " status-dot-muted"}`),
+    makeElement("strong", "", state.syncV2StatusError
+      ? "本机同步配置需检查"
+      : status.autoPaused
+        ? "自动同步已暂停"
+        : status.configured ? "已连接 · 自动同步" : "尚未设置"),
+  );
+  content.append(badge);
+
+  const actions = makeElement("div", "sync-actions");
+  const addAction = (label: string, style: string, handler: () => void | Promise<void>, iconName: IconName) => {
+    const button = makeButton(label, style, handler, iconName);
+    button.dataset.securityMutation = "true";
+    button.disabled = state.syncOperation !== null || state.securityOperation !== null;
+    actions.append(button);
+    return button;
+  };
+  if (state.syncV2StatusError) {
+    content.append(makeElement("p", "", "无法验证此设备保存的 WebDAV 同步配置。请重试读取；如果仍失败，可用主密码清除本机配置后重新加入。服务器上的加密文件不会被删除。"));
+    addAction("重试读取", "button button-secondary", () => refreshWebDavSyncV2Status(state.epoch), "refresh");
+    addAction("清除本机配置", "button button-danger-ghost", disableWebDavSyncV2, "trash");
+  } else if (!status.configured) {
+    content.append(makeElement("p", "", "在第一台设备创建同步空间，再使用同一目录和恢复码连接其他设备。首次连接已有内容的设备时，可以选择合并或经再次确认后以远端替换本机。"));
+    const notice = makeElement("div", "inline-notice inline-notice-compact sync-notice");
+    notice.append(icon("shield", 17), makeElement("p", "", "服务器可能删除或隐藏文件，也能看到访问时间和文件大小。请定期另存加密备份。"));
+    content.append(notice);
+    if (state.syncStatus.configured || state.syncStatusError) {
+      const legacyNotice = makeElement("div", "inline-notice inline-notice-warning inline-notice-compact sync-notice");
+      legacyNotice.append(icon("alert", 17), makeElement("p", "", "此设备仍有旧版同步配置。请先在下方查看恢复码并停止旧版同步，再设置新的多设备同步。旧版远端文件会保留。"));
+      content.append(legacyNotice);
+    } else {
+      addAction("设置第一台设备", "button button-primary", createWebDavSyncV2Space, "plus");
+      addAction("连接另一台设备", "button button-secondary", joinWebDavSyncV2Space, "download");
+    }
+    if (state.webdavV2Retry) {
+      const retry = makeElement("div", "inline-notice inline-notice-warning sync-retry-notice");
+      retry.setAttribute("role", "alert");
+      const copy = makeElement("div", "sync-retry-copy");
+      copy.append(
+        makeElement("strong", "", state.webdavV2Retry.mode === "create" ? "设置未完成" : "连接未完成"),
+        makeElement("p", "", state.webdavV2Retry.message),
+        makeElement("p", "", "重试时会保留目录地址和用户名；密码与恢复码需要重新输入。"),
+      );
+      const retryAction = makeButton("重试", "button button-secondary button-small", state.webdavV2Retry.mode === "create" ? createWebDavSyncV2Space : joinWebDavSyncV2Space, "refresh");
+      retryAction.disabled = state.syncOperation !== null || state.securityOperation !== null;
+      copy.append(retryAction);
+      retry.append(icon("alert", 17), copy);
+      content.append(retry);
+    }
+  } else {
+    const metadata = makeElement("dl", "sync-metadata");
+    appendSensitiveSyncMetadata(metadata, "服务器", status.endpointHost || "已配置");
+    appendSensitiveSyncMetadata(metadata, "用户名", status.username || "—");
+    appendSyncMetadata(metadata, "同步 ID", status.syncIdShort || "—");
+    appendSyncMetadata(metadata, "上次同步", status.lastSyncAt ? formatFullDate(status.lastSyncAt) : "尚未完成");
+    content.append(metadata);
+    const localState = makeElement("div", `sync-local-state${state.syncV2RemoteOutcomeUnknown || state.syncV2StatusUncertain || status.pendingLocalChanges ? " has-pending" : ""}`);
+    localState.append(
+      icon(state.syncV2RemoteOutcomeUnknown || state.syncV2StatusUncertain || status.pendingLocalChanges ? "alert" : "check", 16),
+      makeElement("span", "", state.syncV2RemoteOutcomeUnknown
+        ? "上次请求的远端结果待确认；请重新同步并核对其他设备"
+        : state.syncV2StatusUncertain
+          ? "暂时无法确认同步状态，请重试读取"
+          : status.pendingLocalChanges ? "本机有待同步的修改" : "本机内容与上次同步检查点一致"),
+    );
+    content.append(localState);
+    if (status.autoWarning) {
+      const warning = makeElement("div", "inline-notice inline-notice-warning inline-notice-compact sync-notice");
+      warning.setAttribute("role", "status");
+      warning.append(icon("alert", 17), makeElement("p", "", status.autoWarning));
+      content.append(warning);
+    }
+    if (state.overview.syncConflictCount > 0) {
+      const conflicts = makeElement("div", "inline-notice inline-notice-warning sync-conflicts-notice");
+      conflicts.append(icon("alert", 17), makeElement("p", "", `有 ${state.overview.syncConflictCount} 个待核对的同步冲突副本。`));
+      conflicts.append(makeButton("查看冲突副本", "button button-secondary button-small", showSyncConflictEntries, "search"));
+      content.append(conflicts);
+    }
+    addAction("立即同步", "button button-primary", syncWebDavV2Now, "refresh");
+    addAction("查看恢复码", "button button-ghost", revealWebDavV2RecoveryCode, "eye");
+    addAction("停止此设备同步", "button button-danger-ghost", disableWebDavSyncV2, "x");
+    content.append(makeElement("p", "field-help", "自动同步在保险库解锁期间运行。停止此设备同步只移除本机配置，不删除服务器文件。"));
+    if (state.webdavBackupStatus.configured && !state.webdavBackupStatusError && !state.webdavBackupStatus.automatic) {
+      content.append(makeElement("p", "field-help", "历史 WebDAV 备份连接仍可用于手动上传和恢复；自动上传已关闭。"));
+    }
+  }
+  if (actions.childElementCount) content.append(actions);
+  card.append(content);
+
+  if (state.syncStatus.configured || state.syncStatusError) {
+    const legacy = makeElement("details", "sync-legacy") as HTMLDetailsElement;
+    legacy.open = legacySyncExpanded;
+    legacy.addEventListener("toggle", () => { legacySyncExpanded = legacy.open; });
+    const summary = makeElement("summary", "", "旧版同步配置（CN1）");
+    legacy.append(summary, renderLegacyWebDavSyncSettingsCard());
+    card.append(legacy);
+  }
+  return card;
+}
+
+function renderLegacyWebDavSyncSettingsCard(): HTMLElement {
+  const card = makeElement("section", "content-card settings-card sync-card");
+  card.append(settingsCardHeader("archive", "旧版同步（CN1）", "此设备的旧版同步配置仍可使用。请保存恢复码后再停止，以便迁移到上方的新同步空间。"));
   const content = makeElement("div", "sync-status");
   const status = state.syncStatus;
   const syncNeedsAttention = state.syncStatusError || Boolean(status.autoPaused || status.autoWarning);
@@ -2726,13 +2912,22 @@ function clearWebDavJoinDetails(details: WebDavJoinDetails | null): void {
   details.recoveryCode = "";
 }
 
-async function applyWebDavOutcome(outcome: WebDavSyncOutcome, operationEpoch: number, joined = false): Promise<void> {
+async function applyWebDavOutcome(outcome: WebDavSyncOutcome, operationEpoch: number, joined = false, version: "v1" | "v2" = "v1"): Promise<void> {
   if (operationEpoch !== state.epoch || !state.status.unlocked) return;
-  state.syncStatus = normalizeWebDavSyncStatus(outcome.status);
-  state.syncStatusError = false;
-  state.syncStatusUncertain = false;
-  state.syncRemoteOutcomeUnknown = false;
-  state.webdavRetry = null;
+  if (version === "v2") {
+    state.syncV2Status = normalizeWebDavSyncStatus(outcome.status);
+    state.syncV2StatusError = false;
+    state.syncV2StatusUncertain = false;
+    state.syncV2RemoteOutcomeUnknown = false;
+    state.webdavV2Retry = null;
+    if (joined) await refreshWebDavBackupStatus(operationEpoch);
+  } else {
+    state.syncStatus = normalizeWebDavSyncStatus(outcome.status);
+    state.syncStatusError = false;
+    state.syncStatusUncertain = false;
+    state.syncRemoteOutcomeUnknown = false;
+    state.webdavRetry = null;
+  }
   state.overview.syncConflictCount += outcome.conflicts;
   let listRefreshed = true;
   if (outcome.kind === "downloaded" || outcome.kind === "merged") {
@@ -2743,7 +2938,11 @@ async function applyWebDavOutcome(outcome: WebDavSyncOutcome, operationEpoch: nu
   await loadVaultOverview(operationEpoch).catch(() => undefined);
   if (operationEpoch !== state.epoch || !state.status.unlocked) return;
   const sequence = `远端序列 #${outcome.sequence.toLocaleString("zh-CN")}`;
-  const autoNote = joined && outcome.status.automatic ? " 此设备已启用自动同步，可在设置中关闭。" : "";
+  const autoNote = joined && outcome.status.automatic
+    ? version === "v2"
+      ? " 此设备已启用自动同步，可在设置中停止此设备的连接。"
+      : " 此设备已启用自动同步，可在设置中关闭。"
+    : "";
   if (!listRefreshed) {
     showToast(
       `同步已提交（${sequence}），但条目列表未能刷新。请切换到条目页重新读取；若仍失败，点击“重试读取”${outcome.conflicts > 0 ? `，然后核对 ${outcome.conflicts} 个冲突副本` : ""}。${autoNote}`,
@@ -2761,7 +2960,7 @@ async function applyWebDavOutcome(outcome: WebDavSyncOutcome, operationEpoch: nu
     return;
   }
   const messages: Record<WebDavSyncOutcome["kind"], string> = {
-    upToDate: `已检查服务器，本机与远端均为最新（${sequence}）。`,
+    upToDate: `已检查服务器，本机与本次读取的远端内容一致（${sequence}）。`,
     uploaded: `本机加密修改已上传（${sequence}）。`,
     downloaded: `远端加密修改已下载并应用（${sequence}）。`,
     merged: `本机与远端修改已安全合并（${sequence}）。`,
@@ -2776,7 +2975,7 @@ function describeWebDavNetworkFailure(error: unknown, fallback: string): string 
     ["无法建立 WebDAV HTTPS 连接。请检查服务器是否可达、端口是否启用 HTTPS，以及证书是否可信且与域名匹配。", "无法建立 HTTPS 连接。请确认端口启用了 HTTPS，且证书受本机信任并与访问域名或 IP 匹配。"],
     ["WebDAV HTTPS 证书链不受信任。请检查服务器证书链。", "WebDAV 服务的证书链无法验证。请确认该 HTTPS 服务发送了站点证书及所需中间证书，并检查签发机构是否受本机信任。"],
     ["WebDAV 服务器返回了不支持的状态码 401。", "WebDAV 身份验证失败（401）。请检查用户名和应用专用密码。"],
-    ["WebDAV 服务器返回了不支持的状态码 403。", "WebDAV 拒绝访问（403）。请检查账号对该目录的读取、创建、修改和删除权限。"],
+    ["WebDAV 服务器返回了不支持的状态码 403。", "WebDAV 拒绝访问（403）。请检查账号对该目录的读取与写入权限；旧版备份连接测试还需要删除权限。"],
     ["WebDAV 服务器返回了不支持的状态码 404。", "WebDAV 目录不存在（404）。请先在服务器创建目录，并核对完整地址。"],
     ["WebDAV 服务器返回了不支持的状态码 405。", "WebDAV 方法被拒绝（405）。请检查服务器及反向代理是否允许 WebDAV 请求。"],
     ["WebDAV 服务器返回了不支持的状态码 409。", "WebDAV 目录发生冲突（409）。请确认父目录存在，并重新检查目录权限。"],
@@ -2786,14 +2985,266 @@ function describeWebDavNetworkFailure(error: unknown, fallback: string): string 
     ["远端已存在此 CipherNest 同步空间。", "该目录已有同步空间。若你持有对应恢复码，请使用“加入已有空间”。"],
     ["远端已被另一台设备更新，请重新拉取并合并。", "远端已被另一台设备更新。本机内容未被覆盖，请重新同步并核对冲突副本。"],
     ["WebDAV 服务器不支持安全同步所需的条件请求或强 ETag。", "服务器缺少安全同步所需的强 ETag 或条件写入能力。请检查 WebDAV 服务和反向代理配置。"],
-    ["同步恢复码无效。", "同步恢复码无效。请核对完整的 CN1 恢复码。"],
+    ["同步恢复码无效。", "同步恢复码无效。请核对该同步空间的完整恢复码。"],
     ["本地同步状态无效或已损坏。", "本机同步配置无法验证，同步已停止。请检查设备上的同步配置。"],
     ["本地保险库版本早于上次同步版本，已拒绝覆盖远端数据。", "本机保险库版本早于同步检查点。请先导出本机备份，核对其他设备后再处理。"],
     ["检测到远端回滚、分叉或缺失的父快照。", "远端同步历史无法通过安全检查。请先导出本机备份，再核对服务器与其他设备。"],
     ["远端快照链超过安全检查上限。", "远端历史超过安全检查上限。请先导出本机备份，再核对较新的可信设备。"],
+    ["同步对象超过大小限制。", "同步空间已达到容量或设备数量上限。请保留各设备本机数据与加密备份，核对内容后在新目录创建同步空间。"],
     ["同步期间本地保险库已发生变化；远端内容未覆盖这些更改，请重新同步。", "同步期间本机保险库发生变化，远端内容未覆盖本机修改。请重新同步。"],
   ]);
   return guidance.get(message) ?? fallback;
+}
+
+async function createWebDavSyncV2Space(): Promise<void> {
+  if (state.syncV2Status.configured || state.syncV2StatusError || state.syncStatus.configured || state.syncStatusError) return;
+  if (hasUnsavedDraft()) {
+    showToast("请先保存或放弃当前条目的修改，再设置同步。", "warning");
+    return;
+  }
+  const operationEpoch = beginSyncOperation("create");
+  if (operationEpoch === null) return;
+  let credentials: WebDavCredentials | null = null;
+  let result: WebDavCreateResult | null = null;
+  let recoveryCode = "";
+  let retryEndpoint = "";
+  let retryUsername = "";
+  try {
+    credentials = await askWebDavConnection("create", state.webdavV2Retry?.mode === "create" ? state.webdavV2Retry : null, "v2");
+    if (!credentials || operationEpoch !== state.epoch) return;
+    retryEndpoint = credentials.endpoint;
+    retryUsername = credentials.username;
+    const closeProgress = showRestoreProgress("正在创建 WebDAV 同步空间…", "请保持保险库解锁，等待连接检查完成。", true);
+    try {
+      const request = invokeCommand<WebDavCreateResult>("sync_v2_create", { credentials: { ...credentials } });
+      clearWebDavCredentials(credentials);
+      result = await request;
+    } finally {
+      closeProgress();
+    }
+    if (operationEpoch !== state.epoch || !state.status.unlocked) return;
+    state.syncV2Status = normalizeWebDavSyncStatus(result.status);
+    state.syncV2StatusError = false;
+    state.syncV2StatusUncertain = false;
+    state.syncV2RemoteOutcomeUnknown = false;
+    state.webdavV2Retry = null;
+    await refreshWebDavBackupStatus(operationEpoch);
+    recoveryCode = result.recoveryCode;
+    result.recoveryCode = "";
+    await showRecoveryCodeDialog(recoveryCode, true, "保存多设备同步恢复码");
+    recoveryCode = "";
+    if (operationEpoch !== state.epoch || !state.status.unlocked) return;
+    showToast(
+      state.syncV2Status.autoWarning || state.syncV2Status.pendingLocalChanges
+        ? "同步空间已创建，但首次上传尚未确认。请保管恢复码，在设置中查看状态并手动重试。"
+        : "同步空间已创建。此设备会在解锁期间自动同步。",
+      state.syncV2Status.autoWarning || state.syncV2Status.pendingLocalChanges ? "warning" : "success",
+      7200,
+    );
+  } catch (error) {
+    if (operationEpoch !== state.epoch) return;
+    const probe = await loadWebDavSyncV2StatusSafely(state.syncV2Status);
+    if (operationEpoch !== state.epoch) return;
+    let message = describeWebDavNetworkFailure(error, "无法创建同步空间。请检查 WebDAV 地址、凭据与目录权限后重试。");
+    if (probe.error) {
+      state.syncV2StatusError = true;
+      state.webdavV2Retry = null;
+      message = "无法读取本机同步配置，请在设置中检查。";
+    } else if (probe.status.configured) {
+      state.syncV2Status = probe.status;
+      state.syncV2RemoteOutcomeUnknown = true;
+      state.webdavV2Retry = null;
+      await refreshWebDavBackupStatus(operationEpoch);
+      message = "本机已有同步配置，但创建结果未能确认。请查看并保存恢复码，再检查其他设备的状态。";
+    } else if (retryEndpoint) {
+      state.webdavV2Retry = { mode: "create", endpoint: retryEndpoint, username: retryUsername, message };
+    }
+    if (operationEpoch !== state.epoch || !state.status.unlocked) return;
+    showToast(message, "error", 8200);
+  } finally {
+    clearWebDavCredentials(credentials);
+    if (result) result.recoveryCode = "";
+    recoveryCode = "";
+    finishSyncOperation(operationEpoch);
+  }
+}
+
+async function joinWebDavSyncV2Space(): Promise<void> {
+  if (state.syncV2Status.configured || state.syncV2StatusError || state.syncStatus.configured || state.syncStatusError) return;
+  if (hasUnsavedDraft()) {
+    showToast("请先保存或放弃当前条目的修改，再连接另一台设备。", "warning");
+    return;
+  }
+  const operationEpoch = beginSyncOperation("inspect");
+  if (operationEpoch === null) return;
+  let details: WebDavJoinDetails | null = null;
+  let preview: WebDavRemotePreview | null = null;
+  let retryEndpoint = "";
+  let retryUsername = "";
+  let joinSubmitted = false;
+  try {
+    details = await askWebDavConnection("join", state.webdavV2Retry?.mode === "join" ? state.webdavV2Retry : null, "v2");
+    if (!details || operationEpoch !== state.epoch) return;
+    retryEndpoint = details.credentials.endpoint;
+    retryUsername = details.credentials.username;
+    const closePreview = showRestoreProgress("正在读取远端同步概览…", "确认前不会修改本机条目。", true);
+    try {
+      preview = await invokeCommand<WebDavRemotePreview>("sync_v2_preview_join", {
+        credentials: { ...details.credentials },
+        recoveryCode: details.recoveryCode,
+      });
+    } finally {
+      closePreview();
+    }
+    if (operationEpoch !== state.epoch || !state.status.unlocked) return;
+    const mode = await showWebDavJoinPreview(preview, state.overview.totalEntries);
+    if (!mode || operationEpoch !== state.epoch) return;
+    if (mode === "remote" && preview.localHasHistory) {
+      const confirmed = await showConfirm(
+        "再次确认：以远端内容替换本机？",
+        `本机现有 ${state.overview.totalEntries.toLocaleString("zh-CN")} 个条目及删除历史将被远端内容替换。请先另存加密备份。`,
+        "确认以远端替换",
+        true,
+      );
+      if (!confirmed || operationEpoch !== state.epoch) return;
+    }
+    state.syncOperation = "join";
+    const closeJoin = showRestoreProgress("正在连接并同步…", "请保持保险库解锁，等待本机与远端版本检查完成。", true);
+    let outcome: WebDavSyncOutcome;
+    try {
+      joinSubmitted = true;
+      const request = invokeCommand<WebDavSyncOutcome>("sync_v2_join", {
+        credentials: { ...details.credentials },
+        recoveryCode: details.recoveryCode,
+        previewToken: preview.previewToken,
+        mode,
+        confirmReplace: mode === "remote" && preview.localHasHistory,
+      });
+      preview.previewToken = "";
+      clearWebDavJoinDetails(details);
+      outcome = await request;
+    } finally {
+      closeJoin();
+    }
+    await applyWebDavOutcome(outcome, operationEpoch, true, "v2");
+  } catch (error) {
+    if (operationEpoch !== state.epoch) return;
+    const probe = await loadWebDavSyncV2StatusSafely(state.syncV2Status);
+    if (operationEpoch !== state.epoch) return;
+    let message = describeWebDavNetworkFailure(error, "无法连接同步空间。请核对 WebDAV 凭据、恢复码和远端状态。");
+    if (probe.error) {
+      state.syncV2StatusError = true;
+      state.webdavV2Retry = null;
+      message = "无法读取本机同步配置，请在设置中检查。";
+    } else if (probe.status.configured) {
+      state.syncV2Status = probe.status;
+      state.syncV2RemoteOutcomeUnknown = joinSubmitted;
+      state.webdavV2Retry = null;
+      await Promise.allSettled([
+        loadEntries(false, operationEpoch, false, false),
+        loadVaultOverview(operationEpoch),
+        refreshWebDavBackupStatus(operationEpoch),
+      ]);
+      message = joinSubmitted ? "本机连接已存在，但远端结果待确认。请重新同步并核对条目。" : message;
+    } else if (retryEndpoint) {
+      state.webdavV2Retry = { mode: "join", endpoint: retryEndpoint, username: retryUsername, message };
+    }
+    if (operationEpoch !== state.epoch || !state.status.unlocked) return;
+    showToast(message, "error", 8200);
+  } finally {
+    clearWebDavJoinDetails(details);
+    if (preview) preview.previewToken = "";
+    finishSyncOperation(operationEpoch);
+  }
+}
+
+async function syncWebDavV2Now(): Promise<void> {
+  if (!state.syncV2Status.configured || state.syncV2StatusError) return;
+  if (hasUnsavedDraft()) {
+    showToast("请先保存或放弃当前条目的修改，再同步。", "warning");
+    return;
+  }
+  const operationEpoch = beginSyncOperation("sync");
+  if (operationEpoch === null) return;
+  const closeProgress = showRestoreProgress("正在同步 WebDAV 内容…", "请保持保险库解锁，等待版本检查完成。", true);
+  try {
+    const outcome = await invokeCommand<WebDavSyncOutcome>("sync_v2_now");
+    closeProgress();
+    await applyWebDavOutcome(outcome, operationEpoch, false, "v2");
+  } catch (error) {
+    closeProgress();
+    if (operationEpoch === state.epoch) {
+      state.syncV2RemoteOutcomeUnknown = true;
+      const probe = await loadWebDavSyncV2StatusSafely(state.syncV2Status);
+      if (operationEpoch !== state.epoch) return;
+      if (probe.error) state.syncV2StatusUncertain = true;
+      else {
+        state.syncV2Status = probe.status;
+        state.syncV2StatusUncertain = false;
+      }
+      showToast(describeWebDavNetworkFailure(error, "同步结果待确认。请检查网络与服务器状态，再重新同步。"), "error", 8200);
+      renderMainShell();
+    }
+  } finally {
+    closeProgress();
+    finishSyncOperation(operationEpoch);
+  }
+}
+
+async function revealWebDavV2RecoveryCode(): Promise<void> {
+  if (!state.syncV2Status.configured || state.syncV2StatusError) return;
+  const operationEpoch = beginSyncOperation("reveal");
+  if (operationEpoch === null) return;
+  let currentPassword: string | null = null;
+  let result: WebDavRecoveryCode | null = null;
+  let recoveryCode = "";
+  try {
+    currentPassword = await askMasterPassword("查看同步恢复码", "请输入当前主密码以查看此设备保存的恢复码。", "验证并查看", "当前主密码", "输入当前主密码");
+    if (currentPassword === null || operationEpoch !== state.epoch) return;
+    const request = invokeCommand<WebDavRecoveryCode>("sync_v2_reveal_recovery_code", { currentPassword });
+    currentPassword = "";
+    result = await request;
+    if (operationEpoch !== state.epoch || !state.status.unlocked) return;
+    recoveryCode = result.recoveryCode;
+    result.recoveryCode = "";
+    await showRecoveryCodeDialog(recoveryCode, false, "多设备同步恢复码");
+    recoveryCode = "";
+  } catch {
+    if (operationEpoch === state.epoch) showToast("无法查看恢复码，请检查当前主密码后重试。", "error", 5200);
+  } finally {
+    currentPassword = "";
+    if (result) result.recoveryCode = "";
+    recoveryCode = "";
+    finishSyncOperation(operationEpoch);
+  }
+}
+
+async function disableWebDavSyncV2(): Promise<void> {
+  if (!state.syncV2Status.configured && !state.syncV2StatusError) return;
+  const operationEpoch = beginSyncOperation("disable");
+  if (operationEpoch === null) return;
+  let currentPassword: string | null = null;
+  try {
+    const confirmed = await showConfirm("停止此设备的 WebDAV 同步？", "只会清除本机同步配置。服务器上的加密文件和其他设备的配置会保留。", "继续停止同步", true);
+    if (!confirmed || operationEpoch !== state.epoch) return;
+    currentPassword = await askMasterPassword("确认停止此设备同步", "请输入当前主密码。", "停止此设备同步", "当前主密码", "输入当前主密码");
+    if (currentPassword === null || operationEpoch !== state.epoch) return;
+    const request = invokeCommand<void>("sync_v2_disable", { currentPassword });
+    currentPassword = "";
+    await request;
+    if (operationEpoch !== state.epoch || !state.status.unlocked) return;
+    state.syncV2Status = { ...EMPTY_SYNC_STATUS };
+    state.syncV2StatusError = false;
+    state.syncV2StatusUncertain = false;
+    state.syncV2RemoteOutcomeUnknown = false;
+    state.webdavV2Retry = null;
+    showToast("此设备的同步已停止；服务器上的加密文件仍保留。", "success", 5600);
+  } catch {
+    if (operationEpoch === state.epoch) showToast("无法停止同步，请检查当前主密码后重试。", "error", 5200);
+  } finally {
+    currentPassword = "";
+    finishSyncOperation(operationEpoch);
+  }
 }
 
 async function createWebDavSyncSpace(): Promise<void> {
@@ -3187,7 +3638,20 @@ function renderStatusbar(): HTMLElement {
   left.append(
     icon("shield", 13),
   );
-  const syncLabel = state.syncStatusError
+  const v2SyncLabel = state.syncV2StatusError
+    ? "多设备同步配置需检查 · 查看设置"
+    : state.syncV2RemoteOutcomeUnknown
+      ? "多设备同步结果待确认 · 查看设置"
+      : state.syncV2StatusUncertain
+        ? "多设备同步状态待确认 · 查看设置"
+        : state.syncV2Status.autoPaused
+          ? "多设备自动同步已暂停 · 查看设置"
+          : state.syncV2Status.autoWarning
+            ? "多设备同步需检查 · 查看设置"
+            : state.syncV2Status.configured && state.syncV2Status.pendingLocalChanges
+              ? "本机修改待同步 · 查看设置"
+              : state.syncV2Status.configured ? "本地优先 · 多设备同步" : null;
+  const syncLabel = v2SyncLabel ?? (state.syncStatusError
     ? "同步已停止 · 查看设置"
     : state.syncRemoteOutcomeUnknown
       ? "远端同步结果待确认 · 查看设置"
@@ -3201,8 +3665,8 @@ function renderStatusbar(): HTMLElement {
           ? "本机修改待同步 · 查看设置"
           : state.syncStatus.configured
             ? state.syncStatus.automatic ? "本地优先 · 自动同步" : "本地优先 · 手动同步"
-            : "本地保险库";
-  if (state.syncStatus.configured || state.syncStatusError) {
+            : "本地保险库");
+  if (state.syncV2Status.configured || state.syncV2StatusError || state.syncStatus.configured || state.syncStatusError) {
     const syncLink = makeButton(syncLabel, "statusbar-sync-link", () => switchView("settings"));
     syncLink.dataset.focusKey = "statusbar-sync";
     left.append(syncLink);
@@ -3210,11 +3674,11 @@ function renderStatusbar(): HTMLElement {
     left.append(makeElement("span", "", syncLabel));
   }
   const backupLabel = state.webdavBackupStatusError
-    ? "远端备份状态未知"
+    ? "历史远端备份状态未知"
     : state.webdavBackupStatus.warning
-      ? "远端备份需处理"
+      ? "历史远端备份需处理"
       : state.webdavBackupStatus.configured && state.webdavBackupStatus.automatic && state.webdavBackupStatus.pending
-        ? "远端备份待上传"
+        ? "历史远端备份待上传"
         : null;
   if (backupLabel) {
     left.append(makeElement("span", "status-separator", "•"));
@@ -4561,9 +5025,13 @@ function showWebDavBackupConfig(current: WebDavBackupStatus, operationEpoch: num
     const automaticLabel = makeElement("label", "webdav-backup-automatic");
     const automatic = makeElement("input") as HTMLInputElement;
     automatic.type = "checkbox";
-    automatic.checked = current.configured ? Boolean(current.automatic) : true;
+    const syncV2Active = state.syncV2Status.configured || state.syncV2StatusError;
+    automatic.checked = syncV2Active ? false : current.configured ? Boolean(current.automatic) : true;
+    automatic.disabled = syncV2Active;
     automaticLabel.append(automatic, makeElement("span", "", "保存后自动上传最新加密备份"));
-    const automaticHelp = makeElement("p", "field-help webdav-backup-automatic-help", "短时间连续保存会合并为一次上传，每次上传新增历史文件。未完成的上传会在下次解锁时重试；不会自动下载或合并其他设备的修改。");
+    const automaticHelp = makeElement("p", "field-help webdav-backup-automatic-help", syncV2Active
+      ? "多设备同步已启用。历史远端备份仍可手动上传与恢复；自动上传保持关闭。"
+      : "短时间连续保存会合并为一次上传，每次上传新增历史文件。未完成的上传会在下次解锁时重试；不会自动下载或合并其他设备的修改。");
     const error = makeElement("p", "form-error webdav-form-error");
     error.setAttribute("role", "alert");
     const feedback = makeElement("p", "field-help webdav-backup-feedback");
@@ -4788,7 +5256,7 @@ function showWebDavBackupPicker(operationEpoch: number): Promise<RestoreSelectio
       saveConnection.type = "checkbox";
       saveConnection.checked = true;
       saveConnectionLabel.append(saveConnection, makeElement("span", "", "恢复成功后保存此备份连接，并启用自动备份"));
-      dialog.append(saveConnectionLabel, makeElement("p", "field-help webdav-backup-automatic-help", "凭据只会在确认恢复后加密保存到此设备。取消恢复或验证失败时不会保存；双向同步仍需单独配置。"));
+      dialog.append(saveConnectionLabel, makeElement("p", "field-help webdav-backup-automatic-help", "凭据只会在确认恢复后加密保存到此设备。取消恢复或验证失败时不会保存；多设备同步需凭恢复码重新连接。"));
     }
 
     const error = makeElement("p", "form-error webdav-form-error");
@@ -5011,10 +5479,10 @@ async function restoreBackup(source: "local" | "webdav" = "local"): Promise<void
       state.backupOperationError = null;
       showToast(
         state.webdavBackupStatusError
-          ? "加密备份已恢复；备份连接状态未能读取，请在设置中检查。双向同步需单独配置。"
+          ? "加密备份已恢复；备份连接状态未能读取，请在设置中检查。多设备同步需重新连接。"
           : state.webdavBackupStatus.configured
-            ? "加密备份已恢复；本机 WebDAV 备份连接已保留。双向同步需单独配置。"
-            : "加密备份已恢复；此设备尚未保存 WebDAV 备份连接。双向同步需单独配置。",
+            ? "加密备份已恢复；本机 WebDAV 备份连接已保留。多设备同步需重新连接。"
+            : "加密备份已恢复；此设备尚未保存 WebDAV 备份连接。多设备同步需重新连接。",
         "success",
         7200,
       );
@@ -5026,8 +5494,7 @@ async function restoreBackup(source: "local" | "webdav" = "local"): Promise<void
   } catch (error) {
     if (operationEpoch !== state.epoch) return;
     const failure = describeBackupFailure(restorePhase, error);
-    const message = typeof error === "string" ? error : error instanceof Error ? error.message : "";
-    if (restorePhase === "apply" && message !== RESTORE_TARGET_CHANGED) {
+    if (restorePhase === "apply" && !restoreRejectedBeforeWrite(error)) {
       state.epoch += 1;
       state.status.unlocked = false;
       clearSensitiveState(true);
@@ -5120,12 +5587,15 @@ async function performLock(message: string, notify: boolean): Promise<void> {
 function clearSensitiveState(clearMetadata: boolean): void {
   backupStatusRequestId += 1;
   syncStatusRequestId += 1;
+  syncV2StatusRequestId += 1;
   remoteContentRefreshQueued = false;
   state.securityOperation = null;
   state.syncOperation = null;
   state.backupOperationError = null;
   state.syncStatusUncertain = false;
   state.webdavRetry = null;
+  state.syncV2StatusUncertain = false;
+  state.webdavV2Retry = null;
   hideAllManagedSensitiveInputs();
   hidePassword();
   hideGeneratorPassword();
@@ -5155,6 +5625,10 @@ function clearSensitiveState(clearMetadata: boolean): void {
     state.webdavBackupStatusError = false;
     state.syncStatus = {
       configured: state.syncStatus.configured,
+      pendingLocalChanges: false,
+    };
+    state.syncV2Status = {
+      configured: state.syncV2Status.configured,
       pendingLocalChanges: false,
     };
   }
@@ -5506,11 +5980,12 @@ function validateWebDavEndpointInput(value: string): string | null {
   return null;
 }
 
-function askWebDavConnection(mode: "create", prefill?: WebDavRetryHint | null): Promise<WebDavCredentials | null>;
-function askWebDavConnection(mode: "join", prefill?: WebDavRetryHint | null): Promise<WebDavJoinDetails | null>;
+function askWebDavConnection(mode: "create", prefill?: WebDavRetryHint | null, version?: "v1" | "v2"): Promise<WebDavCredentials | null>;
+function askWebDavConnection(mode: "join", prefill?: WebDavRetryHint | null, version?: "v1" | "v2"): Promise<WebDavJoinDetails | null>;
 function askWebDavConnection(
   mode: "create" | "join",
   prefill?: WebDavRetryHint | null,
+  version: "v1" | "v2" = "v1",
 ): Promise<WebDavCredentials | WebDavJoinDetails | null> {
   return new Promise((resolve) => {
     const region = document.querySelector<HTMLElement>("#modal-region");
@@ -5534,13 +6009,15 @@ function askWebDavConnection(
       "p",
       "",
       mode === "create"
-        ? "使用你已有的空 WebDAV 目录。CipherNest 会验证服务器的条件写入与强 ETag 行为，再创建首个加密快照。"
+        ? version === "v2"
+          ? "使用已有的 HTTPS WebDAV 目录。创建后请保存恢复码，另一台设备加入时需要它。"
+          : "使用你已有的空 WebDAV 目录。CipherNest 会验证服务器的条件写入与强 ETag 行为，再创建首个加密快照。"
         : "输入与另一台设备相同的目录、账号和恢复码。应用会先读取只读概览，不会立即覆盖本机内容。",
     );
     body.id = ids.description;
 
     const endpoint = createTextField("webdav-endpoint", "WebDAV 目录地址", "", "https://cloud.example.com/remote.php/dav/files/name/CipherNest/", true, 2048);
-    endpoint.input.value = prefill?.endpoint ?? "";
+    endpoint.input.value = prefill?.endpoint ?? (version === "v2" && !state.webdavBackupStatusError ? state.webdavBackupStatus.endpoint ?? "" : "");
     addSensitiveTextActions(endpoint, "WebDAV 地址");
     endpoint.wrapper.append(makeElement("p", "field-help", "必须是已存在的 HTTPS 目录，并以 / 结尾；请勿在地址中嵌入凭据。"));
     const portHint = makeElement("p", "field-help", "5005 在一些 WebDAV 服务中是 HTTP 端口。请确认此端口确实启用了 HTTPS；实际端口以服务器设置为准。");
@@ -5555,17 +6032,19 @@ function askWebDavConnection(
       }
     });
     const username = createTextField("webdav-username", "用户名", "", "WebDAV 用户名", true, 500);
-    username.input.value = prefill?.username ?? "";
+    username.input.value = prefill?.username ?? (version === "v2" && !state.webdavBackupStatusError ? state.webdavBackupStatus.username ?? "" : "");
     addSensitiveTextActions(username, "WebDAV 用户名");
     const appPassword = createPasswordField("webdav-app-password", "应用专用密码", "输入 WebDAV 应用专用密码", "off");
     appPassword.input.maxLength = 4096;
-    appPassword.wrapper.append(makeElement("p", "field-help", "建议在服务端单独创建、可随时撤销的应用专用密码。它会加密保存在本机同步配置中。"));
+    appPassword.wrapper.append(makeElement("p", "field-help", version === "v2" && state.webdavBackupStatus.configured && !state.webdavBackupStatusError
+      ? "若地址和用户名与已保存的历史备份连接相同，可留空沿用其密码。否则请输入 WebDAV 密码。"
+      : "建议使用可单独撤销的 WebDAV 应用专用密码。密码会加密保存在本机。"));
     const recovery = mode === "join"
       ? createPasswordField("webdav-recovery-code", "同步恢复码", "输入另一台设备保存的恢复码", "off")
       : null;
     if (recovery) {
       recovery.input.maxLength = 2048;
-      recovery.wrapper.append(makeElement("p", "field-help", "恢复码是解密远端快照的关键，请勿通过同一 WebDAV 目录传递。"));
+      recovery.wrapper.append(makeElement("p", "field-help", "恢复码是解密远端数据的关键，请勿通过同一 WebDAV 目录传递。"));
     }
     const fields = makeElement("div", "webdav-fields");
     fields.append(endpoint.wrapper, username.wrapper, appPassword.wrapper);
@@ -5617,7 +6096,12 @@ function askWebDavConnection(
         username.input.focus();
         return;
       }
-      if (!appPassword.input.value) {
+      const mayReusePassword = version === "v2"
+        && state.webdavBackupStatus.configured
+        && !state.webdavBackupStatusError
+        && endpointValue === state.webdavBackupStatus.endpoint
+        && username.input.value.trim() === state.webdavBackupStatus.username;
+      if (!appPassword.input.value && !mayReusePassword) {
         error.textContent = "请输入 WebDAV 应用专用密码。";
         appPassword.input.focus();
         return;
@@ -5770,7 +6254,7 @@ function showWebDavJoinPreview(preview: WebDavRemotePreview, localItemCount: num
     badge.append(icon("shield", 23));
     const heading = makeElement("h2", "", "核对远端同步空间");
     heading.id = ids.title;
-    const body = makeElement("p", "", "远端快照已通过恢复码和完整性验证，但尚未写入本机。请选择首次加入方式。");
+    const body = makeElement("p", "", "远端内容已通过恢复码和完整性验证，但尚未写入本机。请选择连接方式。");
     body.id = ids.description;
     const details = makeElement("dl", "restore-preview-grid");
     const appendDetail = (label: string, value: string) => {
@@ -5788,7 +6272,7 @@ function showWebDavJoinPreview(preview: WebDavRemotePreview, localItemCount: num
       icon("alert", 17),
       makeElement("p", "", preview.checkpointTrusted
         ? "此快照延续了本机已经信任的检查点。"
-        : "首次加入（TOFU）：此设备没有旧检查点，无法独立证明服务器给出的是最新版本。请与另一台可信设备核对同步 ID 和序列。"),
+        : "此设备首次连接，没有旧检查点，无法独立证明服务器给出的是最新版本。请与另一台可信设备核对同步 ID 和序列。"),
     );
 
     let mode: WebDavJoinMode = preview.localHasHistory ? "merge" : "remote";
@@ -5944,7 +6428,7 @@ function showRestorePreview(selection: RestoreSelection, preview: RestorePreview
       makeElement(
         "p",
         "",
-        "未保存修改不会被保留；本机双向同步配置与检查点会清除。已保存的备份连接会保留；临时连接仅在选择保存时保留。恢复后请核对保险库和远端设置。",
+        "未保存修改不会被保留；本机新旧同步配置与检查点会清除，远端文件仍保留。已保存的备份连接会保留；临时连接仅在选择保存时保留。恢复后请核对保险库，并用恢复码重新连接同步。",
       ),
     );
 
@@ -6011,6 +6495,9 @@ void listen("ciphernest://webdav-backup-status", () => {
 });
 void listen("ciphernest://webdav-sync-status", () => {
   if (state.status.unlocked) void refreshWebDavSyncStatus(state.epoch);
+});
+void listen("ciphernest://webdav-sync-v2-status", () => {
+  if (state.status.unlocked) void refreshWebDavSyncV2Status(state.epoch);
 });
 void listen("ciphernest://vault-content-changed", () => {
   if (state.status.unlocked) void refreshAfterAutoSyncedContent();

@@ -30,6 +30,8 @@ pub enum VaultError {
     PendingRestoreUnavailable,
     #[error("预览后本地保险库已发生变化。为避免覆盖新数据，请重新选择并预览备份。")]
     RestoreTargetChanged,
+    #[error("当前设备的 WebDAV 备份连接无法用所选旧备份的密钥保留。请先解锁当前保险库后重试；从 WebDAV 恢复时也可选择保存本次连接。")]
+    RestoreBackupConnectionNeedsUnlock,
     #[error(
         "检测到未完成的保险库恢复，无法自动确认磁盘状态。请保留应用数据目录并检查备份后再继续。"
     )]

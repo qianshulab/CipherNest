@@ -49,7 +49,7 @@ const NONCE_BYTES: usize = 24;
 const TAG_BYTES: usize = 16;
 const MAX_REMOTE_OBJECT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_HEAD_BYTES: usize = 64 * 1024;
-const MAX_PROPFIND_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_PROPFIND_BYTES: usize = 1024 * 1024;
 const MAX_LOCAL_STATE_BYTES: usize = 40 * 1024 * 1024;
 const MAX_CHAIN_DEPTH: usize = 256;
 const MAX_CHAIN_WALL_TIME: Duration = Duration::from_secs(90);
@@ -63,7 +63,7 @@ pub(crate) fn is_conflict_entry(entry: &VaultEntry) -> bool {
     entry.tags.iter().any(|tag| tag == CONFLICT_TAG)
         || (entry.tags.len() == 20 && entry.title.ends_with(CONFLICT_SUFFIX))
 }
-const PROPFIND_BODY: &[u8] = br#"<?xml version="1.0" encoding="utf-8" ?>
+pub(crate) const PROPFIND_BODY: &[u8] = br#"<?xml version="1.0" encoding="utf-8" ?>
 <d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>"#;
 
 #[derive(Debug, Error)]
@@ -2042,7 +2042,7 @@ fn require_strong_etag(value: Option<&str>) -> SyncResult<String> {
     Ok(value.to_owned())
 }
 
-fn propfind_reports_collection(body: &[u8], endpoint: &Url) -> SyncResult<bool> {
+pub(crate) fn propfind_reports_collection(body: &[u8], endpoint: &Url) -> SyncResult<bool> {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Capture {
         Href,
@@ -2193,7 +2193,7 @@ fn dav_href_matches_endpoint(href: &str, endpoint: &Url) -> bool {
         && candidate.fragment().is_none()
 }
 
-fn classify_transport_error(error: reqwest::Error) -> SyncError {
+pub(crate) fn classify_transport_error(error: reqwest::Error) -> SyncError {
     // Reqwest errors can contain the requested URL. Only expose fixed,
     // credential-free categories to the UI; never forward the error text.
     if error.is_timeout() {
