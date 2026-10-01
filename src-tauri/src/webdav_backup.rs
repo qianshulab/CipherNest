@@ -122,6 +122,7 @@ pub struct WebDavBackupClient {
 
 impl WebDavBackupClient {
     pub fn new(endpoint: &str, username: String, app_password: String) -> VaultResult<Self> {
+        let app_password = Zeroizing::new(app_password);
         let endpoint = validate_webdav_endpoint(endpoint)
             .map_err(|_| backup_error("请输入以 / 结尾的有效 HTTPS WebDAV 文件夹地址。"))?;
         validate_credentials(&username, &app_password)?;
@@ -144,7 +145,7 @@ impl WebDavBackupClient {
             client,
             endpoint,
             username,
-            app_password: Zeroizing::new(app_password),
+            app_password,
         })
     }
 

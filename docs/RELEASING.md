@@ -5,7 +5,7 @@
 ## 自动化行为
 
 - 手动运行 `Package beta release` 只构建并保留 GitHub Actions artifacts，不创建 GitHub Release。
-- 推送与项目版本完全一致的 `v*` 标签（例如 `v0.3.8`）后，工作流才会构建并创建 GitHub prerelease。
+- 推送与项目版本完全一致的 `v*` 标签（例如 `v0.3.9`）后，工作流才会构建并创建 GitHub prerelease。
 - 标签版本必须同时匹配 `package.json`、`src-tauri/tauri.conf.json` 与 `src-tauri/Cargo.toml`；不一致会直接失败。
 - 每个构建显式指定目标架构，并检查最终原生可执行文件头；Windows 构建还须为 GUI 子系统，避免启动时弹出命令行窗口。
 - Windows 打包后，在独立 runner 上静默安装已固定哈希的 0.3.7 安装包，再覆盖安装当前版本；核对安装程序更新及保险库、同步配置、WebDAV 备份配置路径的测试哨兵、备份测试文件的字节完整性。该检查不能代替有效保险库的人工解锁与 WebDAV 演练。

@@ -308,12 +308,26 @@ fn has_obvious_master_password_pattern(password: &str) -> bool {
     if chars.is_empty() {
         return true;
     }
+    let mut longest_run = 1_usize;
+    let mut current_run = 1_usize;
+    for pair in chars.windows(2) {
+        current_run = if pair[0] == pair[1] {
+            current_run + 1
+        } else {
+            1
+        };
+        longest_run = longest_run.max(current_run);
+    }
+    if longest_run >= 8 && longest_run >= chars.len().div_ceil(2) {
+        return true;
+    }
     for period in 1..=4.min(chars.len() / 3) {
-        if chars
+        let mismatches = chars
             .iter()
             .enumerate()
-            .all(|(index, ch)| *ch == chars[index % period])
-        {
+            .filter(|(index, ch)| **ch != chars[*index % period])
+            .count();
+        if mismatches <= (chars.len() / 4).max(3) {
             return true;
         }
     }
@@ -620,7 +634,12 @@ mod tests {
             "123456789012",
             "abcdefghijkl",
             "aaaaaaaaaaaa",
+            "aaaaaaaaaaaaX",
+            "aaaaaaaaaaaaaaaaaaaaaaaX",
             "abababababab",
+            "abcabcabcabc!1",
+            "abcabcabcabc!@#",
+            "pa\u{0085}ssword1234!",
             "correct horse battery staple",
         ] {
             assert!(matches!(
@@ -632,6 +651,7 @@ mod tests {
             "five violet cedar lantern river words",
             "A long independent master passphrase",
             "passwordless-7M%q!f9p2Rz",
+            "pa\u{feff}ssword1234!",
         ] {
             assert!(validate_new_master_password(acceptable).is_ok());
         }

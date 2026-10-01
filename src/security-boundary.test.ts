@@ -414,7 +414,7 @@ describe("renderer security boundary", () => {
   });
 
   it("auto-hides every managed sensitive field and masks notes on window blur", () => {
-    const passwordField = sourceBetween("function createPasswordField", "function estimateMasterPassword");
+    const passwordField = sourceBetween("function createPasswordField", "function renderMainShell");
     const revealHelper = sourceBetween("function hideManagedSensitiveInput", "function setEntryEditorFrozen");
     const notesHelper = sourceBetween("function revealNotes", "function bindDraftInput");
     const focusHandler = sourceBetween("async function handleFocusChange", "function focusSearchAtEnd");

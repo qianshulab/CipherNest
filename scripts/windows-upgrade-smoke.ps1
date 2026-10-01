@@ -4,8 +4,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$expectedOldHash = 'A76B7F302F04B2D312B08EAB91E414C2A0AF02A10202B167510A65674B536232'
-$oldVersion = '0.3.7'
+$expectedOldHash = '9C3CF84C662B12FD7A914779E4887F6D4FE89EA7F3FA5A29AF86E3391E245078'
+$oldVersion = '0.3.8'
 $newVersion = (Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\package.json') -Raw | ConvertFrom-Json).version
 $oldPath = (Resolve-Path -LiteralPath $OldInstaller).Path
 $newPath = (Resolve-Path -LiteralPath $NewInstaller).Path

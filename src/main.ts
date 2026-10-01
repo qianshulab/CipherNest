@@ -4,6 +4,7 @@ import brandLogoUrl from "./assets/ciphernest-logo-ui-v1.png";
 import { describeBackupFailure, type BackupPhase } from "./backup-errors";
 import { describeEntrySaveFailure, describeUnlockFailure, type EntryField } from "./entry-errors";
 import { visibleListRows } from "./list-window";
+import { estimateMasterPassword, hasObviousMasterPasswordPattern } from "./master-password";
 import { captureViewPosition, restoreViewPosition } from "./view-state";
 import "./styles.css";
 
@@ -1015,8 +1016,13 @@ function renderGate(): void {
     error.textContent = "";
     let masterPassword = passwordGroup.input.value;
     if (isCreate) {
-      if (masterPassword.length < 12) {
+      if (Array.from(masterPassword.normalize("NFC")).length < 12) {
         error.textContent = "主密码至少需要 12 个字符；更推荐使用 5–7 个随机单词。";
+        passwordGroup.input.focus();
+        return;
+      }
+      if (hasObviousMasterPasswordPattern(masterPassword)) {
+        error.textContent = MASTER_PASSWORD_TOO_WEAK;
         passwordGroup.input.focus();
         return;
       }
@@ -1099,24 +1105,6 @@ function createPasswordField(
   inputWrap.append(input, reveal);
   wrapper.append(label, inputWrap);
   return { wrapper, input };
-}
-
-function estimateMasterPassword(value: string): { label: string; level: string } {
-  if (!value) return { label: "尚未输入", level: "empty" };
-  const normalized = value.toLocaleLowerCase();
-  const compact = normalized.replace(/\s+/g, "");
-  const predictable = /(?:password|qwerty|letmein|admin|iloveyou|123456|abcdef)/i.test(compact)
-    || /^(.)\1+$/u.test(value)
-    || /(?:012345|123456|234567|abcdef|qwerty)/i.test(compact);
-  if (predictable) return { label: "模式过于可预测", level: "0" };
-  const length = Array.from(value).length;
-  if (length < 12) return { label: "长度不足", level: "0" };
-  const wordCount = value.trim().split(/\s+/).filter(Boolean).length;
-  if (wordCount >= 5 && length >= 20) return { label: "长词组 · 请确认词语随机", level: "4" };
-  if (length >= 24) return { label: "长度较充足", level: "4" };
-  if (length >= 18) return { label: "长度良好", level: "3" };
-  if (length >= 15) return { label: "建议再增加长度", level: "2" };
-  return { label: "仅达到最低长度", level: "1" };
 }
 
 function renderMainShell(): void {
@@ -2301,8 +2289,13 @@ function renderSettingsPage(): HTMLElement {
       current.input.focus();
       return;
     }
-    if (newPassword.length < 12) {
+    if (Array.from(newPassword.normalize("NFC")).length < 12) {
       masterError.textContent = "新主密码至少需要 12 个字符。";
+      next.input.focus();
+      return;
+    }
+    if (hasObviousMasterPasswordPattern(newPassword)) {
+      masterError.textContent = MASTER_PASSWORD_TOO_WEAK;
       next.input.focus();
       return;
     }
