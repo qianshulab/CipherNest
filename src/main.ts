@@ -100,7 +100,7 @@ interface WebDavBackupItem {
 
 type SecurityOperation = "changePassword" | "restore" | "settings" | "backup" | null;
 type EntryMutation = "saving" | "deleting" | "favoriting" | null;
-type SyncOperation = "create" | "inspect" | "join" | "sync" | "reveal" | "disable" | null;
+type SyncOperation = "create" | "inspect" | "join" | "sync" | "auto" | "reveal" | "disable" | null;
 
 interface WebDavRetryHint {
   mode: "create" | "join";
@@ -143,6 +143,7 @@ interface AppState {
   entryMeta: EntryMeta;
   draft: EntryInput | null;
   draftSnapshot: string;
+  entryRevisionConflict: boolean;
   entryMutation: EntryMutation;
   detailLoading: boolean;
   report: SecurityReport | null;
@@ -181,6 +182,7 @@ const DEFAULT_GENERATOR_OPTIONS: GeneratorOptions = {
 
 const CONCEALED_TEXT = "••••••••••••";
 const ENTRY_REVISION_CONFLICT = "该条目已在其他操作中发生变化，请重新加载后再保存。";
+const MASTER_PASSWORD_TOO_WEAK = "主密码包含常见或易预测模式，请改用独有的长随机词组。";
 const RESTORE_TARGET_CHANGED = "预览后本地保险库已发生变化。为避免覆盖新数据，请重新选择并预览备份。";
 
 const EMPTY_STATUS: VaultStatus = {
@@ -234,6 +236,7 @@ const state: AppState = {
   entryMeta: {},
   draft: null,
   draftSnapshot: "",
+  entryRevisionConflict: false,
   entryMutation: null,
   detailLoading: false,
   report: null,
@@ -296,6 +299,10 @@ let autoLockTimeout: ReturnType<typeof setTimeout> | null = null;
 let lastActivitySent = 0;
 let listRequestId = 0;
 let backupStatusRequestId = 0;
+let syncStatusRequestId = 0;
+let remoteContentRefreshActive = false;
+let remoteContentRefreshQueued = false;
+let pendingRemoteContentRender = false;
 let generatorRequestId = 0;
 let generatorFocusRelease: (() => void) | null = null;
 let activeModalClose: (() => void) | null = null;
@@ -325,6 +332,9 @@ function normalizeSettings(settings: VaultSettings): VaultSettings {
 function normalizeWebDavSyncStatus(status: WebDavSyncStatus): WebDavSyncStatus {
   return {
     configured: Boolean(status.configured),
+    automatic: Boolean(status.automatic),
+    autoPaused: Boolean(status.autoPaused),
+    autoWarning: status.autoWarning || undefined,
     endpointHost: status.endpointHost || undefined,
     username: status.username || undefined,
     syncIdShort: status.syncIdShort || undefined,
@@ -376,7 +386,117 @@ async function refreshWebDavBackupStatus(epoch: number): Promise<void> {
   if (requestId !== backupStatusRequestId || epoch !== state.epoch || !state.status.unlocked) return;
   state.webdavBackupStatus = result.status;
   state.webdavBackupStatusError = result.error;
-  if (state.view === "settings" && !hasOpenModal()) renderMainShell();
+  if (!hasOpenModal()) {
+    if (state.view === "settings" && state.securityOperation === null) {
+      document.querySelector<HTMLElement>(".webdav-backup-settings")?.replaceWith(renderWebDavBackupSettings());
+      document.querySelector<HTMLElement>(".settings-webdav-overview")?.replaceWith(renderWebDavOverview());
+    }
+    document.querySelector<HTMLElement>(".statusbar")?.replaceWith(renderStatusbar());
+  }
+}
+
+async function refreshWebDavSyncStatus(epoch: number): Promise<void> {
+  const requestId = ++syncStatusRequestId;
+  const result = await loadWebDavSyncStatusSafely(state.syncStatus);
+  if (requestId !== syncStatusRequestId || epoch !== state.epoch || !state.status.unlocked) return;
+  state.syncStatus = result.status;
+  state.syncStatusError = result.error;
+  state.syncStatusUncertain = result.error;
+  if (hasOpenModal()) return;
+  if (state.view === "settings" && state.syncOperation === null) {
+    const currentCard = document.querySelector<HTMLElement>(".settings-sync-card");
+    if (currentCard) {
+      const nextCard = renderWebDavSyncSettingsCard();
+      nextCard.classList.add("settings-sync-card");
+      currentCard.replaceWith(nextCard);
+    }
+    document.querySelector<HTMLElement>(".settings-webdav-overview")?.replaceWith(renderWebDavOverview());
+  }
+  document.querySelector<HTMLElement>(".statusbar")?.replaceWith(renderStatusbar());
+}
+
+async function refreshAfterAutoSyncedContent(): Promise<void> {
+  if (!state.status.unlocked) return;
+  if (remoteContentRefreshActive) {
+    remoteContentRefreshQueued = true;
+    return;
+  }
+  remoteContentRefreshActive = true;
+  try {
+    do {
+      remoteContentRefreshQueued = false;
+      const epoch = state.epoch;
+      const selectedId = state.selectedId;
+      const [overview, list] = await Promise.allSettled([
+        loadVaultOverview(epoch),
+        loadEntries(false, epoch, false, false),
+      ]);
+      if (epoch !== state.epoch || !state.status.unlocked) return;
+      if (overview.status === "rejected" || list.status === "rejected" || (list.status === "fulfilled" && !list.value)) {
+        pendingRemoteContentRender = true;
+        showToast("远端修改已写入本机，但界面列表未能完整刷新。请点击“重试读取”。", "warning", 7600);
+        continue;
+      }
+      if (
+        hasUnsavedDraft()
+        || state.entryMutation !== null
+        || state.securityOperation !== null
+        || state.syncOperation !== null
+        || hasOpenModal()
+        || state.view === "settings"
+      ) {
+        pendingRemoteContentRender = true;
+        document.querySelector<HTMLElement>(".statusbar")?.replaceWith(renderStatusbar());
+        showToast("其他设备的修改已合并到本机。当前表单已保留；保存前请核对最新条目。", "warning", 7600);
+        continue;
+      }
+      if (selectedId && state.selectedId === selectedId && state.draft) {
+        if (!state.entries.some((entry) => entry.id === selectedId)) {
+          clearEntryDraft();
+          state.selectedId = null;
+        } else {
+          try {
+            const entry = await invokeCommand<VaultEntry>("get_entry", { id: selectedId });
+            if (
+              epoch === state.epoch
+              && state.status.unlocked
+              && state.selectedId === selectedId
+              && !hasUnsavedDraft()
+              && state.entryMutation === null
+            ) {
+              hidePassword();
+              clearEntryDraft();
+              state.selectedId = selectedId;
+              state.entryMeta = {
+                id: entry.id,
+                createdAt: entry.createdAt,
+                updatedAt: entry.updatedAt,
+                passwordUpdatedAt: entry.passwordUpdatedAt,
+                revision: entry.revision,
+              };
+              state.draft = entryInputFromVault(entry);
+              state.draftSnapshot = serializeInput(state.draft);
+            }
+            clearVaultEntrySensitiveFields(entry);
+          } catch {
+            if (epoch === state.epoch && state.selectedId === selectedId) {
+              clearEntryDraft();
+              state.selectedId = null;
+            }
+          }
+        }
+      }
+      if (epoch !== state.epoch || !state.status.unlocked) return;
+      if (hasUnsavedDraft()) {
+        pendingRemoteContentRender = true;
+        showToast("其他设备的修改已合并到本机。当前编辑仍保留，请核对后再保存。", "warning", 7600);
+        continue;
+      }
+      renderMainShell();
+    } while (remoteContentRefreshQueued && state.status.unlocked);
+  } finally {
+    remoteContentRefreshActive = false;
+  }
 }
 
 function recordLocalSyncMutation(): void {
@@ -535,6 +655,21 @@ function activateModal(close: () => void): boolean {
 function deactivateModal(): void {
   activeModalClose = null;
   setModalBackgroundHidden(false);
+  if (pendingRemoteContentRender) {
+    window.setTimeout(() => {
+      if (
+        !pendingRemoteContentRender
+        || !state.status.unlocked
+        || hasOpenModal()
+        || hasUnsavedDraft()
+        || state.entryMutation !== null
+        || state.securityOperation !== null
+        || state.syncOperation !== null
+        || state.view === "settings"
+      ) return;
+      renderMainShell();
+    }, 0);
+  }
 }
 
 function dismissActiveModal(): void {
@@ -789,15 +924,7 @@ function renderGate(): void {
   const offline = makeElement("div", "offline-badge");
   offline.append(
     makeElement("span", "status-dot"),
-    makeElement(
-      "span",
-      "",
-      state.syncStatusError
-        ? "本地优先 · 同步配置需处理"
-        : state.syncStatus.configured
-          ? "本地优先 · 手动加密同步"
-          : "本地优先 · 不自动联网",
-    ),
+    makeElement("span", "", "本地优先 · 远端功能按设置运行"),
   );
 
   const card = makeElement("section", "gate-card");
@@ -917,7 +1044,9 @@ function renderGate(): void {
       if (confirmInput) confirmInput.value = "";
       masterPassword = "";
       error.textContent = isCreate
-        ? "无法创建保险库。数据未被保存，请检查磁盘权限后重试。"
+        ? isWeakMasterPasswordError(caught)
+          ? MASTER_PASSWORD_TOO_WEAK
+          : "无法创建保险库。数据未被保存，请检查磁盘权限后重试。"
         : describeUnlockFailure(caught);
       setBusy(submit, false);
       passwordGroup.input.focus();
@@ -928,15 +1057,7 @@ function renderGate(): void {
   const footer = makeElement("div", "gate-footer");
   footer.append(
     icon("shield", 14),
-    makeElement(
-      "span",
-      "",
-      state.syncStatusError
-        ? "零遥测 · 同步已停止"
-        : state.syncStatus.configured
-          ? "零遥测 · 同步仅在手动触发时联网"
-          : "零遥测 · 不自动联网",
-    ),
+    makeElement("span", "", "零遥测 · 锁定时不发起远端请求"),
   );
   card.append(footer);
 
@@ -1046,6 +1167,9 @@ function renderMainShell(): void {
   );
   updateClipboardStatus();
   if (!hasOpenModal()) restoreViewPosition(app, position, state.view);
+  if (!hasOpenModal() && state.view !== "settings" && !hasUnsavedDraft()) {
+    pendingRemoteContentRender = false;
+  }
 }
 
 function needsBackupAttention(): boolean {
@@ -1156,15 +1280,23 @@ function renderSidebar(): HTMLElement {
   local.append(icon("shield", 18));
   const localCopy = makeElement("div");
   localCopy.append(
-    makeElement("strong", "", state.syncStatus.configured ? "本地优先" : "本机保险库"),
+    makeElement("strong", "", state.syncStatus.configured || state.webdavBackupStatus.configured ? "本地优先" : "本机保险库"),
     makeElement(
       "span",
       "",
       state.syncStatusError
         ? "同步配置需在设置中处理"
-        : state.syncStatus.configured
-          ? "手动端到端加密同步"
-          : "同步功能默认关闭",
+        : state.syncStatus.autoPaused
+          ? "自动同步已暂停 · 请核对"
+        : state.webdavBackupStatus.configured && state.webdavBackupStatus.automatic
+          ? state.syncStatus.configured
+            ? `自动远端备份 · ${state.syncStatus.automatic ? "自动双向同步" : "手动双向同步"}`
+            : "远端备份自动上传"
+          : state.syncStatus.configured
+            ? state.syncStatus.automatic ? "自动双向加密同步" : "手动双向加密同步"
+            : state.webdavBackupStatus.configured
+              ? "远端备份需手动上传"
+              : "远端功能默认关闭",
     ),
   );
   local.append(localCopy);
@@ -1578,6 +1710,20 @@ function renderEntryEditor(): HTMLElement {
   if (state.entryMeta.id) controls.append(iconButton("删除条目", "trash", deleteCurrentEntry, "icon-button danger-hover"));
   top.append(identity, controls);
   editor.append(top);
+
+  if (state.entryRevisionConflict) {
+    const conflict = makeElement("div", "inline-notice inline-notice-warning editor-conflict-notice");
+    conflict.setAttribute("role", "alert");
+    const saveCopy = makeButton("另存当前草稿为新条目", "button button-secondary button-small", saveConflictedDraftAsNewEntry, "plus");
+    saveCopy.dataset.securityMutation = "true";
+    saveCopy.disabled = state.entryMutation !== null || state.syncOperation !== null || state.securityOperation !== null;
+    conflict.append(
+      icon("alert", 17),
+      makeElement("p", "", "此条目已在另一台设备修改或删除。当前未保存的草稿仍在编辑器中。可另存为新条目，再核对两份内容。"),
+      saveCopy,
+    );
+    editor.append(conflict);
+  }
 
   const form = makeElement("form", "editor-form");
   form.noValidate = true;
@@ -2004,9 +2150,11 @@ async function openIssue(entryId: string): Promise<void> {
 function renderSettingsPage(): HTMLElement {
   const page = makeElement("div", "workspace-page settings-page");
   page.dataset.scrollKey = "workspace-page";
-  page.append(pageHeader("LOCAL PREFERENCES", "设置", "安全偏好仅保存在当前设备。"));
+  page.append(pageHeader("LOCAL PREFERENCES", "设置", "管理本机安全设置、加密备份与多设备同步。"));
+  page.append(renderWebDavOverview());
 
   const layout = makeElement("div", "settings-layout");
+
   const security = makeElement("section", "content-card settings-card settings-security-card");
   security.append(settingsCardHeader("shield", "锁定与隐私", "减少敏感字段停留在屏幕和剪贴板中的时间。"));
   const form = makeElement("form", "settings-form");
@@ -2086,7 +2234,7 @@ function renderSettingsPage(): HTMLElement {
   security.append(form);
 
   const backup = makeElement("section", "content-card settings-card settings-backup-card");
-  backup.append(settingsCardHeader("archive", "加密备份", "本机快照、文件导出与 WebDAV 远端副本均保持加密。"));
+  backup.append(settingsCardHeader("archive", "加密备份", "本机快照、文件导出与 WebDAV 单向远端备份。"));
   const autoBackup = state.overview.autoBackup;
   const autoStatus = makeElement("div", "inline-notice inline-notice-compact");
   autoStatus.append(icon(autoBackup.inspectionFailed || autoBackup.warning ? "alert" : "shield", 17));
@@ -2208,7 +2356,7 @@ function renderSettingsPage(): HTMLElement {
           );
         }
       }
-    } catch {
+    } catch (caught) {
       current.input.value = "";
       next.input.value = "";
       confirm.input.value = "";
@@ -2217,7 +2365,9 @@ function renderSettingsPage(): HTMLElement {
       if (operationEpoch !== state.epoch) return;
       state.securityOperation = null;
       setSecurityMutationControlsDisabled(false);
-      masterError.textContent = "无法更改主密码，请检查当前主密码后重试。";
+      masterError.textContent = isWeakMasterPasswordError(caught)
+        ? MASTER_PASSWORD_TOO_WEAK
+        : "无法更改主密码，请检查当前主密码后重试。";
       current.input.focus();
     } finally {
       setBusy(changeButton, false);
@@ -2239,6 +2389,33 @@ function renderSettingsPage(): HTMLElement {
   }
   page.append(layout);
   return page;
+}
+
+function renderWebDavOverview(): HTMLElement {
+  const syncSummary = state.syncStatusError
+    ? "配置需检查"
+    : !state.syncStatus.configured
+      ? "未配置"
+      : state.syncStatus.autoPaused
+        ? "自动同步已暂停"
+        : state.syncStatus.automatic ? "自动运行" : "仅手动运行";
+  const backupSummary = state.webdavBackupStatusError
+    ? "配置需检查"
+    : !state.webdavBackupStatus.configured
+      ? "未配置"
+      : state.webdavBackupStatus.automatic ? "自动上传" : "仅手动上传";
+  const webdavOverview = makeElement("div", "inline-notice inline-notice-compact settings-webdav-overview");
+  webdavOverview.append(icon("shield", 17));
+  const webdavOverviewText = makeElement("p");
+  webdavOverviewText.append(
+    makeElement("strong", "", "WebDAV 同步与备份"),
+    document.createElement("br"),
+    document.createTextNode(
+      `双向同步：${syncSummary}；历史备份：${backupSummary}。同步合并设备间的修改，备份保留可恢复的整库版本。`,
+    ),
+  );
+  webdavOverview.append(webdavOverviewText);
+  return webdavOverview;
 }
 
 function reflowSettingsLayout(): void {
@@ -2265,7 +2442,7 @@ function reflowSettingsLayout(): void {
 function renderWebDavBackupSettings(): HTMLElement {
   const section = makeElement("section", "webdav-backup-settings");
   const heading = makeElement("div", "webdav-backup-heading");
-  heading.append(icon("upload", 17), makeElement("h3", "", "WebDAV 远端备份"));
+  heading.append(icon("upload", 17), makeElement("h3", "", "WebDAV 单向远端备份"));
   section.append(heading);
 
   if (state.webdavBackupStatusError) {
@@ -2294,9 +2471,9 @@ function renderWebDavBackupSettings(): HTMLElement {
   const status = state.webdavBackupStatus;
   const summary = makeElement("p", "webdav-backup-summary", status.configured
     ? status.automatic
-      ? "本机保存后，后台会合并连续修改并上传最新加密快照；每次上传会新增远端文件。上传失败不会撤销本机保存，需要立即备份时可手动上传。"
-      : "已配置远端目录。加密快照仅在你点击“立即上传”时发送。"
-    : "将加密备份保存到已有的 WebDAV HTTPS 目录，可在设备故障后从远端选择备份恢复。");
+      ? "保存后会自动上传最新加密快照，并保留远端历史版本。恢复需手动选取备份并完整替换本机；不会自动合并其他设备的修改。"
+      : "已配置远端目录。点击“立即上传”时创建加密备份；恢复需手动选取备份并完整替换本机。"
+    : "将加密备份单向上传到已有的 WebDAV HTTPS 目录，保留历史副本供以后整库恢复。不会自动合并其他设备的修改。");
   section.append(summary);
   if (status.configured && status.automatic) {
     section.append(makeElement("p", "webdav-backup-storage-note", "远端快照使用不同文件名保留，未被合并的版本可能分别占用空间；目前不会自动清理。请定期检查 WebDAV 存储空间。"));
@@ -2351,19 +2528,26 @@ function renderWebDavBackupSettings(): HTMLElement {
 
 function renderWebDavSyncSettingsCard(): HTMLElement {
   const card = makeElement("section", "content-card settings-card sync-card");
-  card.append(settingsCardHeader("shield", "WebDAV 加密同步", "可选、手动触发；保险库锁定时不会发起同步。"));
+  card.append(settingsCardHeader("shield", "多设备加密同步", "双向合并条目。配置同步空间后，可选择仅手动同步或在解锁期间自动检查；保险库锁定时不会发起同步。"));
   const content = makeElement("div", "sync-status");
   const status = state.syncStatus;
+  const syncNeedsAttention = state.syncStatusError || Boolean(status.autoPaused || status.autoWarning);
   const badge = makeElement(
     "div",
-    `sync-badge${state.syncStatusError ? " has-error" : status.configured ? " is-enabled" : ""}`,
+    `sync-badge${syncNeedsAttention ? " has-error" : status.configured ? " is-enabled" : ""}`,
   );
   badge.append(
-    makeElement("span", `status-dot${state.syncStatusError ? " status-dot-error" : status.configured ? "" : " status-dot-muted"}`),
+    makeElement("span", `status-dot${syncNeedsAttention ? " status-dot-error" : status.configured ? "" : " status-dot-muted"}`),
     makeElement(
       "strong",
       "",
-      state.syncStatusError ? "本机配置无法验证 · 同步已停止" : status.configured ? "已配置 · 仅手动同步" : "默认关闭",
+      state.syncStatusError
+        ? "本机配置无法验证 · 同步已停止"
+        : status.configured && status.autoPaused
+          ? "自动同步已暂停 · 需要核对"
+          : status.configured && status.automatic
+            ? "已配置 · 解锁期间自动同步"
+            : status.configured ? "已配置 · 仅手动同步" : "默认关闭",
     ),
   );
   content.append(badge);
@@ -2389,7 +2573,7 @@ function renderWebDavSyncSettingsCard(): HTMLElement {
     content.append(makeElement(
       "p",
       "",
-      "CipherNest 会先在本机加密，再把不可读的快照写入你指定的现有 WebDAV 目录。应用不会后台同步，保险库锁定时也不会发起网络请求。",
+      "通过 WebDAV 在设备间传递条目修改。创建或加入同步空间后可启用自动同步；远端备份是独立的历史恢复点。同步冲突会保留副本供核对。",
     ));
     const notice = makeElement("div", "inline-notice inline-notice-compact sync-notice");
     notice.append(
@@ -2432,7 +2616,7 @@ function renderWebDavSyncSettingsCard(): HTMLElement {
     appendSensitiveSyncMetadata(metadata, "用户名", status.username || "—");
     appendSyncMetadata(metadata, "同步 ID", status.syncIdShort || "—");
     appendSyncMetadata(metadata, "远端序列", status.remoteSequence === undefined ? "尚未记录" : `#${status.remoteSequence.toLocaleString("zh-CN")}`);
-    appendSyncMetadata(metadata, "上次完成", status.lastSyncAt ? formatFullDate(status.lastSyncAt) : "尚未完成手动同步");
+    appendSyncMetadata(metadata, "上次完成", status.lastSyncAt ? formatFullDate(status.lastSyncAt) : "尚未完成同步");
     content.append(metadata);
 
     const localState = makeElement(
@@ -2454,6 +2638,12 @@ function renderWebDavSyncSettingsCard(): HTMLElement {
       ),
     );
     content.append(localState);
+    if (status.autoWarning) {
+      const autoNotice = makeElement("div", "inline-notice inline-notice-warning inline-notice-compact sync-notice");
+      autoNotice.setAttribute("role", "status");
+      autoNotice.append(icon("alert", 17), makeElement("p", "", status.autoWarning));
+      content.append(autoNotice);
+    }
     if (state.overview.syncConflictCount > 0) {
       const conflicts = makeElement("div", "inline-notice inline-notice-warning sync-conflicts-notice");
       conflicts.append(
@@ -2471,13 +2661,20 @@ function renderWebDavSyncSettingsCard(): HTMLElement {
     );
     const actions = makeElement("div", "sync-actions sync-actions-configured");
     const syncNow = makeButton("立即同步", "button button-primary", syncWebDavNow, "refresh");
+    const automatic = makeButton(
+      status.automatic ? "关闭自动同步" : "启用自动同步",
+      "button button-secondary",
+      toggleWebDavAutoSync,
+      status.automatic ? "x" : "check",
+    );
     const reveal = makeButton("查看恢复码", "button button-ghost", revealWebDavRecoveryCode, "eye");
     const disable = makeButton("停止此设备同步", "button button-danger-ghost", disableWebDavSync, "x");
-    for (const button of [syncNow, reveal, disable]) {
+    for (const button of [syncNow, automatic, reveal, disable]) {
       button.dataset.securityMutation = "true";
       button.disabled = state.syncOperation !== null || state.securityOperation !== null;
     }
-    actions.append(syncNow, reveal, disable);
+    actions.append(syncNow, automatic, reveal, disable);
+    content.append(makeElement("p", "field-help", "自动同步仅在保险库解锁期间运行：保存修改后会检查远端，并定期拉取其他设备的修改。远端提交结果无法确认时会暂停，需手动同步核对。"));
     content.append(notice, actions);
   }
 
@@ -2536,7 +2733,7 @@ function clearWebDavJoinDetails(details: WebDavJoinDetails | null): void {
   details.recoveryCode = "";
 }
 
-async function applyWebDavOutcome(outcome: WebDavSyncOutcome, operationEpoch: number): Promise<void> {
+async function applyWebDavOutcome(outcome: WebDavSyncOutcome, operationEpoch: number, joined = false): Promise<void> {
   if (operationEpoch !== state.epoch || !state.status.unlocked) return;
   state.syncStatus = normalizeWebDavSyncStatus(outcome.status);
   state.syncStatusError = false;
@@ -2553,9 +2750,10 @@ async function applyWebDavOutcome(outcome: WebDavSyncOutcome, operationEpoch: nu
   await loadVaultOverview(operationEpoch).catch(() => undefined);
   if (operationEpoch !== state.epoch || !state.status.unlocked) return;
   const sequence = `远端序列 #${outcome.sequence.toLocaleString("zh-CN")}`;
+  const autoNote = joined && outcome.status.automatic ? " 此设备已启用自动同步，可在设置中关闭。" : "";
   if (!listRefreshed) {
     showToast(
-      `同步已提交（${sequence}），但条目列表未能刷新。请切换到条目页重新读取；若仍失败，点击“重试读取”${outcome.conflicts > 0 ? `，然后核对 ${outcome.conflicts} 个冲突副本` : ""}。`,
+      `同步已提交（${sequence}），但条目列表未能刷新。请切换到条目页重新读取；若仍失败，点击“重试读取”${outcome.conflicts > 0 ? `，然后核对 ${outcome.conflicts} 个冲突副本` : ""}。${autoNote}`,
       "warning",
       8200,
     );
@@ -2563,7 +2761,7 @@ async function applyWebDavOutcome(outcome: WebDavSyncOutcome, operationEpoch: nu
   }
   if (outcome.conflicts > 0) {
     showToast(
-      `同步完成（${sequence}）。已保留 ${outcome.conflicts} 个冲突副本，并标记“同步冲突”供你核对。`,
+      `同步完成（${sequence}）。已保留 ${outcome.conflicts} 个冲突副本，并标记“同步冲突”供你核对。${autoNote}`,
       "warning",
       7200,
     );
@@ -2575,7 +2773,7 @@ async function applyWebDavOutcome(outcome: WebDavSyncOutcome, operationEpoch: nu
     downloaded: `远端加密修改已下载并应用（${sequence}）。`,
     merged: `本机与远端修改已安全合并（${sequence}）。`,
   };
-  showToast(messages[outcome.kind], "success", 5200);
+  showToast(`${messages[outcome.kind]}${autoNote}`, "success", 6200);
 }
 
 function describeWebDavNetworkFailure(error: unknown, fallback: string): string {
@@ -2649,7 +2847,7 @@ async function createWebDavSyncSpace(): Promise<void> {
     await showRecoveryCodeDialog(recoveryCode, true, "保存 WebDAV 恢复码");
     recoveryCode = "";
     if (operationEpoch !== state.epoch || !state.status.unlocked) return;
-    showToast("加密同步空间已创建。以后仍只会在你点击“立即同步”时联网。", "success", 5600);
+    showToast("加密同步空间已创建，并已启用自动同步。保险库解锁期间会检查远端；可在设置中关闭。", "success", 6600);
   } catch (error) {
     if (operationEpoch === state.epoch) {
       const explanation = describeWebDavNetworkFailure(error, "无法创建同步空间。请检查 HTTPS 地址、目录权限和应用专用密码后重试。");
@@ -2752,7 +2950,7 @@ async function joinWebDavSyncSpace(): Promise<void> {
     } finally {
       closeJoin();
     }
-    await applyWebDavOutcome(outcome, operationEpoch);
+    await applyWebDavOutcome(outcome, operationEpoch, true);
   } catch (error) {
     if (operationEpoch === state.epoch) {
       const explanation = describeWebDavNetworkFailure(error, "无法加入此同步空间。请检查凭据、恢复码及服务器状态。");
@@ -2811,6 +3009,34 @@ async function syncWebDavNow(): Promise<void> {
     }
   } finally {
     closeProgress();
+    finishSyncOperation(operationEpoch);
+  }
+}
+
+async function toggleWebDavAutoSync(): Promise<void> {
+  if (!state.syncStatus.configured || state.syncStatusError) return;
+  const operationEpoch = beginSyncOperation("auto");
+  if (operationEpoch === null) return;
+  const enabled = !state.syncStatus.automatic;
+  try {
+    const status = await invokeCommand<WebDavSyncStatus>("set_webdav_auto_sync", { enabled });
+    if (operationEpoch !== state.epoch || !state.status.unlocked) return;
+    state.syncStatus = normalizeWebDavSyncStatus(status);
+    state.syncStatusUncertain = false;
+    renderMainShell();
+    showToast(
+      enabled
+        ? status.autoPaused
+          ? "自动同步设置已保存。请先手动同步，核对上次未确认的远端结果。"
+          : "自动同步已启用。保险库解锁期间会检查远端修改。"
+        : "自动同步已关闭。仍可使用“立即同步”。",
+      enabled && status.autoPaused ? "warning" : "success",
+      6200,
+    );
+  } catch (error) {
+    if (operationEpoch !== state.epoch) return;
+    showToast(describeWebDavNetworkFailure(error, "无法更改自动同步设置，请重试。"), "error", 6200);
+  } finally {
     finishSyncOperation(operationEpoch);
   }
 }
@@ -2974,10 +3200,14 @@ function renderStatusbar(): HTMLElement {
       ? "远端同步结果待确认 · 查看设置"
       : state.syncStatusUncertain
         ? "同步状态待确认 · 查看设置"
+        : state.syncStatus.autoPaused
+          ? "自动同步已暂停 · 查看设置"
+          : state.syncStatus.autoWarning
+            ? "自动同步需检查 · 查看设置"
         : state.syncStatus.configured && state.syncStatus.pendingLocalChanges
           ? "本机修改待同步 · 查看设置"
           : state.syncStatus.configured
-            ? "本地优先 · 手动同步"
+            ? state.syncStatus.automatic ? "本地优先 · 自动同步" : "本地优先 · 手动同步"
             : "本地保险库";
   if (state.syncStatus.configured || state.syncStatusError) {
     const syncLink = makeButton(syncLabel, "statusbar-sync-link", () => switchView("settings"));
@@ -2985,6 +3215,19 @@ function renderStatusbar(): HTMLElement {
     left.append(syncLink);
   } else {
     left.append(makeElement("span", "", syncLabel));
+  }
+  const backupLabel = state.webdavBackupStatusError
+    ? "远端备份状态未知"
+    : state.webdavBackupStatus.warning
+      ? "远端备份需处理"
+      : state.webdavBackupStatus.configured && state.webdavBackupStatus.automatic && state.webdavBackupStatus.pending
+        ? "远端备份待上传"
+        : null;
+  if (backupLabel) {
+    left.append(makeElement("span", "status-separator", "•"));
+    const backupLink = makeButton(`${backupLabel} · 查看设置`, `statusbar-backup-link${state.webdavBackupStatusError || state.webdavBackupStatus.warning ? " has-error" : ""}`, () => switchView("settings"));
+    backupLink.dataset.focusKey = "statusbar-backup";
+    left.append(backupLink);
   }
   left.append(makeElement("span", "status-separator", "•"));
   left.append(makeElement("span", "", `空闲 ${state.settings.autoLockMinutes} 分钟自动锁定`));
@@ -3060,7 +3303,7 @@ async function loadEntries(
     state.entries = [];
     state.listLoading = false;
     state.listError = true;
-    if (render || document.querySelector(".entry-list")) renderMainShell();
+    if (render || (document.querySelector(".entry-list") && !hasUnsavedDraft() && state.view !== "settings")) renderMainShell();
     if (notifyFailure) showToast("无法读取条目列表。列表已隐藏，请点击“重试读取”。", "error");
     return false;
   }
@@ -3131,6 +3374,7 @@ async function selectEntry(id: string): Promise<boolean> {
       passwordUpdatedAt: entry.passwordUpdatedAt,
       revision: entry.revision,
     };
+    state.entryRevisionConflict = false;
     state.draft = entryInputFromVault(entry);
     state.draftSnapshot = serializeInput(state.draft);
     clearVaultEntrySensitiveFields(entry);
@@ -3205,6 +3449,26 @@ function hasUnsavedDraft(): boolean {
   return Boolean(state.draft && serializeInput(state.draft) !== state.draftSnapshot);
 }
 
+async function saveConflictedDraftAsNewEntry(): Promise<void> {
+  if (!state.entryRevisionConflict || !state.draft || !state.status.unlocked) return;
+  if (state.entryMutation !== null || state.syncOperation !== null || state.securityOperation !== null) return;
+  const copy = cloneEntryInput(state.draft);
+  delete copy.id;
+  delete copy.expectedRevision;
+  const suffix = "（本机草稿）";
+  if (!copy.title.endsWith(suffix) && [...copy.title].length + [...suffix].length <= 200) {
+    copy.title += suffix;
+  }
+  if (!copy.tags.includes("同步冲突") && copy.tags.length < 20) copy.tags.push("同步冲突");
+  clearEntryDraft();
+  state.view = "all";
+  state.conflictsOnly = false;
+  state.draft = copy;
+  state.draftSnapshot = serializeInput(emptyEntryInput());
+  renderMainShell();
+  await saveCurrentEntry();
+}
+
 async function saveCurrentEntry(button?: HTMLButtonElement): Promise<boolean> {
   if (
     !state.draft
@@ -3247,6 +3511,7 @@ async function saveCurrentEntry(button?: HTMLButtonElement): Promise<boolean> {
       passwordUpdatedAt: entry.passwordUpdatedAt,
       revision: entry.revision,
     };
+    state.entryRevisionConflict = false;
     const draftChangedWhileSaving = Boolean(
       state.draft && serializeInput(state.draft) !== submittedSnapshot,
     );
@@ -3296,6 +3561,12 @@ async function saveCurrentEntry(button?: HTMLButtonElement): Promise<boolean> {
       );
       return true;
     }
+    if (isEntryRevisionConflict(error) || error === "找不到该条目。") {
+      state.entryRevisionConflict = true;
+      renderMainShell();
+      showToast("该条目已有远端修改。草稿仍在；可点击“另存当前草稿为新条目”保存，再核对内容。", "warning", 7600);
+      return false;
+    }
     presentEntrySaveFailure(error, "editor");
     return false;
   }
@@ -3311,6 +3582,11 @@ function presentEntrySaveFailure(error: unknown, context: "editor" | "generator"
 function isEntryRevisionConflict(error: unknown): boolean {
   return error === ENTRY_REVISION_CONFLICT
     || (error instanceof Error && error.message === ENTRY_REVISION_CONFLICT);
+}
+
+function isWeakMasterPasswordError(error: unknown): boolean {
+  return error === MASTER_PASSWORD_TOO_WEAK
+    || (error instanceof Error && error.message === MASTER_PASSWORD_TOO_WEAK);
 }
 
 function entryFieldId(field: EntryField, context: "editor" | "generator"): string | null {
@@ -3392,6 +3668,7 @@ function clearEntryDraft(): void {
   }
   state.draft = null;
   state.draftSnapshot = "";
+  state.entryRevisionConflict = false;
   state.entryMutation = null;
   state.selectedId = null;
   state.entryMeta = {};
@@ -4292,7 +4569,8 @@ function showWebDavBackupConfig(current: WebDavBackupStatus, operationEpoch: num
     const automatic = makeElement("input") as HTMLInputElement;
     automatic.type = "checkbox";
     automatic.checked = current.configured ? Boolean(current.automatic) : true;
-    automaticLabel.append(automatic, makeElement("span", "", "保存后在后台合并上传最新加密备份"));
+    automaticLabel.append(automatic, makeElement("span", "", "保存后自动上传最新加密备份"));
+    const automaticHelp = makeElement("p", "field-help webdav-backup-automatic-help", "短时间连续保存会合并为一次上传，每次上传新增历史文件。未完成的上传会在下次解锁时重试；不会自动下载或合并其他设备的修改。");
     const error = makeElement("p", "form-error webdav-form-error");
     error.setAttribute("role", "alert");
     const feedback = makeElement("p", "field-help webdav-backup-feedback");
@@ -4371,7 +4649,7 @@ function showWebDavBackupConfig(current: WebDavBackupStatus, operationEpoch: num
     };
     dialog.addEventListener("submit", (event) => { event.preventDefault(); void submit("save"); });
     actions.append(cancel, test, save);
-    dialog.append(badge, heading, body, fields, automaticLabel, error, feedback, actions);
+    dialog.append(badge, heading, body, fields, automaticLabel, automaticHelp, error, feedback, actions);
     overlay.append(dialog);
     region.append(overlay);
     release = installDialogFocusTrap(dialog, () => { if (!busy) finish(null); });
@@ -4488,7 +4766,7 @@ function showWebDavBackupPicker(operationEpoch: number): Promise<RestoreSelectio
     const heading = makeElement("h2", "", "选择 WebDAV 加密备份");
     heading.id = ids.title;
     const body = makeElement("p", "", needsCredentials
-      ? "输入备份目录凭据，选择要下载的备份。连接凭据仅用于这次恢复，不会保存在本机。"
+      ? "输入备份目录凭据，选择要下载的备份。恢复后可将这组凭据加密保存在本机，用于继续自动备份。"
       : "先下载所选备份，再使用创建备份时的主密码验证内容；确认前不会替换当前保险库。");
     body.id = ids.description;
     dialog.append(badge, heading, body);
@@ -4510,6 +4788,14 @@ function showWebDavBackupPicker(operationEpoch: number): Promise<RestoreSelectio
       const fields = makeElement("div", "webdav-fields");
       fields.append(endpoint.wrapper, username.wrapper, password.wrapper);
       dialog.append(fields);
+    }
+    const saveConnectionLabel = needsCredentials ? makeElement("label", "webdav-backup-automatic") : null;
+    const saveConnection = needsCredentials ? makeElement("input") as HTMLInputElement : null;
+    if (saveConnectionLabel && saveConnection) {
+      saveConnection.type = "checkbox";
+      saveConnection.checked = true;
+      saveConnectionLabel.append(saveConnection, makeElement("span", "", "恢复成功后保存此备份连接，并启用自动备份"));
+      dialog.append(saveConnectionLabel, makeElement("p", "field-help webdav-backup-automatic-help", "凭据只会在确认恢复后加密保存到此设备。取消恢复或验证失败时不会保存；双向同步仍需单独配置。"));
     }
 
     const error = makeElement("p", "form-error webdav-form-error");
@@ -4624,6 +4910,7 @@ function showWebDavBackupPicker(operationEpoch: number): Promise<RestoreSelectio
         const selection = needsCredentials
           ? await invokeCommand<RestoreSelection>("webdav_backup_prepare_restore_with_credentials", {
             credentials, fileName: item.fileName,
+            saveConnectionAfterRestore: Boolean(saveConnection?.checked),
           })
           : await invokeCommand<RestoreSelection>("webdav_backup_prepare_restore", { fileName: item.fileName });
         if (!settled && operationEpoch === state.epoch) finish(selection);
@@ -4730,7 +5017,11 @@ async function restoreBackup(source: "local" | "webdav" = "local"): Promise<void
     if (refreshed && !state.listError) {
       state.backupOperationError = null;
       showToast(
-        "加密备份已恢复；本机 WebDAV 同步和备份配置已停用。如需继续使用，请重新配置。",
+        state.webdavBackupStatusError
+          ? "加密备份已恢复；备份连接状态未能读取，请在设置中检查。双向同步需单独配置。"
+          : state.webdavBackupStatus.configured
+            ? "加密备份已恢复；本机 WebDAV 备份连接已保留。双向同步需单独配置。"
+            : "加密备份已恢复；此设备尚未保存 WebDAV 备份连接。双向同步需单独配置。",
         "success",
         7200,
       );
@@ -4835,6 +5126,8 @@ async function performLock(message: string, notify: boolean): Promise<void> {
 
 function clearSensitiveState(clearMetadata: boolean): void {
   backupStatusRequestId += 1;
+  syncStatusRequestId += 1;
+  remoteContentRefreshQueued = false;
   state.securityOperation = null;
   state.syncOperation = null;
   state.backupOperationError = null;
@@ -5658,7 +5951,7 @@ function showRestorePreview(selection: RestoreSelection, preview: RestorePreview
       makeElement(
         "p",
         "",
-        "未保存修改不会被保留；恢复完成后，本机 WebDAV 同步及备份配置会停用。请在核对恢复内容后重新配置。",
+        "未保存修改不会被保留；本机双向同步配置与检查点会清除。已保存的备份连接会保留；临时连接仅在选择保存时保留。恢复后请核对保险库和远端设置。",
       ),
     );
 
@@ -5722,6 +6015,12 @@ ensureLayers();
 void listen("ciphernest://vault-locked", () => void handleLifecycleLock());
 void listen("ciphernest://webdav-backup-status", () => {
   if (state.status.unlocked) void refreshWebDavBackupStatus(state.epoch);
+});
+void listen("ciphernest://webdav-sync-status", () => {
+  if (state.status.unlocked) void refreshWebDavSyncStatus(state.epoch);
+});
+void listen("ciphernest://vault-content-changed", () => {
+  if (state.status.unlocked) void refreshAfterAutoSyncedContent();
 });
 document.addEventListener("keydown", handleGlobalShortcut);
 document.addEventListener("pointerdown", recordActivity, { passive: true });

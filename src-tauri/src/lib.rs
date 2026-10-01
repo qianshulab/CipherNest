@@ -7,6 +7,9 @@ mod sync;
 mod vault;
 mod webdav_backup;
 
+#[cfg(test)]
+mod upgrade_compat_tests;
+
 use std::path::PathBuf;
 
 use tauri::{Emitter, Manager, RunEvent};
@@ -46,6 +49,7 @@ pub fn run() {
             commands::get_settings,
             commands::update_settings,
             commands::webdav_sync_status,
+            commands::set_webdav_auto_sync,
             commands::create_webdav_sync,
             commands::inspect_webdav_sync,
             commands::join_webdav_sync,

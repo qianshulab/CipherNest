@@ -12,6 +12,8 @@ use std::{
 };
 
 #[cfg(test)]
+use crate::crypto::create_envelope;
+#[cfg(test)]
 use std::fs;
 
 use sha2::{Digest, Sha256};
@@ -24,7 +26,8 @@ use zeroize::Zeroizing;
 
 use crate::{
     crypto::{
-        create_envelope, decrypt_envelope, parse_envelope_bytes, VaultEnvelope, MAX_VAULT_BYTES,
+        create_envelope_with_verified_password, decrypt_envelope, parse_envelope_bytes,
+        upgrade_weak_kdf, VaultEnvelope, MAX_VAULT_BYTES,
     },
     error::{VaultError, VaultResult},
     generator,
@@ -49,6 +52,9 @@ struct ClipboardLease {
 const PENDING_RESTORE_TTL: Duration = Duration::from_secs(5 * 60);
 const PENDING_SYNC_PREVIEW_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_SYNC_COMMIT_ATTEMPTS: usize = 3;
+const AUTO_SYNC_DEBOUNCE: Duration = Duration::from_secs(3);
+const AUTO_SYNC_POLL_INTERVAL: Duration = Duration::from_secs(90);
+const MAX_AUTO_SYNC_FAST_RETRIES: u64 = 2;
 
 struct VerifiedRestore {
     root_key: Zeroizing<[u8; 32]>,
@@ -69,6 +75,7 @@ struct PendingRestore {
     envelope: VaultEnvelope,
     verified: Option<VerifiedRestore>,
     target_fingerprint: Option<[u8; 32]>,
+    backup_config_after_restore: Option<BackupConfig>,
 }
 
 fn prepare_verified_restore(
@@ -79,6 +86,9 @@ fn prepare_verified_restore(
     let source_updated_at = data.updated_at;
     let source_generation = data.generation;
     if data.password_only_unlock {
+        // Verify and strengthen a historical password slot before it can
+        // become the active vault. The selected backup remains untouched.
+        let envelope = upgrade_weak_kdf(master_password, &envelope, &root_key)?.unwrap_or(envelope);
         return Ok(PreparedRestore {
             envelope,
             verified: VerifiedRestore { root_key, data },
@@ -93,7 +103,8 @@ fn prepare_verified_restore(
     data.password_only_unlock = true;
     data.generation = data.generation.saturating_add(1);
     data.updated_at = now_ms();
-    let (migrated_envelope, migrated_root_key) = create_envelope(master_password, &data)?;
+    let (migrated_envelope, migrated_root_key) =
+        create_envelope_with_verified_password(master_password, &data)?;
     Ok(PreparedRestore {
         envelope: migrated_envelope,
         verified: VerifiedRestore {
@@ -160,6 +171,11 @@ pub struct AppState {
     pending_sync_preview: Arc<Mutex<Option<PendingSyncPreview>>>,
     sync_operation_active: Arc<AtomicBool>,
     sync_cancel_epoch: watch::Sender<u64>,
+    auto_sync_cancel_epoch: watch::Sender<u64>,
+    auto_sync_schedule_sequence: Arc<AtomicU64>,
+    auto_sync_poll_sequence: Arc<AtomicU64>,
+    auto_sync_fast_retry_count: Arc<AtomicU64>,
+    last_auto_check_at: AtomicU64,
     backup_schedule_sequence: Arc<AtomicU64>,
     backup_configuration_epoch: Arc<AtomicU64>,
     backup_upload_queue: Arc<tokio::sync::Mutex<()>>,
@@ -168,6 +184,7 @@ pub struct AppState {
 impl AppState {
     pub fn new(vault_path: PathBuf) -> Self {
         let (sync_cancel_epoch, _) = watch::channel(0);
+        let (auto_sync_cancel_epoch, _) = watch::channel(0);
         Self {
             store: Arc::new(Mutex::new(VaultStore::new(vault_path))),
             clipboard: Arc::new(Mutex::new(None)),
@@ -175,6 +192,11 @@ impl AppState {
             pending_sync_preview: Arc::new(Mutex::new(None)),
             sync_operation_active: Arc::new(AtomicBool::new(false)),
             sync_cancel_epoch,
+            auto_sync_cancel_epoch,
+            auto_sync_schedule_sequence: Arc::new(AtomicU64::new(0)),
+            auto_sync_poll_sequence: Arc::new(AtomicU64::new(0)),
+            auto_sync_fast_retry_count: Arc::new(AtomicU64::new(0)),
+            last_auto_check_at: AtomicU64::new(0),
             backup_schedule_sequence: Arc::new(AtomicU64::new(0)),
             backup_configuration_epoch: Arc::new(AtomicU64::new(0)),
             backup_upload_queue: Arc::new(tokio::sync::Mutex::new(())),
@@ -184,6 +206,208 @@ impl AppState {
     fn cancel_sync_operations(&self) {
         self.sync_cancel_epoch
             .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+        self.cancel_auto_sync();
+        self.auto_sync_schedule_sequence
+            .fetch_add(1, Ordering::AcqRel);
+        self.auto_sync_poll_sequence.fetch_add(1, Ordering::AcqRel);
+        self.last_auto_check_at.store(0, Ordering::Release);
+    }
+
+    fn cancel_auto_sync(&self) {
+        self.auto_sync_cancel_epoch
+            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+    }
+}
+
+async fn acquire_manual_sync_guard(state: &AppState) -> VaultResult<SyncOperationGuard> {
+    // An explicit user operation takes priority over a background check.
+    state.cancel_auto_sync();
+    for _ in 0..30 {
+        match SyncOperationGuard::acquire(&state.sync_operation_active) {
+            Ok(guard) => return Ok(guard),
+            Err(VaultError::SyncBusy) => tokio::time::sleep(Duration::from_millis(100)).await,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(VaultError::SyncBusy)
+}
+
+struct AutoSyncAttempt {
+    vault_id: String,
+    session_id: String,
+    state_digest: [u8; 32],
+    commit_started: bool,
+    commit_confirmed: bool,
+}
+
+impl AutoSyncAttempt {
+    fn new(context: &ExistingSyncContext) -> Self {
+        Self {
+            vault_id: context.vault_id.clone(),
+            session_id: context.session_id.clone(),
+            state_digest: context.state_digest,
+            commit_started: false,
+            commit_confirmed: false,
+        }
+    }
+}
+
+fn schedule_auto_webdav_sync(app: &AppHandle, state: &AppState) {
+    state.auto_sync_fast_retry_count.store(0, Ordering::Release);
+    enqueue_auto_webdav_sync(app, state, AUTO_SYNC_DEBOUNCE);
+}
+
+fn auto_sync_fast_retry_delay(previous_retries: u64) -> Option<Duration> {
+    (previous_retries < MAX_AUTO_SYNC_FAST_RETRIES)
+        .then(|| AUTO_SYNC_DEBOUNCE.saturating_mul(1 << previous_retries))
+}
+
+fn schedule_auto_webdav_sync_retry(app: &AppHandle, state: &AppState) {
+    let previous = state
+        .auto_sync_fast_retry_count
+        .fetch_add(1, Ordering::AcqRel);
+    if let Some(delay) = auto_sync_fast_retry_delay(previous) {
+        enqueue_auto_webdav_sync(app, state, delay);
+    }
+}
+
+fn enqueue_auto_webdav_sync(app: &AppHandle, state: &AppState, delay: Duration) {
+    let ticket = state
+        .auto_sync_schedule_sequence
+        .fetch_add(1, Ordering::AcqRel)
+        + 1;
+    let sequence = Arc::clone(&state.auto_sync_schedule_sequence);
+    let cancellation = state.sync_cancel_epoch.clone();
+    let authorized_epoch = *cancellation.borrow();
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(delay).await;
+        if sequence.load(Ordering::Acquire) == ticket && *cancellation.borrow() == authorized_epoch
+        {
+            auto_sync_once(&app).await;
+        }
+    });
+}
+
+fn start_auto_webdav_sync_poller(app: &AppHandle, state: &AppState) {
+    let ticket = state.auto_sync_poll_sequence.fetch_add(1, Ordering::AcqRel) + 1;
+    let sequence = Arc::clone(&state.auto_sync_poll_sequence);
+    let cancellation = state.sync_cancel_epoch.clone();
+    let authorized_epoch = *cancellation.borrow();
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(AUTO_SYNC_POLL_INTERVAL).await;
+            if sequence.load(Ordering::Acquire) != ticket
+                || *cancellation.borrow() != authorized_epoch
+            {
+                return;
+            }
+            auto_sync_once(&app).await;
+        }
+    });
+}
+
+async fn auto_sync_once(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let _operation = match SyncOperationGuard::acquire(&state.sync_operation_active) {
+        Ok(guard) => guard,
+        Err(_) => return,
+    };
+    let authorized_epoch = *state.sync_cancel_epoch.borrow();
+    let auto_epoch = *state.auto_sync_cancel_epoch.borrow();
+    let context = match run_store(Arc::clone(&state.store), VaultStore::prepare_auto_sync).await {
+        Ok(Some(context)) => context,
+        Ok(None) | Err(VaultError::Locked) => return,
+        Err(_) => {
+            let _ = app.emit("ciphernest://webdav-sync-status", ());
+            return;
+        }
+    };
+    let mut attempt = AutoSyncAttempt::new(&context);
+    let result = run_existing_sync_context(
+        app,
+        &state,
+        context,
+        authorized_epoch,
+        Some(auto_epoch),
+        &mut attempt,
+    )
+    .await;
+    match result {
+        Ok(outcome) => {
+            state.auto_sync_fast_retry_count.store(0, Ordering::Release);
+            state.last_auto_check_at.store(now_ms(), Ordering::Release);
+            let _ = app.emit("ciphernest://webdav-sync-status", ());
+            if matches!(
+                outcome.kind,
+                WebDavSyncOutcomeKind::Downloaded | WebDavSyncOutcomeKind::Merged
+            ) {
+                let _ = app.emit("ciphernest://vault-content-changed", ());
+            }
+        }
+        Err(VaultError::Locked) => {}
+        Err(error) => {
+            let known_concurrent = matches!(
+                &error,
+                VaultError::Sync(message) if message == &SyncError::ConcurrentUpdate.to_string()
+            );
+            let local_race = matches!(&error, VaultError::SyncLocalChanged);
+            let checkpoint_error = auto_sync_checkpoint_error(&error);
+            let safe_retry = known_concurrent || (attempt.commit_confirmed && local_race);
+            let fast_retry = local_race && (!attempt.commit_started || attempt.commit_confirmed);
+            let paused = checkpoint_error || (attempt.commit_started && !safe_retry);
+            let warning = if checkpoint_error {
+                "自动同步已暂停：同步历史或本地检查点无法安全验证。请保留本机备份，检查其他设备后手动同步。".to_owned()
+            } else if paused {
+                "自动同步已暂停：远端提交结果无法确认。请先检查其他设备，再手动同步以核对结果。"
+                    .to_owned()
+            } else {
+                format!("自动同步暂时失败：{error} 应用会在解锁期间定期重试。")
+            };
+            let vault_id = attempt.vault_id;
+            let session_id = attempt.session_id;
+            let digest = attempt.state_digest;
+            let stored = run_store(Arc::clone(&state.store), move |store| {
+                store.set_auto_sync_issue_if_unchanged(
+                    &vault_id,
+                    &session_id,
+                    &digest,
+                    warning,
+                    paused,
+                    safe_retry,
+                )
+            })
+            .await;
+            if matches!(stored, Ok(true)) {
+                let _ = app.emit("ciphernest://webdav-sync-status", ());
+                if fast_retry {
+                    schedule_auto_webdav_sync_retry(app, &state);
+                }
+            }
+        }
+    }
+}
+
+fn auto_sync_checkpoint_error(error: &VaultError) -> bool {
+    if matches!(error, VaultError::SyncLocalChanged) {
+        return false;
+    }
+    match error {
+        VaultError::Sync(message) => [
+            SyncError::InvalidLocalState,
+            SyncError::LocalRollback,
+            SyncError::InvalidRemoteObject,
+            SyncError::HashMismatch,
+            SyncError::RemoteNotInitialized,
+            SyncError::RollbackOrFork,
+            SyncError::ChainTooLong,
+            SyncError::UnsafeServer,
+            SyncError::InvalidData,
+        ]
+        .iter()
+        .any(|candidate| message == &candidate.to_string()),
+        _ => false,
     }
 }
 
@@ -214,13 +438,19 @@ fn schedule_auto_webdav_backup(app: &AppHandle, state: &State<'_, AppState>) {
         }
         let context = match run_store(Arc::clone(&store), VaultStore::remote_backup_context).await {
             Ok(context) => context,
-            Err(_) => return,
+            Err(VaultError::Locked | VaultError::BackupNotConfigured) => return,
+            Err(_) => {
+                let _ = app.emit("ciphernest://webdav-backup-status", ());
+                return;
+            }
         };
         if !context.config.automatic
-            || context
+            || (context
                 .config
                 .last_uploaded_generation
                 .is_some_and(|generation| generation >= context.generation)
+                && context.config.last_uploaded_sha256.as_deref()
+                    == Some(context.envelope_sha256.as_str()))
         {
             return;
         }
@@ -229,15 +459,18 @@ fn schedule_auto_webdav_backup(app: &AppHandle, state: &State<'_, AppState>) {
             context.config.username.clone(),
             context.config.app_password.clone(),
         ) {
-            Ok(client) => client
-                .upload(
+            Ok(client) => await_backup_network(
+                &cancellation,
+                authorized_epoch,
+                client.upload(
                     &context.bytes,
                     &context.vault_id,
                     context.generation,
                     context.updated_at,
-                )
-                .await
-                .map(|_| ()),
+                ),
+            )
+            .await
+            .map(|_| ()),
             Err(error) => Err(error),
         };
         if *cancellation.borrow() != authorized_epoch {
@@ -316,7 +549,10 @@ pub async fn unlock_vault(
         store.unlock(password.as_str())
     })
     .await?;
+    state.last_auto_check_at.store(0, Ordering::Release);
     schedule_auto_webdav_backup(&app, &state);
+    schedule_auto_webdav_sync(&app, &state);
+    start_auto_webdav_sync_poller(&app, &state);
     Ok(status)
 }
 
@@ -375,6 +611,7 @@ pub async fn save_entry(
     let store = Arc::clone(&state.store);
     let saved = run_store(store, move |store| store.save_entry(input)).await?;
     schedule_auto_webdav_backup(&app, &state);
+    schedule_auto_webdav_sync(&app, &state);
     Ok(saved)
 }
 
@@ -391,6 +628,7 @@ pub async fn delete_entry(
     })
     .await?;
     schedule_auto_webdav_backup(&app, &state);
+    schedule_auto_webdav_sync(&app, &state);
     Ok(())
 }
 
@@ -408,6 +646,7 @@ pub async fn set_favorite(
     })
     .await?;
     schedule_auto_webdav_backup(&app, &state);
+    schedule_auto_webdav_sync(&app, &state);
     Ok(revision)
 }
 
@@ -433,20 +672,55 @@ pub async fn update_settings(
     let store = Arc::clone(&state.store);
     run_store(store, move |store| store.update_settings(settings)).await?;
     schedule_auto_webdav_backup(&app, &state);
+    schedule_auto_webdav_sync(&app, &state);
     Ok(())
 }
 
 #[tauri::command]
 pub async fn webdav_sync_status(state: State<'_, AppState>) -> VaultResult<WebDavSyncStatus> {
-    run_store(Arc::clone(&state.store), VaultStore::webdav_sync_status).await
+    let status = run_store(Arc::clone(&state.store), VaultStore::webdav_sync_status).await?;
+    Ok(with_session_auto_check(status, &state))
+}
+
+fn with_session_auto_check(mut status: WebDavSyncStatus, state: &AppState) -> WebDavSyncStatus {
+    let checked_at = state.last_auto_check_at.load(Ordering::Acquire);
+    if status.configured && status.automatic && checked_at != 0 {
+        status.last_auto_check_at = Some(checked_at);
+    }
+    status
+}
+
+#[tauri::command]
+pub async fn set_webdav_auto_sync(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> VaultResult<WebDavSyncStatus> {
+    let _operation = acquire_manual_sync_guard(&state).await?;
+    let status = run_store(Arc::clone(&state.store), move |store| {
+        store.set_webdav_auto_sync(enabled)
+    })
+    .await?;
+    state.last_auto_check_at.store(0, Ordering::Release);
+    state
+        .auto_sync_schedule_sequence
+        .fetch_add(1, Ordering::AcqRel);
+    state.auto_sync_poll_sequence.fetch_add(1, Ordering::AcqRel);
+    if enabled {
+        schedule_auto_webdav_sync(&app, &state);
+        start_auto_webdav_sync_poller(&app, &state);
+    }
+    let _ = app.emit("ciphernest://webdav-sync-status", ());
+    Ok(status)
 }
 
 #[tauri::command]
 pub async fn create_webdav_sync(
+    app: AppHandle,
     state: State<'_, AppState>,
     mut credentials: WebDavCredentialsInput,
 ) -> VaultResult<WebDavCreateResult> {
-    let _operation = SyncOperationGuard::acquire(&state.sync_operation_active)?;
+    let _operation = acquire_manual_sync_guard(&state).await?;
     let authorized_epoch = *state.sync_cancel_epoch.borrow();
     let context = run_store(Arc::clone(&state.store), VaultStore::prepare_new_sync).await?;
     let client = take_webdav_client(&mut credentials)?;
@@ -483,6 +757,10 @@ pub async fn create_webdav_sync(
         )
     })
     .await?;
+    state.last_auto_check_at.store(0, Ordering::Release);
+    schedule_auto_webdav_sync(&app, &state);
+    start_auto_webdav_sync_poller(&app, &state);
+    let _ = app.emit("ciphernest://webdav-sync-status", ());
     Ok(WebDavCreateResult {
         status,
         recovery_code: recovery_code.as_str().to_owned(),
@@ -494,7 +772,7 @@ pub async fn inspect_webdav_sync(
     state: State<'_, AppState>,
     mut request: WebDavInspectInput,
 ) -> VaultResult<WebDavRemotePreview> {
-    let _operation = SyncOperationGuard::acquire(&state.sync_operation_active)?;
+    let _operation = acquire_manual_sync_guard(&state).await?;
     clear_pending_sync_preview_state(&state.pending_sync_preview)?;
     let authorized_epoch = *state.sync_cancel_epoch.borrow();
     let context = run_store(Arc::clone(&state.store), VaultStore::prepare_new_sync).await?;
@@ -550,7 +828,7 @@ pub async fn join_webdav_sync(
     state: State<'_, AppState>,
     mut request: WebDavJoinInput,
 ) -> VaultResult<WebDavSyncOutcome> {
-    let _operation = SyncOperationGuard::acquire(&state.sync_operation_active)?;
+    let _operation = acquire_manual_sync_guard(&state).await?;
     let authorized_epoch = *state.sync_cancel_epoch.borrow();
     let context = run_store(Arc::clone(&state.store), VaultStore::prepare_new_sync).await?;
     let client = take_webdav_client(&mut request.credentials)?;
@@ -613,7 +891,11 @@ pub async fn join_webdav_sync(
                 )
             })
             .await?;
+            state.last_auto_check_at.store(0, Ordering::Release);
             schedule_auto_webdav_backup(&app, &state);
+            schedule_auto_webdav_sync(&app, &state);
+            start_auto_webdav_sync_poller(&app, &state);
+            let _ = app.emit("ciphernest://webdav-sync-status", ());
             Ok(WebDavSyncOutcome {
                 kind: WebDavSyncOutcomeKind::Downloaded,
                 conflicts: 0,
@@ -652,7 +934,11 @@ pub async fn join_webdav_sync(
                 )
             })
             .await?;
+            state.last_auto_check_at.store(0, Ordering::Release);
             schedule_auto_webdav_backup(&app, &state);
+            schedule_auto_webdav_sync(&app, &state);
+            start_auto_webdav_sync_poller(&app, &state);
+            let _ = app.emit("ciphernest://webdav-sync-status", ());
             Ok(WebDavSyncOutcome {
                 kind: WebDavSyncOutcomeKind::Merged,
                 conflicts: conflict_count,
@@ -668,21 +954,38 @@ pub async fn sync_webdav_now(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> VaultResult<WebDavSyncOutcome> {
-    let _operation = SyncOperationGuard::acquire(&state.sync_operation_active)?;
+    let _operation = acquire_manual_sync_guard(&state).await?;
     let authorized_epoch = *state.sync_cancel_epoch.borrow();
-    let mut context =
-        run_store(Arc::clone(&state.store), VaultStore::prepare_existing_sync).await?;
+    let context = run_store(Arc::clone(&state.store), VaultStore::prepare_existing_sync).await?;
+    let mut attempt = AutoSyncAttempt::new(&context);
+    let mut outcome =
+        run_existing_sync_context(&app, &state, context, authorized_epoch, None, &mut attempt)
+            .await?;
+    outcome.status = with_session_auto_check(outcome.status, &state);
+    let _ = app.emit("ciphernest://webdav-sync-status", ());
+    Ok(outcome)
+}
+
+async fn run_existing_sync_context(
+    app: &AppHandle,
+    state: &AppState,
+    mut context: ExistingSyncContext,
+    authorized_epoch: u64,
+    auto_epoch: Option<u64>,
+    attempt: &mut AutoSyncAttempt,
+) -> VaultResult<WebDavSyncOutcome> {
     let client = WebDavClient::from_local_state(&context.state)?;
     let timestamp = now_ms();
-    let mut cursor = await_sync_network(
-        &state.sync_cancel_epoch,
+    let mut cursor = await_existing_sync_network(
+        state,
         authorized_epoch,
+        auto_epoch,
         client.fetch_for_sync(&context.state),
     )
     .await?;
     require_cursor_checkpoint(&cursor, true)?;
 
-    for attempt in 0..MAX_SYNC_COMMIT_ATTEMPTS {
+    for commit_attempt in 0..MAX_SYNC_COMMIT_ATTEMPTS {
         let base = context
             .state
             .base_snapshot()
@@ -692,14 +995,30 @@ pub async fn sync_webdav_now(
         let remote_changed = cursor.snapshot().sequence() != base.sequence();
 
         if !local_changed && !remote_changed {
+            let no_op_background_check = auto_epoch.is_some()
+                && context.state.auto_warning().is_none()
+                && !context.state.auto_commit_inflight();
             client.accept_fetched_for_sync(
                 &mut context.state,
                 &cursor,
                 context.generation,
                 timestamp,
             )?;
+            context.state.clear_auto_issue();
             let sequence = cursor.snapshot().sequence();
-            let status = commit_existing_sync_context(&state, context, None).await?;
+            require_existing_sync_epoch(state, authorized_epoch, auto_epoch)?;
+            let status = if no_op_background_check {
+                let vault_id = context.vault_id;
+                let session_id = context.session_id;
+                let generation = context.generation;
+                let digest = context.state_digest;
+                run_store(Arc::clone(&state.store), move |store| {
+                    store.observe_auto_sync_unchanged(&vault_id, &session_id, generation, &digest)
+                })
+                .await?
+            } else {
+                commit_existing_sync_context(state, context, None, auto_epoch.is_some()).await?
+            };
             return Ok(WebDavSyncOutcome {
                 kind: WebDavSyncOutcomeKind::UpToDate,
                 conflicts: 0,
@@ -717,9 +1036,13 @@ pub async fn sync_webdav_now(
                 target_generation,
                 timestamp,
             )?;
+            context.state.clear_auto_issue();
             let sequence = cursor.snapshot().sequence();
-            let status = commit_existing_sync_context(&state, context, Some(content)).await?;
-            schedule_auto_webdav_backup(&app, &state);
+            require_existing_sync_epoch(state, authorized_epoch, auto_epoch)?;
+            let status =
+                commit_existing_sync_context(state, context, Some(content), auto_epoch.is_some())
+                    .await?;
+            schedule_auto_webdav_backup(app, &app.state::<AppState>());
             return Ok(WebDavSyncOutcome {
                 kind: WebDavSyncOutcomeKind::Downloaded,
                 conflicts: 0,
@@ -729,9 +1052,11 @@ pub async fn sync_webdav_now(
         }
 
         if local_changed && !remote_changed {
-            match await_sync_network(
-                &state.sync_cancel_epoch,
+            prepare_auto_commit_if_needed(state, &mut context, attempt, auto_epoch).await?;
+            match await_existing_sync_network(
+                state,
                 authorized_epoch,
+                auto_epoch,
                 client.commit_for_sync(
                     &mut context.state,
                     &cursor,
@@ -743,8 +1068,13 @@ pub async fn sync_webdav_now(
             .await
             {
                 Ok(committed) => {
+                    attempt.commit_confirmed = auto_epoch.is_some();
+                    context.state.clear_auto_issue();
                     let sequence = committed.snapshot().sequence();
-                    let status = commit_existing_sync_context(&state, context, None).await?;
+                    require_existing_sync_epoch(state, authorized_epoch, auto_epoch)?;
+                    let status =
+                        commit_existing_sync_context(state, context, None, auto_epoch.is_some())
+                            .await?;
                     return Ok(WebDavSyncOutcome {
                         kind: WebDavSyncOutcomeKind::Uploaded,
                         conflicts: 0,
@@ -753,11 +1083,12 @@ pub async fn sync_webdav_now(
                     });
                 }
                 Err(SyncNetworkError::Sync(SyncError::ConcurrentUpdate))
-                    if attempt + 1 < MAX_SYNC_COMMIT_ATTEMPTS =>
+                    if commit_attempt + 1 < MAX_SYNC_COMMIT_ATTEMPTS =>
                 {
-                    cursor = await_sync_network(
-                        &state.sync_cancel_epoch,
+                    cursor = await_existing_sync_network(
+                        state,
                         authorized_epoch,
+                        auto_epoch,
                         client.fetch_for_sync(&context.state),
                     )
                     .await?;
@@ -772,9 +1103,11 @@ pub async fn sync_webdav_now(
         let conflict_count = merged.conflicts.len();
         let merged_content = merged.content.clone();
         let target_generation = next_sync_generation(context.generation)?;
-        match await_sync_network(
-            &state.sync_cancel_epoch,
+        prepare_auto_commit_if_needed(state, &mut context, attempt, auto_epoch).await?;
+        match await_existing_sync_network(
+            state,
             authorized_epoch,
+            auto_epoch,
             client.commit_for_sync(
                 &mut context.state,
                 &cursor,
@@ -786,10 +1119,18 @@ pub async fn sync_webdav_now(
         .await
         {
             Ok(committed) => {
+                attempt.commit_confirmed = auto_epoch.is_some();
+                context.state.clear_auto_issue();
                 let sequence = committed.snapshot().sequence();
-                let status =
-                    commit_existing_sync_context(&state, context, Some(merged_content)).await?;
-                schedule_auto_webdav_backup(&app, &state);
+                require_existing_sync_epoch(state, authorized_epoch, auto_epoch)?;
+                let status = commit_existing_sync_context(
+                    state,
+                    context,
+                    Some(merged_content),
+                    auto_epoch.is_some(),
+                )
+                .await?;
+                schedule_auto_webdav_backup(app, &app.state::<AppState>());
                 return Ok(WebDavSyncOutcome {
                     kind: WebDavSyncOutcomeKind::Merged,
                     conflicts: conflict_count,
@@ -798,11 +1139,12 @@ pub async fn sync_webdav_now(
                 });
             }
             Err(SyncNetworkError::Sync(SyncError::ConcurrentUpdate))
-                if attempt + 1 < MAX_SYNC_COMMIT_ATTEMPTS =>
+                if commit_attempt + 1 < MAX_SYNC_COMMIT_ATTEMPTS =>
             {
-                cursor = await_sync_network(
-                    &state.sync_cancel_epoch,
+                cursor = await_existing_sync_network(
+                    state,
                     authorized_epoch,
+                    auto_epoch,
                     client.fetch_for_sync(&context.state),
                 )
                 .await?;
@@ -831,15 +1173,23 @@ pub async fn reveal_webdav_recovery_code(
 
 #[tauri::command]
 pub async fn disable_webdav_sync(
+    app: AppHandle,
     state: State<'_, AppState>,
     current_password: String,
 ) -> VaultResult<()> {
-    let _operation = SyncOperationGuard::acquire(&state.sync_operation_active)?;
+    let _operation = acquire_manual_sync_guard(&state).await?;
     run_store(Arc::clone(&state.store), move |store| {
         let password = Zeroizing::new(current_password);
         store.disable_webdav_sync(password.as_str())
     })
-    .await
+    .await?;
+    state.last_auto_check_at.store(0, Ordering::Release);
+    state
+        .auto_sync_schedule_sequence
+        .fetch_add(1, Ordering::AcqRel);
+    state.auto_sync_poll_sequence.fetch_add(1, Ordering::AcqRel);
+    let _ = app.emit("ciphernest://webdav-sync-status", ());
+    Ok(())
 }
 
 #[tauri::command]
@@ -865,6 +1215,8 @@ pub async fn change_master_password(
     state.cancel_sync_operations();
     clear_pending_sync_preview_state(&state.pending_sync_preview)?;
     schedule_auto_webdav_backup(&app, &state);
+    schedule_auto_webdav_sync(&app, &state);
+    start_auto_webdav_sync_poller(&app, &state);
     Ok(result)
 }
 
@@ -1033,6 +1385,13 @@ pub async fn webdav_backup_save_config(
                     .and_then(|saved| saved.last_uploaded_generation)
             })
             .flatten(),
+        last_uploaded_sha256: same_target
+            .then(|| {
+                existing
+                    .as_ref()
+                    .and_then(|saved| saved.last_uploaded_sha256.clone())
+            })
+            .flatten(),
         warning: None,
     };
     let queue_guard = state.backup_upload_queue.lock().await;
@@ -1081,20 +1440,26 @@ pub async fn webdav_backup_upload(
         .backup_schedule_sequence
         .fetch_add(1, Ordering::AcqRel);
     let _queue_guard = state.backup_upload_queue.lock().await;
+    let authorized_epoch = *state.sync_cancel_epoch.borrow();
     let context = run_store(Arc::clone(&state.store), VaultStore::remote_backup_context).await?;
+    require_sync_epoch(&state.sync_cancel_epoch, authorized_epoch)?;
     let client = WebDavBackupClient::new(
         &context.config.endpoint,
         context.config.username.clone(),
         context.config.app_password.clone(),
     )?;
-    let item = client
-        .upload(
+    let item = await_backup_network(
+        &state.sync_cancel_epoch,
+        authorized_epoch,
+        client.upload(
             &context.bytes,
             &context.vault_id,
             context.generation,
             context.updated_at,
-        )
-        .await?;
+        ),
+    )
+    .await?;
+    require_sync_epoch(&state.sync_cancel_epoch, authorized_epoch)?;
     let uploaded_at = now_ms();
     run_store(Arc::clone(&state.store), move |store| {
         store.mark_remote_backup_uploaded(&context, uploaded_at)
@@ -1143,17 +1508,31 @@ pub async fn webdav_backup_prepare_restore(
         config.username.clone(),
         config.app_password.clone(),
     )?;
-    prepare_remote_restore(&state, client, file_name).await
+    // The user selected a recovery point through this device's saved backup
+    // connection. Keep that device setting when the selected vault replaces
+    // its contents, including when the source vault ID differs.
+    prepare_remote_restore(&state, client, file_name, Some(config)).await
 }
 
 #[tauri::command]
 pub async fn webdav_backup_prepare_restore_with_credentials(
     state: State<'_, AppState>,
-    credentials: WebDavCredentialsInput,
+    mut credentials: WebDavCredentialsInput,
     file_name: String,
+    save_connection_after_restore: bool,
 ) -> VaultResult<RestoreSelection> {
     let client = backup_client_from_input(&credentials)?;
-    prepare_remote_restore(&state, client, file_name).await
+    let backup_config_after_restore = save_connection_after_restore.then(|| BackupConfig {
+        endpoint: std::mem::take(&mut credentials.endpoint),
+        username: std::mem::take(&mut credentials.username),
+        app_password: std::mem::take(&mut credentials.app_password),
+        automatic: true,
+        last_upload_at: None,
+        last_uploaded_generation: None,
+        last_uploaded_sha256: None,
+        warning: None,
+    });
+    prepare_remote_restore(&state, client, file_name, backup_config_after_restore).await
 }
 
 fn backup_client_from_input(
@@ -1170,6 +1549,7 @@ async fn prepare_remote_restore(
     state: &State<'_, AppState>,
     client: WebDavBackupClient,
     file_name: String,
+    backup_config_after_restore: Option<BackupConfig>,
 ) -> VaultResult<RestoreSelection> {
     let authorized_epoch = *state.sync_cancel_epoch.borrow();
     clear_pending_restore_state(&state.pending_restore)?;
@@ -1191,6 +1571,7 @@ async fn prepare_remote_restore(
             envelope,
             verified: None,
             target_fingerprint: None,
+            backup_config_after_restore,
         },
     )?;
     Ok(RestoreSelection {
@@ -1239,6 +1620,7 @@ pub async fn select_backup_for_restore(
         envelope,
         verified: None,
         target_fingerprint: None,
+        backup_config_after_restore: None,
     };
     replace_pending_restore(&state.pending_restore, pending)?;
     Ok(Some(RestoreSelection {
@@ -1310,10 +1692,15 @@ pub async fn inspect_selected_backup(
 
 #[tauri::command]
 pub async fn apply_selected_backup(
+    app: AppHandle,
     state: State<'_, AppState>,
     token: String,
 ) -> VaultResult<VaultStatus> {
-    let _sync_operation = SyncOperationGuard::acquire(&state.sync_operation_active)?;
+    let _sync_operation = acquire_manual_sync_guard(&state).await?;
+    state
+        .backup_schedule_sequence
+        .fetch_add(1, Ordering::AcqRel);
+    let backup_queue_guard = state.backup_upload_queue.lock().await;
     let token = Zeroizing::new(token);
     let store = Arc::clone(&state.store);
     let pending_restore = Arc::clone(&state.pending_restore);
@@ -1344,7 +1731,12 @@ pub async fn apply_selected_backup(
         drop(pending_guard);
 
         ensure_restore_target_unchanged(&store, pending.target_fingerprint)?;
-        store.replace_with_verified_backup(pending.envelope, verified.root_key, verified.data)?;
+        store.replace_with_verified_backup_and_config(
+            pending.envelope,
+            verified.root_key,
+            verified.data,
+            pending.backup_config_after_restore,
+        )?;
         Ok(store.status().0)
     })
     .await
@@ -1352,6 +1744,12 @@ pub async fn apply_selected_backup(
     let status = applied?;
     state.cancel_sync_operations();
     clear_pending_sync_preview_state(&state.pending_sync_preview)?;
+    state
+        .backup_configuration_epoch
+        .fetch_add(1, Ordering::AcqRel);
+    drop(backup_queue_guard);
+    schedule_auto_webdav_backup(&app, &state);
+    let _ = app.emit("ciphernest://webdav-backup-status", ());
     Ok(status)
 }
 
@@ -1422,6 +1820,26 @@ fn require_sync_epoch(cancel_epoch: &watch::Sender<u64>, authorized_epoch: u64) 
     }
 }
 
+async fn await_backup_network<T, F>(
+    cancel_epoch: &watch::Sender<u64>,
+    authorized_epoch: u64,
+    operation: F,
+) -> VaultResult<T>
+where
+    F: Future<Output = VaultResult<T>>,
+{
+    let mut cancellation = cancel_epoch.subscribe();
+    require_sync_epoch(cancel_epoch, authorized_epoch)?;
+    tokio::select! {
+        biased;
+        changed = cancellation.changed() => {
+            let _ = changed;
+            Err(VaultError::Locked)
+        }
+        result = operation => result,
+    }
+}
+
 async fn await_sync_network<T, F>(
     cancel_epoch: &watch::Sender<u64>,
     authorized_epoch: u64,
@@ -1444,6 +1862,73 @@ where
     }
 }
 
+fn require_existing_sync_epoch(
+    state: &AppState,
+    authorized_epoch: u64,
+    auto_epoch: Option<u64>,
+) -> VaultResult<()> {
+    require_sync_epoch(&state.sync_cancel_epoch, authorized_epoch)?;
+    if auto_epoch.is_some_and(|epoch| *state.auto_sync_cancel_epoch.borrow() != epoch) {
+        return Err(VaultError::Locked);
+    }
+    Ok(())
+}
+
+async fn await_existing_sync_network<T, F>(
+    state: &AppState,
+    authorized_epoch: u64,
+    auto_epoch: Option<u64>,
+    operation: F,
+) -> Result<T, SyncNetworkError>
+where
+    F: Future<Output = sync::SyncResult<T>>,
+{
+    let Some(auto_epoch) = auto_epoch else {
+        return await_sync_network(&state.sync_cancel_epoch, authorized_epoch, operation).await;
+    };
+    let mut cancellation = state.auto_sync_cancel_epoch.subscribe();
+    if *cancellation.borrow() != auto_epoch {
+        return Err(SyncNetworkError::Cancelled);
+    }
+    tokio::select! {
+        biased;
+        changed = cancellation.changed() => {
+            let _ = changed;
+            Err(SyncNetworkError::Cancelled)
+        }
+        result = await_sync_network(&state.sync_cancel_epoch, authorized_epoch, operation) => result,
+    }
+}
+
+async fn prepare_auto_commit_if_needed(
+    state: &AppState,
+    context: &mut ExistingSyncContext,
+    attempt: &mut AutoSyncAttempt,
+    auto_epoch: Option<u64>,
+) -> VaultResult<()> {
+    if auto_epoch.is_none() || attempt.commit_started {
+        return Ok(());
+    }
+    let expected_vault_id = context.vault_id.clone();
+    let expected_session_id = context.session_id.clone();
+    let expected_generation = context.generation;
+    let expected_digest = context.state_digest;
+    let next_digest = run_store(Arc::clone(&state.store), move |store| {
+        store.mark_auto_sync_commit_started(
+            &expected_vault_id,
+            &expected_session_id,
+            expected_generation,
+            &expected_digest,
+        )
+    })
+    .await?;
+    context.state.set_auto_commit_inflight(true);
+    context.state_digest = next_digest;
+    attempt.state_digest = next_digest;
+    attempt.commit_started = true;
+    Ok(())
+}
+
 fn next_sync_generation(current: u64) -> VaultResult<u64> {
     current
         .checked_add(1)
@@ -1451,20 +1936,32 @@ fn next_sync_generation(current: u64) -> VaultResult<u64> {
 }
 
 async fn commit_existing_sync_context(
-    app_state: &State<'_, AppState>,
+    app_state: &AppState,
     context: ExistingSyncContext,
     content_to_apply: Option<sync::SyncContent>,
+    background: bool,
 ) -> VaultResult<WebDavSyncStatus> {
     let store = Arc::clone(&app_state.store);
     run_store(store, move |store| {
-        store.commit_sync_result(
-            &context.vault_id,
-            &context.session_id,
-            context.generation,
-            &context.state_digest,
-            &context.state,
-            content_to_apply,
-        )
+        if background {
+            store.commit_auto_sync_result(
+                &context.vault_id,
+                &context.session_id,
+                context.generation,
+                &context.state_digest,
+                &context.state,
+                content_to_apply,
+            )
+        } else {
+            store.commit_sync_result(
+                &context.vault_id,
+                &context.session_id,
+                context.generation,
+                &context.state_digest,
+                &context.state,
+                content_to_apply,
+            )
+        }
     })
     .await
 }
@@ -1759,6 +2256,90 @@ mod tests {
         FORMAT_VERSION,
     };
 
+    #[tokio::test]
+    async fn cancelled_backup_network_drops_the_in_flight_request() {
+        struct DropMarker(Arc<AtomicBool>);
+        impl Drop for DropMarker {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let (cancel_epoch, _) = watch::channel(0_u64);
+        let request_epoch = cancel_epoch.clone();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_for_request = Arc::clone(&dropped);
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            await_backup_network(&request_epoch, 0, async move {
+                let _marker = DropMarker(dropped_for_request);
+                let _ = started.send(());
+                std::future::pending::<VaultResult<()>>().await
+            })
+            .await
+        });
+        ready.await.unwrap();
+        cancel_epoch.send_modify(|epoch| *epoch += 1);
+        let result = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(result, Err(VaultError::Locked)));
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn automatic_sync_pauses_on_untrusted_history_but_retries_transient_network_errors() {
+        for error in [
+            SyncError::RollbackOrFork,
+            SyncError::ChainTooLong,
+            SyncError::HashMismatch,
+            SyncError::InvalidRemoteObject,
+            SyncError::UnsafeServer,
+        ] {
+            assert!(auto_sync_checkpoint_error(&error.into()));
+        }
+        for error in [
+            SyncError::Transport,
+            SyncError::Timeout,
+            SyncError::UnexpectedStatus(401),
+            SyncError::ConcurrentUpdate,
+        ] {
+            assert!(!auto_sync_checkpoint_error(&error.into()));
+        }
+    }
+
+    #[test]
+    fn automatic_sync_fast_retry_is_bounded_and_backed_off() {
+        assert_eq!(auto_sync_fast_retry_delay(0), Some(Duration::from_secs(3)));
+        assert_eq!(auto_sync_fast_retry_delay(1), Some(Duration::from_secs(6)));
+        assert_eq!(auto_sync_fast_retry_delay(2), None);
+        assert_eq!(auto_sync_fast_retry_delay(u64::MAX), None);
+    }
+
+    #[test]
+    fn session_check_time_is_only_reported_for_enabled_automatic_sync() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(directory.path().join("vault.cnvault"));
+        state.last_auto_check_at.store(123, Ordering::Release);
+        let absent = with_session_auto_check(WebDavSyncStatus::not_configured(), &state);
+        assert_eq!(absent.last_auto_check_at, None);
+
+        let mut configured = WebDavSyncStatus::not_configured();
+        configured.configured = true;
+        assert_eq!(
+            with_session_auto_check(configured.clone(), &state).last_auto_check_at,
+            None
+        );
+        configured.automatic = true;
+        assert_eq!(
+            with_session_auto_check(configured, &state).last_auto_check_at,
+            Some(123)
+        );
+        state.cancel_sync_operations();
+        assert_eq!(state.last_auto_check_at.load(Ordering::Acquire), 0);
+    }
+
     fn test_envelope(vault_id: &str) -> VaultEnvelope {
         VaultEnvelope {
             format: FORMAT_NAME.into(),
@@ -1811,6 +2392,7 @@ mod tests {
             envelope: test_envelope(&vault_id),
             verified: None,
             target_fingerprint: None,
+            backup_config_after_restore: None,
         }
     }
 
@@ -1945,6 +2527,7 @@ mod tests {
             envelope: legacy_envelope,
             verified: None,
             target_fingerprint: None,
+            backup_config_after_restore: None,
         })));
         commit_verified_restore(
             &pending,
@@ -2011,6 +2594,39 @@ mod tests {
         assert!(store.lock());
         assert!(store.unlock(current_password).is_err());
         assert!(store.unlock(backup_password).unwrap().unlocked);
+    }
+
+    #[test]
+    fn restore_preparation_upgrades_weak_slot_and_accepts_verified_historical_password() {
+        let password = "a long independent backup passphrase";
+        let data = test_data(&Uuid::new_v4().to_string());
+        let (strong, root_key) = create_envelope(password, &data).unwrap();
+        let weak =
+            crate::crypto::rewrap_with_test_kdf(password, &strong, &root_key, 19 * 1024, 1, 1)
+                .unwrap();
+        let source_bytes = serde_json::to_vec(&weak).unwrap();
+        let prepared = prepare_verified_restore(password, weak.clone()).unwrap();
+        assert_eq!(prepared.source_generation, weak.generation);
+        assert_eq!(prepared.envelope.kdf.memory_kib, 64 * 1024);
+        assert_eq!(prepared.envelope.kdf.iterations, 3);
+        assert_eq!(prepared.envelope.payload, weak.payload);
+        assert_eq!(serde_json::to_vec(&weak).unwrap(), source_bytes);
+        assert_eq!(
+            decrypt_envelope(password, &prepared.envelope)
+                .unwrap()
+                .0
+                .as_ref(),
+            root_key.as_ref()
+        );
+
+        let short_password = "oldpass";
+        let mut legacy_data = data;
+        legacy_data.password_only_unlock = false;
+        let (historical, _) =
+            create_envelope_with_verified_password(short_password, &legacy_data).unwrap();
+        let migrated = prepare_verified_restore(short_password, historical).unwrap();
+        assert!(migrated.verified.data.password_only_unlock);
+        assert!(decrypt_envelope(short_password, &migrated.envelope).is_ok());
     }
 
     #[test]

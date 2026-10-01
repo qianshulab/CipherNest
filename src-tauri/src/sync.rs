@@ -181,6 +181,14 @@ pub struct LocalSyncState {
     base_snapshot: Option<SyncSnapshot>,
     last_local_generation: u64,
     last_sync_at: Option<u64>,
+    #[serde(default)]
+    automatic: bool,
+    #[serde(default)]
+    auto_paused: bool,
+    #[serde(default)]
+    auto_warning: Option<String>,
+    #[serde(default)]
+    auto_commit_inflight: bool,
 }
 
 impl LocalSyncState {
@@ -206,6 +214,41 @@ impl LocalSyncState {
 
     pub fn last_sync_at(&self) -> Option<u64> {
         self.last_sync_at
+    }
+
+    pub fn automatic(&self) -> bool {
+        self.automatic
+    }
+
+    pub fn auto_paused(&self) -> bool {
+        self.auto_paused
+    }
+
+    pub fn auto_warning(&self) -> Option<&str> {
+        self.auto_warning.as_deref()
+    }
+
+    pub fn auto_commit_inflight(&self) -> bool {
+        self.auto_commit_inflight
+    }
+
+    pub fn set_automatic(&mut self, enabled: bool) {
+        self.automatic = enabled;
+    }
+
+    pub fn set_auto_issue(&mut self, warning: String, paused: bool) {
+        self.auto_warning = Some(warning);
+        self.auto_paused = paused;
+    }
+
+    pub fn clear_auto_issue(&mut self) {
+        self.auto_warning = None;
+        self.auto_paused = false;
+        self.auto_commit_inflight = false;
+    }
+
+    pub fn set_auto_commit_inflight(&mut self, active: bool) {
+        self.auto_commit_inflight = active;
     }
 
     /// Returns the high-value recovery secret in an auto-zeroizing buffer.
@@ -310,16 +353,19 @@ impl WebDavClient {
         let app_password = Zeroizing::new(app_password);
         let endpoint = validate_webdav_endpoint(endpoint)?;
         validate_credentials(&username, &app_password)?;
-        let client = reqwest::Client::builder()
+        let builder = reqwest::Client::builder()
             .https_only(true)
             .redirect(reqwest::redirect::Policy::none())
             .min_tls_version(TlsVersion::TLS_1_2)
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(45))
             .no_proxy()
-            .user_agent("CipherNest-WebDAV/1")
-            .build()
-            .map_err(|_| SyncError::Transport)?;
+            .user_agent("CipherNest-WebDAV/1");
+        // Use the same Windows trust store and intermediate-certificate
+        // discovery as encrypted WebDAV backup.
+        #[cfg(target_os = "windows")]
+        let builder = builder.use_native_tls();
+        let client = builder.build().map_err(|_| SyncError::Transport)?;
         Ok(Self {
             client,
             endpoint,
@@ -853,6 +899,10 @@ impl WebDavClient {
             base_snapshot: Some(cursor.snapshot.clone()),
             last_local_generation,
             last_sync_at: Some(now),
+            automatic: true,
+            auto_paused: false,
+            auto_warning: None,
+            auto_commit_inflight: false,
         };
         validate_local_state(&state)?;
         Ok(state)
@@ -1821,6 +1871,11 @@ fn validate_local_state(state: &LocalSyncState) -> SyncResult<()> {
     if state.state_version != SYNC_VERSION
         || state.last_local_generation == 0
         || state.last_sync_at == Some(0)
+        || state
+            .auto_warning
+            .as_ref()
+            .is_some_and(|warning| warning.len() > 512 || warning.is_empty())
+        || (state.auto_paused && state.auto_warning.is_none())
     {
         return Err(SyncError::InvalidLocalState);
     }
@@ -2655,6 +2710,30 @@ mod tests {
     }
 
     #[test]
+    fn newly_created_sync_space_enables_automatic_checks() {
+        let client = WebDavClient::new(
+            "https://dav.example.test/ciphernest/",
+            "alice".into(),
+            "application-password".into(),
+        )
+        .unwrap();
+        let (material, _) = generate_recovery_material().unwrap();
+        let first = snapshot(&material.sync_id, 1, None, Vec::new(), Vec::new());
+        let device_id = first.device_id.clone();
+        let cursor = RemoteCursor {
+            snapshot_hash: "a".repeat(64),
+            head_etag: "\"v1\"".into(),
+            snapshot: first,
+            proven_checkpoint: None,
+        };
+        let state = client
+            .state_for_created_remote(&material, &device_id, 1, 1, &cursor)
+            .unwrap();
+        assert!(state.automatic());
+        assert!(!state.auto_paused());
+    }
+
+    #[test]
     fn endpoint_validation_is_https_and_credential_free() {
         assert!(validate_webdav_endpoint("https://dav.example.test/ciphernest/").is_ok());
         assert!(validate_webdav_endpoint("http://dav.example.test/ciphernest/").is_err());
@@ -2920,6 +2999,10 @@ mod tests {
             base_snapshot: None,
             last_local_generation: 1,
             last_sync_at: None,
+            automatic: false,
+            auto_paused: false,
+            auto_warning: None,
+            auto_commit_inflight: false,
         };
         let root = [9_u8; KEY_BYTES];
         write_local_sync_state(&path, &vault_id, &root, &state).unwrap();
@@ -2929,6 +3012,16 @@ mod tests {
             .any(|window| { window == state.app_password.as_bytes() }));
         let mut loaded = read_local_sync_state(&path, &vault_id, &root).unwrap();
         assert_eq!(loaded.app_password, state.app_password);
+        let mut old_format = serde_json::to_value(&state).unwrap();
+        let object = old_format.as_object_mut().unwrap();
+        object.remove("automatic");
+        object.remove("autoPaused");
+        object.remove("autoWarning");
+        object.remove("autoCommitInflight");
+        let legacy_state: LocalSyncState = serde_json::from_value(old_format).unwrap();
+        assert!(!legacy_state.automatic());
+        assert!(!legacy_state.auto_paused());
+        assert!(!legacy_state.auto_commit_inflight());
         assert!(validate_local_generation(&loaded, 1).is_ok());
         loaded.last_local_generation = 2;
         assert!(matches!(

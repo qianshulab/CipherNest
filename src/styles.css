@@ -1569,6 +1569,20 @@ p {
   backdrop-filter: blur(10px);
 }
 
+.editor-conflict-notice {
+  flex-wrap: wrap;
+  align-items: center;
+  margin: 16px 22px 0;
+}
+
+.editor-conflict-notice p {
+  flex: 1 1 260px;
+}
+
+.editor-conflict-notice .button {
+  margin-left: 27px;
+}
+
 .editor-identity,
 .editor-header-actions {
   display: flex;
@@ -1987,6 +2001,10 @@ p {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
+.settings-webdav-overview {
+  margin-bottom: 16px;
+}
+
 .settings-column {
   display: grid;
   min-width: 0;
@@ -2214,6 +2232,11 @@ p {
 .webdav-backup-automatic input {
   margin-top: 2px;
   accent-color: var(--orange);
+}
+
+.webdav-backup-automatic-help {
+  margin: 6px 0 0 25px;
+  line-height: 1.5;
 }
 
 .webdav-backup-feedback {
@@ -2550,22 +2573,40 @@ p {
   gap: 7px;
 }
 
+.statusbar-group {
+  flex: 1;
+  overflow: hidden;
+}
+
 .statusbar-group svg {
   color: var(--green);
 }
 
-.statusbar-sync-link {
+.statusbar-sync-link,
+.statusbar-backup-link {
   min-width: 0;
+  overflow: hidden;
   border: 0;
   padding: 0;
   background: transparent;
   color: inherit;
   font: inherit;
   text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   cursor: pointer;
 }
 
-.statusbar-sync-link:hover {
+.statusbar-backup-link {
+  color: var(--yellow);
+}
+
+.statusbar-backup-link.has-error {
+  color: var(--red);
+}
+
+.statusbar-sync-link:hover,
+.statusbar-backup-link:hover {
   color: var(--yellow);
 }
 

@@ -36,10 +36,14 @@ export interface RestorePreview {
 
 export interface WebDavSyncStatus {
   configured: boolean;
+  automatic?: boolean;
+  autoPaused?: boolean;
+  autoWarning?: string;
   endpointHost?: string;
   username?: string;
   syncIdShort?: string;
   lastSyncAt?: number;
+  lastAutoCheckAt?: number;
   remoteSequence?: number;
   pendingLocalChanges: boolean;
 }
