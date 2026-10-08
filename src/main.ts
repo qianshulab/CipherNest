@@ -322,6 +322,7 @@ let activeModalClose: (() => void) | null = null;
 let modalSequence = 0;
 let trustedSystemInteractionDepth = 0;
 let settingsUiEpoch = -1;
+let searchCompositionActive = false;
 const revealedSensitiveInputs = new Set<ManagedSensitiveInput>();
 let revealedNotesInput: HTMLTextAreaElement | null = null;
 let notesRevealButton: HTMLButtonElement | null = null;
@@ -473,7 +474,7 @@ async function refreshAfterAutoSyncedContent(): Promise<void> {
       const selectedId = state.selectedId;
       const [overview, list] = await Promise.allSettled([
         loadVaultOverview(epoch),
-        loadEntries(false, epoch, false, false),
+        loadEntries(false, epoch, false),
       ]);
       if (epoch !== state.epoch || !state.status.unlocked) return;
       if (overview.status === "rejected" || list.status === "rejected" || (list.status === "fulfilled" && !list.value)) {
@@ -1175,9 +1176,24 @@ function createPasswordField(
 
 function renderMainShell(): void {
   if (!state.status.unlocked) {
+    searchCompositionActive = false;
     renderGate();
     return;
   }
+  const focusedSearch = document.activeElement instanceof HTMLInputElement
+    && document.activeElement.id === "vault-search"
+    && (state.view === "all" || state.view === "favorites")
+    ? document.activeElement
+    : null;
+  if (searchCompositionActive && focusedSearch && !hasOpenModal()) return;
+  searchCompositionActive = false;
+  const searchSelection = focusedSearch
+    ? {
+        start: focusedSearch.selectionStart ?? focusedSearch.value.length,
+        end: focusedSearch.selectionEnd ?? focusedSearch.value.length,
+        direction: focusedSearch.selectionDirection ?? undefined,
+      }
+    : null;
   const reusableSettingsCards = state.view === "settings" && settingsUiEpoch === state.epoch
     ? {
         security: app.querySelector<HTMLElement>(".settings-security-card"),
@@ -1223,6 +1239,13 @@ function renderMainShell(): void {
   if (!hasOpenModal()) restoreViewPosition(app, position, state.view);
   if (!hasOpenModal() && state.view !== "settings" && !hasUnsavedDraft()) {
     pendingRemoteContentRender = false;
+  }
+  if (searchSelection && !hasOpenModal()) {
+    const search = document.querySelector<HTMLInputElement>("#vault-search");
+    if (search) {
+      search.focus({ preventScroll: true });
+      search.setSelectionRange(searchSelection.start, searchSelection.end, searchSelection.direction);
+    }
   }
 }
 
@@ -1450,6 +1473,9 @@ async function switchView(view: VaultView): Promise<void> {
     if (!discard) return;
   }
   if (state.view === "settings" && !await confirmLeavingUnsavedSettings()) return;
+  if (listDebounce) window.clearTimeout(listDebounce);
+  listDebounce = null;
+  searchCompositionActive = false;
   clearEntryDraft();
   state.view = view;
   state.conflictsOnly = false;
@@ -1517,33 +1543,62 @@ function renderEntryList(): HTMLElement {
   searchWrap.append(icon("search", 17));
   const search = makeElement("input", "search-input") as HTMLInputElement;
   search.id = "vault-search";
-  search.type = "password";
+  search.type = "text";
   search.placeholder = "搜索名称、账号、用途或标签";
   search.value = state.query;
   search.autocomplete = "off";
   search.spellcheck = false;
-  search.setAttribute("aria-label", "搜索保险库条目（内容已隐藏）");
-  let managedSearch: ManagedSensitiveInput;
-  const searchReveal = iconButton("显示搜索内容", "eye", () => {
-    if (search.type === "password") revealManagedSensitiveInput(managedSearch);
-    else hideManagedSensitiveInput(managedSearch);
-  }, "search-reveal");
-  searchReveal.setAttribute("aria-pressed", "false");
+  search.setAttribute("aria-label", "搜索保险库条目");
   const searchActions = makeElement("div", "search-actions");
   const clearSearch = iconButton("清除搜索", "x", () => {
+    if (listDebounce) window.clearTimeout(listDebounce);
+    listDebounce = null;
+    searchCompositionActive = false;
     state.query = "";
-    hideManagedSensitiveInput(managedSearch);
-    void loadEntries(true, undefined, true);
+    search.value = "";
+    search.focus();
+    void loadEntries(true);
   }, "search-clear");
   setOptionalActionAvailable(clearSearch, Boolean(state.query));
-  managedSearch = { input: search, button: searchReveal, label: "搜索内容", timeout: null };
-  search.addEventListener("input", () => {
+  const queueSearch = () => {
+    if (!search.isConnected || !state.status.unlocked || (state.view !== "all" && state.view !== "favorites")) return;
+    if (listDebounce) window.clearTimeout(listDebounce);
+    listDebounce = window.setTimeout(() => {
+      listDebounce = null;
+      if (state.status.unlocked && (state.view === "all" || state.view === "favorites")) {
+        void loadEntries(true);
+      }
+    }, 220);
+  };
+  search.addEventListener("input", (event) => {
+    if (!search.isConnected) return;
+    state.query = search.value;
+    listRequestId += 1;
+    setOptionalActionAvailable(clearSearch, Boolean(search.value));
+    if (searchCompositionActive || (event as InputEvent).isComposing) return;
+    queueSearch();
+  });
+  search.addEventListener("compositionstart", () => {
+    searchCompositionActive = true;
+    listRequestId += 1;
+    if (listDebounce) window.clearTimeout(listDebounce);
+    listDebounce = null;
+  });
+  search.addEventListener("compositionend", () => {
+    if (!search.isConnected) return;
+    searchCompositionActive = false;
     state.query = search.value;
     setOptionalActionAvailable(clearSearch, Boolean(search.value));
-    if (listDebounce) window.clearTimeout(listDebounce);
-    listDebounce = window.setTimeout(() => void loadEntries(true), 220);
+    queueSearch();
   });
-  searchActions.append(searchReveal, clearSearch);
+  search.addEventListener("blur", () => {
+    if (!search.isConnected) return;
+    if (!searchCompositionActive) return;
+    searchCompositionActive = false;
+    state.query = search.value;
+    queueSearch();
+  });
+  searchActions.append(clearSearch);
   searchWrap.append(search, searchActions);
   header.append(searchWrap);
 
@@ -2933,7 +2988,7 @@ async function applyWebDavOutcome(outcome: WebDavSyncOutcome, operationEpoch: nu
   if (outcome.kind === "downloaded" || outcome.kind === "merged") {
     clearEntryDraft();
     state.report = null;
-    listRefreshed = await loadEntries(false, operationEpoch, false, false);
+    listRefreshed = await loadEntries(false, operationEpoch, false);
   }
   await loadVaultOverview(operationEpoch).catch(() => undefined);
   if (operationEpoch !== state.epoch || !state.status.unlocked) return;
@@ -3141,7 +3196,7 @@ async function joinWebDavSyncV2Space(): Promise<void> {
       state.syncV2RemoteOutcomeUnknown = joinSubmitted;
       state.webdavV2Retry = null;
       await Promise.allSettled([
-        loadEntries(false, operationEpoch, false, false),
+        loadEntries(false, operationEpoch, false),
         loadVaultOverview(operationEpoch),
         refreshWebDavBackupStatus(operationEpoch),
       ]);
@@ -3720,7 +3775,6 @@ async function showSyncConflictEntries(): Promise<void> {
 async function loadEntries(
   render = true,
   requestedEpoch = state.epoch,
-  restoreSearchFocus = false,
   notifyFailure = true,
 ): Promise<boolean> {
   const epoch = requestedEpoch;
@@ -3752,7 +3806,6 @@ async function loadEntries(
         const list = document.querySelector<HTMLElement>(".entry-list");
         if (list) list.scrollTop = 0;
       }
-      if (restoreSearchFocus) focusSearchAtEnd();
     }
     return true;
   } catch {
@@ -3953,7 +4006,7 @@ async function saveCurrentEntry(button?: HTMLButtonElement): Promise<boolean> {
     recordLocalSyncMutation();
     state.selectedId = summary.id;
     state.status.itemCount = Math.max(state.status.itemCount, state.entries.length + (input.id ? 0 : 1));
-    const listRefreshed = await loadEntries(false, epoch, false, false);
+    const listRefreshed = await loadEntries(false, epoch, false);
     await loadVaultOverview(epoch).catch(() => undefined);
     await refreshSyncStatusAfterMutation(epoch);
     const entry = await invokeCommand<VaultEntry>("get_entry", { id: summary.id });
@@ -4008,7 +4061,7 @@ async function saveCurrentEntry(button?: HTMLButtonElement): Promise<boolean> {
       clearEntryDraft();
       await loadVaultOverview(epoch).catch(() => undefined);
       await refreshSyncStatusAfterMutation(epoch);
-      const listRefreshed = await loadEntries(true, epoch, false, false);
+      const listRefreshed = await loadEntries(true, epoch, false);
       showToast(
         listRefreshed
           ? "条目已保存，但详情刷新失败。请重新打开条目确认内容。"
@@ -4165,7 +4218,7 @@ async function deleteCurrentEntry(): Promise<void> {
     state.report = null;
     await loadVaultOverview(epoch).catch(() => undefined);
     await refreshSyncStatusAfterMutation(epoch);
-    const listRefreshed = await loadEntries(true, epoch, false, false);
+    const listRefreshed = await loadEntries(true, epoch, false);
     showToast(
       listRefreshed
         ? "条目已删除。既有快照和导出文件不会被自动修改。"
@@ -4177,7 +4230,7 @@ async function deleteCurrentEntry(): Promise<void> {
     if (state.entryMutation === "deleting") state.entryMutation = null;
     setEntryEditorFrozen(false);
     if (isEntryRevisionConflict(error)) {
-      const listRefreshed = await loadEntries(true, epoch, false, false);
+      const listRefreshed = await loadEntries(true, epoch, false);
       showToast(
         listRefreshed
           ? "该条目已有新版本，未执行删除。请重新打开条目，核对最新内容后再操作。"
@@ -4222,7 +4275,7 @@ async function toggleFavorite(entry: EntrySummary): Promise<void> {
     }
     const [, listRefreshed] = await Promise.all([
       loadVaultOverview(epoch).catch(() => undefined),
-      loadEntries(false, epoch, false, false),
+      loadEntries(false, epoch, false),
       refreshSyncStatusAfterMutation(epoch),
     ]);
     if (epoch !== state.epoch || !state.status.unlocked || state.entryMutation !== "favoriting") return;
@@ -4234,7 +4287,7 @@ async function toggleFavorite(entry: EntrySummary): Promise<void> {
     if (state.entryMutation === "favoriting") state.entryMutation = null;
     setEntryEditorFrozen(false);
     if (isEntryRevisionConflict(error)) {
-      const listRefreshed = await loadEntries(true, epoch, false, false);
+      const listRefreshed = await loadEntries(true, epoch, false);
       showToast(
         listRefreshed
           ? "该条目已有新版本，收藏状态未修改。请重新打开条目后再操作。"
@@ -4287,7 +4340,7 @@ async function toggleCurrentFavorite(): Promise<void> {
     }
     await loadVaultOverview(epoch).catch(() => undefined);
     await refreshSyncStatusAfterMutation(epoch);
-    const listRefreshed = await loadEntries(false, epoch, false, false);
+    const listRefreshed = await loadEntries(false, epoch, false);
     if (
       epoch !== state.epoch
       || !state.status.unlocked
@@ -4302,7 +4355,7 @@ async function toggleCurrentFavorite(): Promise<void> {
     if (state.entryMutation === "favoriting") state.entryMutation = null;
     setEntryEditorFrozen(false);
     if (isEntryRevisionConflict(error)) {
-      const listRefreshed = await loadEntries(true, epoch, false, false);
+      const listRefreshed = await loadEntries(true, epoch, false);
       showToast(
         listRefreshed
           ? "该条目已有新版本，收藏状态未修改。请重新打开条目后再操作。"
@@ -4874,7 +4927,7 @@ async function applyGeneratedPassword(button: HTMLButtonElement): Promise<void> 
       );
       return;
     }
-    const listRefreshed = await loadEntries(true, epoch, false, false);
+    const listRefreshed = await loadEntries(true, epoch, false);
     const detailOpened = await selectEntry(summary.id);
     const backupNeedsAttention = currentAutoBackupNeedsAttention();
     showToast(
@@ -5597,6 +5650,9 @@ function clearSensitiveState(clearMetadata: boolean): void {
   state.syncV2StatusUncertain = false;
   state.webdavV2Retry = null;
   hideAllManagedSensitiveInputs();
+  searchCompositionActive = false;
+  if (listDebounce) window.clearTimeout(listDebounce);
+  listDebounce = null;
   hidePassword();
   hideGeneratorPassword();
   hideNotes();

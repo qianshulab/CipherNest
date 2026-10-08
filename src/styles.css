@@ -1131,7 +1131,7 @@ p {
   height: 36px;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  padding: 8px 68px 8px 34px;
+  padding: 8px 40px 8px 34px;
   background: var(--field);
   color: var(--text);
   font-size: 11px;
@@ -1154,8 +1154,7 @@ p {
   gap: 1px;
 }
 
-.search-clear,
-.search-reveal {
+.search-clear {
   display: flex;
   width: 28px;
   height: 28px;
@@ -1173,8 +1172,7 @@ p {
   display: none;
 }
 
-.search-clear:hover,
-.search-reveal:hover {
+.search-clear:hover {
   background: rgba(255, 255, 255, 0.05);
   color: var(--text);
 }
