@@ -5,6 +5,7 @@ import { describeBackupFailure, restoreRejectedBeforeWrite, type BackupPhase } f
 import { describeEntrySaveFailure, describeUnlockFailure, type EntryField } from "./entry-errors";
 import { visibleListRows } from "./list-window";
 import { estimateMasterPassword, hasObviousMasterPasswordPattern } from "./master-password";
+import { getWebDavV2SyncPresentation } from "./sync-status";
 import { captureViewPosition, restoreViewPosition } from "./view-state";
 import "./styles.css";
 
@@ -115,6 +116,7 @@ interface ManagedSensitiveInput {
   button: HTMLButtonElement;
   label: string;
   timeout: ReturnType<typeof setTimeout> | null;
+  composing: boolean;
 }
 
 interface AppState {
@@ -301,6 +303,7 @@ let listDebounce: ReturnType<typeof setTimeout> | null = null;
 let generatorDebounce: ReturnType<typeof setTimeout> | null = null;
 let revealTimeout: ReturnType<typeof setTimeout> | null = null;
 let revealTicker: ReturnType<typeof setInterval> | null = null;
+let entryPasswordComposing = false;
 let generatorRevealTimeout: ReturnType<typeof setTimeout> | null = null;
 let clipboardTimeout: ReturnType<typeof setTimeout> | null = null;
 let clipboardTicker: ReturnType<typeof setInterval> | null = null;
@@ -327,6 +330,7 @@ const revealedSensitiveInputs = new Set<ManagedSensitiveInput>();
 let revealedNotesInput: HTMLTextAreaElement | null = null;
 let notesRevealButton: HTMLButtonElement | null = null;
 let notesRevealTimeout: ReturnType<typeof setTimeout> | null = null;
+let notesComposing = false;
 
 function emptyGeneratorDraft(): GeneratorDraft {
   return { title: "", username: "", purpose: "", url: "", tags: [] };
@@ -484,6 +488,7 @@ async function refreshAfterAutoSyncedContent(): Promise<void> {
       }
       if (
         hasUnsavedDraft()
+        || isEditingEntryInput()
         || state.entryMutation !== null
         || state.securityOperation !== null
         || state.syncOperation !== null
@@ -507,6 +512,7 @@ async function refreshAfterAutoSyncedContent(): Promise<void> {
               && state.status.unlocked
               && state.selectedId === selectedId
               && !hasUnsavedDraft()
+              && !isEditingEntryInput()
               && state.entryMutation === null
             ) {
               hidePassword();
@@ -532,7 +538,7 @@ async function refreshAfterAutoSyncedContent(): Promise<void> {
         }
       }
       if (epoch !== state.epoch || !state.status.unlocked) return;
-      if (hasUnsavedDraft()) {
+      if (hasUnsavedDraft() || isEditingEntryInput()) {
         pendingRemoteContentRender = true;
         showToast("其他设备的修改已合并到本机。当前编辑仍保留，请核对后再保存。", "warning", 7600);
         continue;
@@ -725,6 +731,7 @@ function deactivateModal(): void {
         || !state.status.unlocked
         || hasOpenModal()
         || hasUnsavedDraft()
+        || isEditingEntryInput()
         || state.entryMutation !== null
         || state.securityOperation !== null
         || state.syncOperation !== null
@@ -757,6 +764,7 @@ function nextModalIds(prefix: string): { title: string; description: string } {
 function hideManagedSensitiveInput(field: ManagedSensitiveInput): void {
   if (field.timeout) window.clearTimeout(field.timeout);
   field.timeout = null;
+  field.composing = false;
   field.input.type = "password";
   clearNode(field.button);
   field.button.append(icon("eye"));
@@ -764,6 +772,42 @@ function hideManagedSensitiveInput(field: ManagedSensitiveInput): void {
   field.button.setAttribute("aria-pressed", "false");
   field.button.title = `显示${field.label}`;
   revealedSensitiveInputs.delete(field);
+}
+
+function scheduleManagedSensitiveHide(field: ManagedSensitiveInput): void {
+  if (field.timeout) window.clearTimeout(field.timeout);
+  field.timeout = null;
+  if (!revealedSensitiveInputs.has(field) || field.composing) return;
+  const seconds = Math.max(1, state.settings.passwordRevealSeconds || DEFAULT_SETTINGS.passwordRevealSeconds);
+  field.timeout = window.setTimeout(() => hideManagedSensitiveInput(field), seconds * 1000);
+}
+
+function compositionRevealLimitMs(): number {
+  return Math.max(60_000, 3 * state.settings.passwordRevealSeconds * 1000);
+}
+
+function bindManagedSensitiveInput(field: ManagedSensitiveInput): void {
+  field.input.addEventListener("input", () => {
+    if (revealedSensitiveInputs.has(field) && !field.composing) scheduleManagedSensitiveHide(field);
+  });
+  field.input.addEventListener("compositionstart", () => {
+    field.composing = true;
+    if (field.timeout) window.clearTimeout(field.timeout);
+    field.timeout = revealedSensitiveInputs.has(field)
+      ? window.setTimeout(() => hideManagedSensitiveInput(field), compositionRevealLimitMs())
+      : null;
+  });
+  field.input.addEventListener("compositionend", () => {
+    field.composing = false;
+    scheduleManagedSensitiveHide(field);
+  });
+  field.input.addEventListener("blur", (event) => {
+    field.composing = false;
+    if (revealedSensitiveInputs.has(field)) {
+      if (event.relatedTarget === field.button) scheduleManagedSensitiveHide(field);
+      else hideManagedSensitiveInput(field);
+    }
+  });
 }
 
 function revealManagedSensitiveInput(field: ManagedSensitiveInput): void {
@@ -780,9 +824,8 @@ function revealManagedSensitiveInput(field: ManagedSensitiveInput): void {
   field.button.setAttribute("aria-label", `隐藏${field.label}`);
   field.button.setAttribute("aria-pressed", "true");
   field.button.title = `隐藏${field.label}`;
-  const seconds = Math.max(1, state.settings.passwordRevealSeconds || DEFAULT_SETTINGS.passwordRevealSeconds);
-  field.timeout = window.setTimeout(() => hideManagedSensitiveInput(field), seconds * 1000);
   revealedSensitiveInputs.add(field);
+  scheduleManagedSensitiveHide(field);
 }
 
 function hideAllManagedSensitiveInputs(): void {
@@ -800,6 +843,7 @@ function setEntryEditorFrozen(frozen: boolean): void {
     .forEach((control) => {
       control.disabled = frozen;
     });
+  updateEditorSaveState();
 }
 
 function blockEntryActionWhileMutating(): boolean {
@@ -1068,14 +1112,17 @@ function renderGate(): void {
   submit.type = "submit";
   form.append(submit);
 
-  const restore = makeButton("从加密备份恢复", "button button-ghost button-full", restoreBackup, "upload");
+  const recoveryActions = makeElement("div", "gate-recovery-actions");
+  recoveryActions.setAttribute("role", "group");
+  recoveryActions.setAttribute("aria-label", "恢复保险库");
+  const restore = makeButton("本机备份恢复", "button button-ghost button-full", restoreBackup, "upload");
   restore.dataset.securityMutation = "true";
   restore.disabled = state.securityOperation !== null;
-  form.append(restore);
-  const restoreRemote = makeButton("从 WebDAV 恢复", "button button-ghost button-full", () => restoreBackup("webdav"), "download");
+  const restoreRemote = makeButton("WebDAV 恢复", "button button-ghost button-full", () => restoreBackup("webdav"), "download");
   restoreRemote.dataset.securityMutation = "true";
   restoreRemote.disabled = state.securityOperation !== null;
-  form.append(restoreRemote);
+  recoveryActions.append(restore, restoreRemote);
+  form.append(recoveryActions);
 
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -1168,7 +1215,8 @@ function createPasswordField(
     else hideManagedSensitiveInput(managedField);
   });
   reveal.setAttribute("aria-pressed", "false");
-  managedField = { input, button: reveal, label: "密码", timeout: null };
+  managedField = { input, button: reveal, label: "密码", timeout: null, composing: false };
+  bindManagedSensitiveInput(managedField);
   inputWrap.append(input, reveal);
   wrapper.append(label, inputWrap);
   return { wrapper, input };
@@ -1187,6 +1235,7 @@ function renderMainShell(): void {
     : null;
   if (searchCompositionActive && focusedSearch && !hasOpenModal()) return;
   searchCompositionActive = false;
+  const focusedEntryInput = isEditingEntryInput();
   const searchSelection = focusedSearch
     ? {
         start: focusedSearch.selectionStart ?? focusedSearch.value.length,
@@ -1237,7 +1286,7 @@ function renderMainShell(): void {
   );
   updateClipboardStatus();
   if (!hasOpenModal()) restoreViewPosition(app, position, state.view);
-  if (!hasOpenModal() && state.view !== "settings" && !hasUnsavedDraft()) {
+  if (!hasOpenModal() && state.view !== "settings" && !hasUnsavedDraft() && !focusedEntryInput) {
     pendingRemoteContentRender = false;
   }
   if (searchSelection && !hasOpenModal()) {
@@ -1286,10 +1335,12 @@ function renderTopbar(): HTMLElement {
   const actions = makeElement("div", "topbar-actions");
   const generate = makeButton("生成密码", "button button-ghost topbar-button", () => openGenerator("standalone"), "key");
   generate.dataset.focusKey = "topbar-generator";
+  generate.setAttribute("aria-label", "生成密码");
   generate.title = shortcutTitle("G");
   generate.dataset.securityMutation = "true";
   const add = makeButton("新建条目", "button button-primary topbar-button", createNewEntry, "plus");
   add.dataset.focusKey = "topbar-add";
+  add.setAttribute("aria-label", "新建条目");
   add.title = shortcutTitle("N");
   add.dataset.securityMutation = "true";
   const lock = iconButton("立即锁定", "lock", manualLock, "icon-button lock-button");
@@ -1301,6 +1352,7 @@ function renderTopbar(): HTMLElement {
 }
 
 function renderSidebar(): HTMLElement {
+  const syncV2Summary = webDavV2SyncPresentation();
   const overlay = makeElement("div", `sidebar-overlay${state.mobileNavOpen ? " is-open" : ""}`);
   overlay.setAttribute("aria-hidden", "true");
   overlay.addEventListener("click", () => {
@@ -1361,12 +1413,8 @@ function renderSidebar(): HTMLElement {
     makeElement(
       "span",
       "",
-      state.syncV2StatusError
-        ? "多设备同步配置需检查"
-        : state.syncV2Status.autoPaused
-          ? "多设备自动同步已暂停"
-          : state.syncV2Status.configured
-            ? "WebDAV 多设备自动同步"
+      state.syncV2Status.configured || state.syncV2StatusError
+        ? `WebDAV 多设备同步 · ${syncV2Summary.label}`
       : state.syncStatusError
         ? "同步配置需在设置中处理"
         : state.syncStatus.autoPaused
@@ -1484,15 +1532,23 @@ async function switchView(view: VaultView): Promise<void> {
     state.reportLoading = true;
     state.reportError = false;
     renderMainShell();
+    focusCurrentViewHeading();
     await loadSecurityReport();
   } else if (view === "all" || view === "favorites") {
     state.listLoading = true;
     renderMainShell();
+    focusCurrentViewHeading();
     await loadEntries(true);
   } else {
     renderMainShell();
+    focusCurrentViewHeading();
     if (view === "settings") void refreshWebDavBackupStatus(state.epoch);
   }
+}
+
+function focusCurrentViewHeading(): void {
+  if (hasOpenModal()) return;
+  document.querySelector<HTMLElement>(".main-content [data-focus-key='view-heading']")?.focus({ preventScroll: true });
 }
 
 function hasUnsavedSettings(): boolean {
@@ -1532,6 +1588,8 @@ function renderEntryList(): HTMLElement {
   const header = makeElement("div", "list-header");
   const titleRow = makeElement("div", "list-title-row");
   const title = makeElement("h1", "panel-title", state.conflictsOnly ? "同步冲突" : state.view === "favorites" ? "收藏" : "全部条目");
+  title.dataset.focusKey = "view-heading";
+  title.tabIndex = -1;
   const count = makeElement("span", "count-chip", String(state.entries.length));
   count.setAttribute("role", "status");
   count.setAttribute("aria-live", "polite");
@@ -1557,6 +1615,7 @@ function renderEntryList(): HTMLElement {
     state.query = "";
     search.value = "";
     search.focus();
+    markListResultsPending();
     void loadEntries(true);
   }, "search-clear");
   setOptionalActionAvailable(clearSearch, Boolean(state.query));
@@ -1575,6 +1634,7 @@ function renderEntryList(): HTMLElement {
     state.query = search.value;
     listRequestId += 1;
     setOptionalActionAvailable(clearSearch, Boolean(search.value));
+    markListResultsPending();
     if (searchCompositionActive || (event as InputEvent).isComposing) return;
     queueSearch();
   });
@@ -1620,6 +1680,7 @@ function renderEntryList(): HTMLElement {
   }
   sort.addEventListener("change", () => {
     state.sort = sort.value as EntrySort;
+    markListResultsPending();
     void loadEntries(true);
   });
   selectWrap.append(sort, icon("chevron", 15));
@@ -1639,7 +1700,8 @@ function renderEntryList(): HTMLElement {
   list.dataset.scrollKey = "entry-list";
   list.setAttribute("role", "list");
   list.setAttribute("aria-busy", String(state.listLoading));
-  if (state.listLoading) {
+  const showPreviousResults = state.listLoading && !state.listError && state.entries.length > 0;
+  if (state.listLoading && !showPreviousResults) {
     const loadingStatus = makeElement("span", "sr-only", "正在读取条目列表…");
     loadingStatus.setAttribute("role", "status");
     list.append(loadingStatus);
@@ -1659,14 +1721,25 @@ function renderEntryList(): HTMLElement {
   } else if (!state.entries.length) {
     list.append(renderListEmpty());
   } else {
+    const rowTarget = showPreviousResults ? makeElement("div", "list-previous-results") : list;
+    if (showPreviousResults) {
+      count.textContent = "…";
+      count.setAttribute("aria-label", "正在更新条目列表");
+      const pending = makeElement("div", "list-refresh-notice");
+      pending.setAttribute("role", "status");
+      pending.append(makeElement("span", "spinner"), makeElement("span", "", "正在更新；下方为上次结果，更新完成后可操作"));
+      rowTarget.inert = true;
+      rowTarget.setAttribute("aria-hidden", "true");
+      list.append(pending);
+    }
     const windowed = visibleListRows(state.entries, state.visibleEntryCount, state.selectedId);
     if (windowed.selectedBeyondPage) {
       const selected = makeElement("div", "entry-pinned-selection");
       selected.append(makeElement("span", "entry-pinned-label", "当前打开的条目 · 位于后续列表"));
       selected.append(renderEntryRow(windowed.selectedBeyondPage));
-      list.append(selected);
+      rowTarget.append(selected);
     }
-    for (const entry of windowed.page) list.append(renderEntryRow(entry));
+    for (const entry of windowed.page) rowTarget.append(renderEntryRow(entry));
     if (state.entries.length > state.visibleEntryCount) {
       const progress = makeElement("div", "list-pagination");
       progress.setAttribute("role", "listitem");
@@ -1688,11 +1761,44 @@ function renderEntryList(): HTMLElement {
       });
       more.dataset.focusKey = "entry-load-more";
       progress.append(more);
-      list.append(progress);
+      rowTarget.append(progress);
+    }
+    if (showPreviousResults) {
+      rowTarget.querySelectorAll<HTMLButtonElement>("button").forEach((button) => { button.disabled = true; });
+      list.append(rowTarget);
     }
   }
   panel.append(list);
   return panel;
+}
+
+function markListResultsPending(): void {
+  state.listLoading = true;
+  const list = document.querySelector<HTMLElement>(".entry-list");
+  if (!list || list.classList.contains("is-pending") || list.querySelector(".list-refresh-notice")) return;
+  if (state.entries.length === 0) return;
+  list.classList.add("is-pending");
+  list.setAttribute("aria-busy", "true");
+  const count = document.querySelector<HTMLElement>(".list-title-row .count-chip");
+  if (count) {
+    count.textContent = "…";
+    count.setAttribute("aria-label", "正在更新条目列表");
+  }
+  const pending = makeElement("div", "list-refresh-notice");
+  pending.setAttribute("role", "status");
+  pending.append(
+    makeElement("span", "spinner"),
+    makeElement("span", "", state.entries.length > 0
+      ? "正在更新；下方为上次结果，更新完成后可操作"
+      : "正在更新条目列表…"),
+  );
+  list.prepend(pending);
+  for (const child of Array.from(list.children)) {
+    if (child === pending) continue;
+    (child as HTMLElement).inert = true;
+    child.setAttribute("aria-hidden", "true");
+    child.querySelectorAll<HTMLButtonElement>("button").forEach((button) => { button.disabled = true; });
+  }
 }
 
 function renderListSkeleton(): HTMLElement {
@@ -1715,6 +1821,8 @@ function renderListEmpty(): HTMLElement {
     empty.append(makeElement("h2", "", "没有匹配的条目"), makeElement("p", "", "未找到匹配的内容。"));
     empty.append(makeButton("清除搜索", "button button-ghost button-small", () => {
       state.query = "";
+      document.querySelector<HTMLInputElement>("#vault-search")?.focus();
+      markListResultsPending();
       void loadEntries(true);
     }, "x"));
   } else if (state.conflictsOnly) {
@@ -1820,11 +1928,24 @@ function renderEntryEditor(): HTMLElement {
   identity.append(avatar, copy);
   const controls = makeElement("div", "editor-header-actions");
   const favorite = iconButton(draft.favorite ? "取消收藏" : "收藏", "favorite", toggleCurrentFavorite, `icon-button${draft.favorite ? " is-favorite" : ""}`);
+  favorite.dataset.focusKey = "editor-favorite";
   favorite.setAttribute("aria-pressed", String(draft.favorite));
   controls.append(favorite);
   if (state.entryMeta.id) controls.append(iconButton("删除条目", "trash", deleteCurrentEntry, "icon-button danger-hover"));
   top.append(identity, controls);
   editor.append(top);
+
+  if (
+    state.entryMeta.id
+    && !state.listLoading
+    && !state.listError
+    && (state.query.trim() || state.view === "favorites" || state.conflictsOnly)
+    && !state.entries.some((entry) => entry.id === state.entryMeta.id)
+  ) {
+    const outsideFilter = makeElement("div", "inline-notice inline-notice-compact editor-filter-notice");
+    outsideFilter.append(icon("search", 17), makeElement("p", "", "当前条目不在左侧筛选结果中；仍可继续编辑并保存。"));
+    editor.append(outsideFilter);
+  }
 
   if (state.entryRevisionConflict) {
     const conflict = makeElement("div", "inline-notice inline-notice-warning editor-conflict-notice");
@@ -1870,9 +1991,32 @@ function renderEntryEditor(): HTMLElement {
   password.autocomplete = "new-password";
   password.spellcheck = false;
   password.maxLength = 4096;
-  password.addEventListener("input", () => {
+  password.addEventListener("input", (event) => {
     if (state.draft) state.draft.password = password.value;
     clearFieldError("entry-password");
+    if (state.passwordVisible && !entryPasswordComposing && !(event as InputEvent).isComposing) {
+      startPasswordRevealTimer();
+    }
+  });
+  password.addEventListener("compositionstart", () => {
+    entryPasswordComposing = true;
+    if (revealTimeout) window.clearTimeout(revealTimeout);
+    if (revealTicker) window.clearInterval(revealTicker);
+    revealTimeout = state.passwordVisible
+      ? window.setTimeout(hidePassword, compositionRevealLimitMs())
+      : null;
+    revealTicker = null;
+  });
+  password.addEventListener("compositionend", () => {
+    entryPasswordComposing = false;
+    if (state.passwordVisible) startPasswordRevealTimer();
+  });
+  password.addEventListener("blur", (event) => {
+    entryPasswordComposing = false;
+    if (state.passwordVisible) {
+      if (event.relatedTarget === reveal) startPasswordRevealTimer();
+      else hidePassword();
+    }
   });
   const secretActions = makeElement("div", "secret-actions");
   const reveal = iconButton(state.passwordVisible ? "隐藏密码" : "显示密码", state.passwordVisible ? "eyeOff" : "eye", togglePasswordVisibility);
@@ -1929,15 +2073,29 @@ function renderEntryEditor(): HTMLElement {
   revealNotesButton.setAttribute("aria-pressed", "false");
   const copyNotes = iconButton("复制备注", "copy", () => copySecret(state.draft?.notes ?? "", "备注"));
   setOptionalActionAvailable(copyNotes, Boolean(draft.notes));
-  notes.addEventListener("input", () => {
+  notes.addEventListener("input", (event) => {
     if (state.draft) state.draft.notes = notes.value;
     setOptionalActionAvailable(copyNotes, Boolean(notes.value));
     clearFieldError("entry-notes");
+    if (revealedNotesInput === notes && !notesComposing && !(event as InputEvent).isComposing) scheduleNotesHide();
+  });
+  notes.addEventListener("compositionstart", () => {
+    notesComposing = true;
+    if (notesRevealTimeout) window.clearTimeout(notesRevealTimeout);
+    notesRevealTimeout = revealedNotesInput === notes
+      ? window.setTimeout(hideNotes, compositionRevealLimitMs())
+      : null;
+  });
+  notes.addEventListener("compositionend", () => {
+    notesComposing = false;
     if (revealedNotesInput === notes) scheduleNotesHide();
   });
   notes.addEventListener("blur", (event) => {
-    // Let the reveal button handle its own click; hide when editing moves elsewhere.
-    if (event.relatedTarget !== revealNotesButton && revealedNotesInput === notes) hideNotes();
+    notesComposing = false;
+    if (revealedNotesInput === notes) {
+      if (event.relatedTarget === revealNotesButton) scheduleNotesHide();
+      else hideNotes();
+    }
   });
   const notesError = makeElement("p", "field-error");
   notesError.id = "entry-notes-error";
@@ -1964,22 +2122,12 @@ function renderEntryEditor(): HTMLElement {
 
   const footer = makeElement("footer", "editor-footer");
   const dirtyState = makeElement("div", "save-state");
-  dirtyState.append(makeElement("span", hasUnsavedDraft() ? "unsaved-dot" : "saved-dot"));
-  dirtyState.append(makeElement(
-    "span",
-    "",
-    state.entryMutation !== null
-      ? state.entryMutation === "saving"
-        ? "正在加密保存…"
-        : state.entryMutation === "deleting"
-          ? "正在删除条目…"
-          : "正在更新收藏…"
-      : hasUnsavedDraft()
-        ? "有未保存的修改"
-        : state.entryMeta.id
-          ? "已保存到本地"
-          : "填写后保存",
-  ));
+  const saveState = editorSaveState();
+  dirtyState.append(makeElement("span", saveState.dirty ? "unsaved-dot" : "saved-dot"));
+  const saveStateLabel = makeElement("span", "save-state-label", saveState.label);
+  saveStateLabel.setAttribute("role", "status");
+  saveStateLabel.setAttribute("aria-live", "polite");
+  dirtyState.append(saveStateLabel);
   const actions = makeElement("div", "editor-actions");
   const cancel = makeButton("取消", "button button-ghost", cancelEditing);
   const save = makeButton("保存条目", "button button-primary", async () => {
@@ -1992,6 +2140,18 @@ function renderEntryEditor(): HTMLElement {
   form.addEventListener("submit", (event) => {
     event.preventDefault();
     void saveCurrentEntry(save);
+  });
+  form.addEventListener("input", updateEditorSaveState);
+  form.addEventListener("focusout", () => {
+    window.setTimeout(() => {
+      if (
+        pendingRemoteContentRender
+        && state.status.unlocked
+        && !hasUnsavedDraft()
+        && !isEditingEntryInput()
+        && !hasOpenModal()
+      ) void refreshAfterAutoSyncedContent();
+    }, 0);
   });
   editor.append(form);
   if (state.passwordVisible) syncPasswordRevealHint();
@@ -2059,7 +2219,8 @@ function addSensitiveTextActions(
   field.input.addEventListener("input", () => {
     setOptionalActionAvailable(copy, Boolean(field.input.value));
   });
-  managedField = { input: field.input, button: reveal, label, timeout: null };
+  managedField = { input: field.input, button: reveal, label, timeout: null, composing: false };
+  bindManagedSensitiveInput(managedField);
   field.wrapper.insertBefore(inputWrap, field.input);
   actions.append(reveal, copy);
   inputWrap.append(field.input, actions);
@@ -2102,6 +2263,7 @@ function scheduleNotesHide(): void {
 function hideNotes(): void {
   if (notesRevealTimeout) window.clearTimeout(notesRevealTimeout);
   notesRevealTimeout = null;
+  notesComposing = false;
   const input = revealedNotesInput;
   if (input?.isConnected && !input.readOnly) {
     if (state.draft) state.draft.notes = input.value;
@@ -2519,25 +2681,31 @@ function renderSettingsPage(): HTMLElement {
 }
 
 function renderWebDavOverview(): HTMLElement {
-  const syncSummary = state.syncV2StatusError
-    ? "配置需检查"
-    : !state.syncV2Status.configured
-      ? "尚未设置"
-      : state.syncV2Status.autoPaused
-        ? "自动同步已暂停"
-        : "自动运行";
-  const webdavOverview = makeElement("div", "inline-notice inline-notice-compact settings-webdav-overview");
+  const summary = webDavV2SyncPresentation();
+  const needsAttention = summary.tone === "error" || summary.tone === "warning" || summary.tone === "pending";
+  const webdavOverview = makeElement(
+    "div",
+    `inline-notice inline-notice-compact settings-webdav-overview${needsAttention ? " inline-notice-warning" : ""}`,
+  );
   webdavOverview.append(icon("shield", 17));
   const webdavOverviewText = makeElement("p");
   webdavOverviewText.append(
     makeElement("strong", "", "WebDAV 多设备同步"),
     document.createElement("br"),
     document.createTextNode(
-      `状态：${syncSummary}。多设备同步会传递已保存条目的修改；请继续保留独立的加密备份。`,
+      `状态：${summary.label}。${summary.hint}多设备同步会传递已保存条目的修改；请继续保留独立的加密备份。`,
     ),
   );
   webdavOverview.append(webdavOverviewText);
   return webdavOverview;
+}
+
+function webDavV2SyncPresentation() {
+  return getWebDavV2SyncPresentation(state.syncV2Status, {
+    configError: state.syncV2StatusError,
+    statusUncertain: state.syncV2StatusUncertain,
+    remoteOutcomeUnknown: state.syncV2RemoteOutcomeUnknown,
+  });
 }
 
 function reflowSettingsLayout(): void {
@@ -2657,17 +2825,19 @@ function renderWebDavSyncSettingsCard(): HTMLElement {
   card.append(settingsCardHeader("shield", "WebDAV 多设备同步", "使用现有的 HTTPS WebDAV 目录，在设备间自动同步已保存的条目。"));
   const content = makeElement("div", "sync-status");
   const status = state.syncV2Status;
-  const needsAttention = state.syncV2StatusError || Boolean(status.autoPaused || status.autoWarning);
-  const badge = makeElement("div", `sync-badge${needsAttention ? " has-error" : status.configured ? " is-enabled" : ""}`);
+  const summary = webDavV2SyncPresentation();
+  const badgeTone = summary.tone === "error" ? " has-error"
+    : summary.tone === "warning" || summary.tone === "pending" ? " is-warning"
+      : summary.tone === "ready" ? " is-enabled" : "";
+  const badge = makeElement("div", `sync-badge${badgeTone}`);
   badge.append(
-    makeElement("span", `status-dot${needsAttention ? " status-dot-error" : status.configured ? "" : " status-dot-muted"}`),
-    makeElement("strong", "", state.syncV2StatusError
-      ? "本机同步配置需检查"
-      : status.autoPaused
-        ? "自动同步已暂停"
-        : status.configured ? "已连接 · 自动同步" : "尚未设置"),
+    makeElement("span", `status-dot${summary.tone === "error" ? " status-dot-error" : summary.tone === "warning" || summary.tone === "pending" ? " status-dot-warning" : status.configured ? "" : " status-dot-muted"}`),
+    makeElement("strong", "", summary.label),
   );
   content.append(badge);
+  if (status.configured && summary.tone !== "ready") {
+    content.append(makeElement("p", "sync-status-hint", summary.hint));
+  }
 
   const actions = makeElement("div", "sync-actions");
   const addAction = (label: string, style: string, handler: () => void | Promise<void>, iconName: IconName) => {
@@ -3622,7 +3792,10 @@ async function disableWebDavSync(): Promise<void> {
 function pageHeader(eyebrow: string, title: string, description: string): HTMLElement {
   const header = makeElement("header", "page-header");
   const copy = makeElement("div");
-  copy.append(makeElement("span", "eyebrow", eyebrow), makeElement("h1", "", title), makeElement("p", "", description));
+  const heading = makeElement("h1", "", title);
+  heading.dataset.focusKey = "view-heading";
+  heading.tabIndex = -1;
+  copy.append(makeElement("span", "eyebrow", eyebrow), heading, makeElement("p", "", description));
   header.append(copy);
   return header;
 }
@@ -3693,19 +3866,9 @@ function renderStatusbar(): HTMLElement {
   left.append(
     icon("shield", 13),
   );
-  const v2SyncLabel = state.syncV2StatusError
-    ? "多设备同步配置需检查 · 查看设置"
-    : state.syncV2RemoteOutcomeUnknown
-      ? "多设备同步结果待确认 · 查看设置"
-      : state.syncV2StatusUncertain
-        ? "多设备同步状态待确认 · 查看设置"
-        : state.syncV2Status.autoPaused
-          ? "多设备自动同步已暂停 · 查看设置"
-          : state.syncV2Status.autoWarning
-            ? "多设备同步需检查 · 查看设置"
-            : state.syncV2Status.configured && state.syncV2Status.pendingLocalChanges
-              ? "本机修改待同步 · 查看设置"
-              : state.syncV2Status.configured ? "本地优先 · 多设备同步" : null;
+  const v2SyncLabel = state.syncV2Status.configured || state.syncV2StatusError
+    ? `${webDavV2SyncPresentation().label} · 查看设置`
+    : null;
   const syncLabel = v2SyncLabel ?? (state.syncStatusError
     ? "同步已停止 · 查看设置"
     : state.syncRemoteOutcomeUnknown
@@ -3779,8 +3942,16 @@ async function loadEntries(
 ): Promise<boolean> {
   const epoch = requestedEpoch;
   const requestId = ++listRequestId;
+  const renderListUpdate = () => {
+    const sortWasFocused = document.activeElement instanceof HTMLSelectElement
+      && document.activeElement.dataset.focusKey === "entry-sort";
+    renderMainShell();
+    if (sortWasFocused && !hasOpenModal()) {
+      document.querySelector<HTMLSelectElement>("[data-focus-key='entry-sort']")?.focus({ preventScroll: true });
+    }
+  };
   state.listLoading = true;
-  if (render && state.status.unlocked) renderMainShell();
+  if (render && state.status.unlocked) renderListUpdate();
   const args: Record<string, unknown> = {
     filter: state.conflictsOnly ? "conflicts" : state.view === "favorites" ? "favorites" : "all",
     sort: state.sort,
@@ -3801,7 +3972,7 @@ async function loadEntries(
     state.listLoading = false;
     state.listError = false;
     if (render) {
-      renderMainShell();
+      renderListUpdate();
       if (listChanged) {
         const list = document.querySelector<HTMLElement>(".entry-list");
         if (list) list.scrollTop = 0;
@@ -3813,7 +3984,7 @@ async function loadEntries(
     state.entries = [];
     state.listLoading = false;
     state.listError = true;
-    if (render || (document.querySelector(".entry-list") && !hasUnsavedDraft() && state.view !== "settings")) renderMainShell();
+    if (render || (document.querySelector(".entry-list") && !hasUnsavedDraft() && state.view !== "settings")) renderListUpdate();
     if (notifyFailure) showToast("无法读取条目列表。列表已隐藏，请点击“重试读取”。", "error");
     return false;
   }
@@ -3957,6 +4128,43 @@ function serializeInput(input: EntryInput): string {
 
 function hasUnsavedDraft(): boolean {
   return Boolean(state.draft && serializeInput(state.draft) !== state.draftSnapshot);
+}
+
+function isEditingEntryInput(): boolean {
+  const active = document.activeElement;
+  return Boolean(
+    state.draft
+    && active instanceof HTMLElement
+    && active.matches("input, textarea")
+    && active.closest(".entry-editor"),
+  );
+}
+
+function editorSaveState(): { dirty: boolean; label: string } {
+  const dirty = hasUnsavedDraft();
+  const label = state.entryMutation === "saving"
+    ? "正在加密保存…"
+    : state.entryMutation === "deleting"
+      ? "正在删除条目…"
+      : state.entryMutation === "favoriting"
+        ? "正在更新收藏…"
+        : dirty
+          ? "有未保存的修改"
+          : state.entryMeta.id
+            ? "已保存到本地"
+            : "填写后保存";
+  return { dirty, label };
+}
+
+function updateEditorSaveState(): void {
+  const status = document.querySelector<HTMLElement>(".entry-editor .save-state");
+  if (!status) return;
+  const { dirty, label } = editorSaveState();
+  const dot = status.querySelector<HTMLElement>(".unsaved-dot, .saved-dot");
+  dot?.classList.toggle("unsaved-dot", dirty);
+  dot?.classList.toggle("saved-dot", !dirty);
+  const text = status.querySelector<HTMLElement>(".save-state-label");
+  if (text && text.textContent !== label) text.textContent = label;
 }
 
 async function saveConflictedDraftAsNewEntry(): Promise<void> {
@@ -4253,6 +4461,8 @@ async function toggleFavorite(entry: EntrySummary): Promise<void> {
   if (blockEntryActionWhileMutating()) return;
   const epoch = state.epoch;
   const id = entry.id;
+  const focusedRowAction = document.activeElement instanceof HTMLElement
+    && document.activeElement.dataset.focusKey === `entry-${id}-favorite`;
   const favorite = !entry.favorite;
   const expectedRevision = entry.revision;
   state.entryMutation = "favoriting";
@@ -4281,6 +4491,9 @@ async function toggleFavorite(entry: EntrySummary): Promise<void> {
     if (epoch !== state.epoch || !state.status.unlocked || state.entryMutation !== "favoriting") return;
     state.entryMutation = null;
     renderMainShell();
+    if (focusedRowAction && state.view === "favorites" && !state.entries.some((item) => item.id === id)) {
+      document.querySelector<HTMLInputElement>("#vault-search")?.focus({ preventScroll: true });
+    }
     if (!listRefreshed) showToast("收藏状态已保存，但列表刷新失败。请点击“重试读取”。", "warning", 5200);
   } catch (error) {
     if (epoch !== state.epoch || !state.status.unlocked) return;
@@ -4309,6 +4522,8 @@ async function toggleFavorite(entry: EntrySummary): Promise<void> {
 async function toggleCurrentFavorite(): Promise<void> {
   if (blockEntryActionWhileMutating()) return;
   if (!state.draft) return;
+  const focusedEditorFavorite = document.activeElement instanceof HTMLElement
+    && document.activeElement.dataset.focusKey === "editor-favorite";
   const favorite = !state.draft.favorite;
   if (!state.draft.id) {
     state.draft.favorite = favorite;
@@ -4371,6 +4586,9 @@ async function toggleCurrentFavorite(): Promise<void> {
       state.entryMutation = null;
       setEntryEditorFrozen(false);
     }
+    if (focusedEditorFavorite && epoch === state.epoch && state.status.unlocked && state.draft?.id === id && !hasOpenModal()) {
+      document.querySelector<HTMLButtonElement>("[data-focus-key='editor-favorite']")?.focus({ preventScroll: true });
+    }
   }
 }
 
@@ -4415,6 +4633,13 @@ function togglePasswordVisibility(): void {
 function startPasswordRevealTimer(): void {
   if (revealTimeout) window.clearTimeout(revealTimeout);
   if (revealTicker) window.clearInterval(revealTicker);
+  if (entryPasswordComposing) {
+    revealTimeout = window.setTimeout(hidePassword, compositionRevealLimitMs());
+    revealTicker = null;
+    const hint = document.querySelector<HTMLElement>("#password-reveal-hint");
+    if (hint) hint.textContent = "正在输入；结束后重新计时，持续输入也会自动隐藏。";
+    return;
+  }
   const duration = Math.max(1, state.settings.passwordRevealSeconds) * 1000;
   const deadline = Date.now() + duration;
   revealTimeout = window.setTimeout(hidePassword, duration);
@@ -4431,6 +4656,7 @@ function syncPasswordRevealHint(deadline?: number): void {
 
 function hidePassword(): void {
   state.passwordVisible = false;
+  entryPasswordComposing = false;
   if (revealTimeout) window.clearTimeout(revealTimeout);
   if (revealTicker) window.clearInterval(revealTicker);
   revealTimeout = null;
@@ -6228,7 +6454,8 @@ function showRecoveryCodeDialog(code: string, requireSaved: boolean, title: stri
     });
     reveal.setAttribute("aria-pressed", "false");
     const copy = iconButton("复制恢复码", "copy", () => copySecret(input.value, "恢复码"));
-    managedField = { input, button: reveal, label: "恢复码", timeout: null };
+    managedField = { input, button: reveal, label: "恢复码", timeout: null, composing: false };
+    bindManagedSensitiveInput(managedField);
     actionsInField.append(reveal, copy);
     codeWrap.append(input, actionsInField);
 

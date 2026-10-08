@@ -5,7 +5,7 @@
 <p align="center"><strong>本地优先的加密密码库</strong><br>安全保存密码 · 本机加密备份 · WebDAV 多设备同步</p>
 
 <p align="center">
-  <a href="https://github.com/qianshulab/CipherNest/releases/tag/v0.4.1"><img src="https://img.shields.io/badge/release-v0.4.1%20beta-ff791c?style=flat-square&amp;labelColor=1b2029" alt="下载 v0.4.1 beta"></a>
+  <a href="https://github.com/qianshulab/CipherNest/releases/tag/v0.4.2"><img src="https://img.shields.io/badge/release-v0.4.2%20beta-ff791c?style=flat-square&amp;labelColor=1b2029" alt="下载 v0.4.2 beta"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-ff791c?style=flat-square&amp;labelColor=1b2029" alt="MIT 许可证"></a>
 </p>
 
@@ -43,7 +43,7 @@ CipherNest 是一款面向 Windows、macOS 和 Linux 的密码管理器。账号
   </tr>
 </table>
 
-保险库支持搜索、筛选、排序、收藏和标签；条目较多时，列表分批显示。本地安全检查会提示部分常见口令、明显规律的密码、重复使用和长期未更新的密码；密码生成器支持自定义长度与字符类别。敏感字段默认遮罩，并可设置自动锁定、失焦锁定和剪贴板清除时间。
+保险库支持搜索、筛选、排序、收藏和标签；条目较多时，列表分批显示。搜索或排序刷新期间，已有结果会标为“上次结果”，更新完成前不可操作。本地安全检查会提示部分常见口令、明显规律的密码、重复使用和长期未更新的密码；密码生成器支持自定义长度与字符类别。敏感字段默认遮罩，并可设置自动锁定、失焦锁定和剪贴板清除时间。条目编辑器即时显示保存状态；后台同步取得修改时会保留当前输入和未保存草稿，供保存前核对。
 
 ## 下载与安装
 
