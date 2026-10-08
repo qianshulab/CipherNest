@@ -168,7 +168,7 @@ describe("renderer security boundary", () => {
     expect(card).toContain("立即同步");
     expect(card).toContain("自动同步在保险库解锁期间运行");
     expect(card).toContain("停止此设备同步只移除本机配置");
-    expect(card).toContain("本机同步配置需检查");
+    expect(card).toContain("webDavV2SyncPresentation()");
     expect(card).toContain("清除本机配置");
     expect(card).toContain("旧版同步配置（CN1）");
 
