@@ -324,8 +324,9 @@ describe("renderer security boundary", () => {
     expect(row).toContain("securityFlagSummary(entry.securityFlags)");
     expect(row).not.toMatch(/entry\.(?:username|purpose|tags)/);
     const list = sourceBetween("function renderEntryList", "function renderListSkeleton");
-    expect(list).toContain('search.type = "password"');
-    expect(list).toContain("revealManagedSensitiveInput(managedSearch)");
+    expect(list).toContain('search.type = "text"');
+    expect(list).toContain('search.setAttribute("aria-label", "搜索保险库条目")');
+    expect(list).not.toContain("revealManagedSensitiveInput(managedSearch)");
     const generator = sourceBetween("function renderGeneratorDialog", "function generatorToggle");
     for (const field of ["generatorUser", "generatorPurpose", "generatorUrl", "generatorTags"]) {
       expect(generator).toContain(`addSensitiveTextActions(${field},`);
